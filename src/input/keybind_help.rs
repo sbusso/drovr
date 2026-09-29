@@ -115,6 +115,18 @@ pub(crate) fn keybind_help_groups(
                     "workspace navigation",
                 ),
                 entry(binding_label(&keybinds.goto), "session navigator"),
+                entry(
+                    binding_label(&keybinds.project_menu),
+                    "sidebar project menu",
+                ),
+                entry(
+                    binding_label(&keybinds.jump_agent),
+                    "jump to agent by number",
+                ),
+                entry(
+                    binding_label(&keybinds.toggle_hidden_workspaces),
+                    "show/conceal hidden workspaces",
+                ),
                 entry(binding_label(&keybinds.new_workspace), "new workspace"),
                 entry(binding_label(&keybinds.new_worktree), "new worktree"),
                 entry(binding_label(&keybinds.open_worktree), "open worktree"),

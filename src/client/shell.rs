@@ -28,6 +28,8 @@ mod notification_policy;
 mod notifications;
 mod overlay_input;
 mod preferences;
+mod project_actions;
+mod projects;
 mod render;
 mod scroll;
 mod settings;

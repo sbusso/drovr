@@ -268,29 +268,86 @@ pub(super) fn render_expanded(
 
     enum Row {
         Endpoint(usize),
+        Project(usize),
         Workspace {
             endpoint: usize,
             entry: WorkspaceEntry,
+            badge: bool,
+            hidden: bool,
         },
     }
+    // andreconde fork: project groups (across machines) first, then whatever is
+    // left under its machine header as before.
+    let layout = super::projects::layout();
+    let (sections, claimed) = super::projects::sections(&layout, state.endpoints);
     let mut rows = Vec::new();
+    for (section_index, section) in sections.iter().enumerate() {
+        let visible = section
+            .members
+            .iter()
+            .filter(|member| layout.show_hidden || !member.hidden)
+            .collect::<Vec<_>>();
+        if visible.is_empty() && !section.members.is_empty() {
+            continue;
+        }
+        rows.push(Row::Project(section_index));
+        if layout.groups[section.group].collapsed {
+            continue;
+        }
+        rows.extend(visible.into_iter().map(|member| Row::Workspace {
+            endpoint: member.endpoint,
+            entry: WorkspaceEntry {
+                index: member.index,
+                indented: false,
+                last_child: false,
+            },
+            badge: true,
+            hidden: member.hidden,
+        }));
+    }
     for (endpoint_index, endpoint) in state.endpoints.iter().enumerate() {
+        let entries = endpoint
+            .snapshot
+            .as_deref()
+            .map(|snapshot| {
+                let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
+                    .unwrap_or(&empty_collapsed_groups);
+                super::sidebar::workspace_entries(snapshot, collapsed_groups)
+                    .into_iter()
+                    .filter(|entry| !claimed.contains(&(endpoint_index, entry.index)))
+                    .map(|entry| {
+                        let hidden =
+                            snapshot
+                                .workspaces
+                                .get(entry.index)
+                                .is_some_and(|workspace| {
+                                    layout.is_hidden(&super::projects::workspace_key(
+                                        endpoint,
+                                        &workspace.label,
+                                    ))
+                                });
+                        (entry, hidden)
+                    })
+                    .filter(|(_, hidden)| layout.show_hidden || !hidden)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !sections.is_empty()
+            && entries.is_empty()
+            && endpoint.status == ClientEndpointStatus::Online
+        {
+            continue;
+        }
         rows.push(Row::Endpoint(endpoint_index));
         if state.collapsed_endpoints.contains(&endpoint.endpoint_id) {
             continue;
         }
-        if let Some(snapshot) = endpoint.snapshot.as_deref() {
-            let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
-                .unwrap_or(&empty_collapsed_groups);
-            rows.extend(
-                super::sidebar::workspace_entries(snapshot, collapsed_groups)
-                    .into_iter()
-                    .map(|entry| Row::Workspace {
-                        endpoint: endpoint_index,
-                        entry,
-                    }),
-            );
-        }
+        rows.extend(entries.into_iter().map(|(entry, hidden)| Row::Workspace {
+            endpoint: endpoint_index,
+            entry,
+            badge: false,
+            hidden,
+        }));
     }
     let body = Rect::new(
         workspace_area.x,
@@ -304,8 +361,10 @@ pub(super) fn render_expanded(
     let row_heights = rows
         .iter()
         .map(|row| match row {
-            Row::Endpoint(_) => 1,
-            Row::Workspace { endpoint, entry } => {
+            Row::Endpoint(_) | Row::Project(_) => 1,
+            Row::Workspace {
+                endpoint, entry, ..
+            } => {
                 let endpoint = &state.endpoints[*endpoint];
                 let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
                     .unwrap_or(&empty_collapsed_groups);
@@ -343,6 +402,7 @@ pub(super) fn render_expanded(
                 Some(Row::Workspace {
                     endpoint: next_endpoint,
                     entry,
+                    ..
                 }),
             ) if endpoint == next_endpoint => u16::from(!entry.indented) * config.spaces.row_gap,
             _ => 0,
@@ -352,7 +412,9 @@ pub(super) fn render_expanded(
     let reveal_focus = !body.is_empty() && std::mem::take(state.reveal_focused_workspace);
     if reveal_navigation || reveal_focus {
         let selected_row = rows.iter().position(|row| match row {
-            Row::Workspace { endpoint, entry } => {
+            Row::Workspace {
+                endpoint, entry, ..
+            } => {
                 let endpoint = &state.endpoints[*endpoint];
                 endpoint
                     .snapshot
@@ -372,7 +434,7 @@ pub(super) fn render_expanded(
                         }
                     })
             }
-            Row::Endpoint(_) => false,
+            Row::Endpoint(_) | Row::Project(_) => false,
         });
         if let Some(selected_row) = selected_row {
             *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
@@ -432,7 +494,32 @@ pub(super) fn render_expanded(
                     .saturating_add(1)
                     .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
             }
-            Row::Workspace { endpoint, entry } => {
+            Row::Project(section_index) => {
+                if y >= body.bottom() {
+                    break;
+                }
+                let section = &sections[*section_index];
+                let group = &layout.groups[section.group];
+                let rect = Rect::new(body.x, y, content_width, 1);
+                render_project_row(
+                    buffer,
+                    rect,
+                    group,
+                    super::projects::section_status(section, state.endpoints),
+                    section.members.len(),
+                    config,
+                );
+                hits.projects.push((rect, group.name.clone()));
+                y = y
+                    .saturating_add(1)
+                    .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
+            }
+            Row::Workspace {
+                endpoint,
+                entry,
+                badge,
+                hidden,
+            } => {
                 let endpoint = &state.endpoints[*endpoint];
                 let Some(snapshot) = endpoint.snapshot.as_deref() else {
                     continue;
@@ -481,6 +568,28 @@ pub(super) fn render_expanded(
                     false,
                     palette,
                 );
+                if *badge && !endpoint.endpoint_id.is_local() {
+                    put_right_text(
+                        buffer,
+                        rect,
+                        rect.y,
+                        &format!("{} ", endpoint.label),
+                        Style::default()
+                            .fg(palette.overlay0)
+                            .add_modifier(Modifier::DIM),
+                    );
+                }
+                if *hidden {
+                    put_text(
+                        buffer,
+                        rect.x,
+                        rect.y,
+                        1,
+                        "⊘",
+                        Style::default().fg(palette.overlay0),
+                    );
+                    buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+                }
                 if endpoint.status != ClientEndpointStatus::Online {
                     buffer.set_style(
                         rect,
@@ -646,4 +755,43 @@ fn render_endpoint_row(
         signal_width,
         1,
     )
+}
+
+/// andreconde fork: a project header — marker, pin, name, worst member status.
+fn render_project_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    group: &super::projects::ProjectGroup,
+    status: crate::api::schema::AgentStatus,
+    members: usize,
+    config: &ClientShellConfig,
+) {
+    let palette = &config.palette;
+    let marker = if group.collapsed { "▸" } else { "▾" };
+    let pin = if group.pinned { "★ " } else { "" };
+    put_text(
+        buffer,
+        rect.x,
+        rect.y,
+        rect.width.saturating_sub(4),
+        &format!(" {marker} {pin}{}", group.name),
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let signal = if group.collapsed {
+        format!(
+            "{} {members}",
+            status_icon(status, config.status_indicators)
+        )
+    } else {
+        String::new()
+    };
+    put_right_text(
+        buffer,
+        rect,
+        rect.y,
+        &signal,
+        Style::default().fg(status_color(status, palette)),
+    );
 }

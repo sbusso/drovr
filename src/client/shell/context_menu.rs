@@ -2,10 +2,24 @@ use super::*;
 
 impl ClientContextMenuOverlay {
     pub(super) fn items(&self) -> Vec<ClientContextMenuItem> {
+        items_for(&self.target)
+    }
+}
+
+pub(super) fn items_for(target: &ClientContextMenuTarget) -> Vec<ClientContextMenuItem> {
+    {
         use ClientContextMenuAction as Action;
 
-        let item = |label, action| ClientContextMenuItem { label, action };
-        match &self.target {
+        let item = |label: &'static str, action| ClientContextMenuItem {
+            label: label.into(),
+            action,
+        };
+        match target {
+            ClientContextMenuTarget::ProjectWorkspace { .. }
+            | ClientContextMenuTarget::Project { .. }
+            | ClientContextMenuTarget::Agent { .. } => {
+                super::project_actions::project_menu_items(target)
+            }
             ClientContextMenuTarget::Workspace { is_git: false, .. } => {
                 vec![item("Rename", Action::Rename), item("Close", Action::Close)]
             }
@@ -191,6 +205,14 @@ impl ClientShellState {
             outcome.repaint = true;
             return;
         };
+        let menu = match super::project_actions::split_project_menu(menu, index) {
+            Ok(base) => {
+                // Stock item of a merged workspace menu: replay it on the base menu.
+                self.overlay = Some(ClientShellOverlay::ContextMenu(base));
+                return self.activate_context_menu_item(index, outcome);
+            }
+            Err(menu) => menu,
+        };
         match menu.target {
             ClientContextMenuTarget::Workspace {
                 workspace_id,
@@ -215,6 +237,7 @@ impl ClientShellState {
                 action,
                 outcome,
             ),
+            target => self.activate_project_action(target, action, outcome),
         }
         outcome.repaint = true;
     }

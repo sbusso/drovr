@@ -43,6 +43,25 @@ impl ClientShellState {
                     self.begin_worktree_action(action, outcome);
                     return;
                 }
+                // andreconde fork: sidebar project keys.
+                match action {
+                    crate::input::KeybindAction::ProjectMenu => {
+                        self.open_focused_project_menu();
+                        outcome.repaint = true;
+                        return;
+                    }
+                    crate::input::KeybindAction::JumpAgent => {
+                        self.open_jump_agent_prompt();
+                        outcome.repaint = true;
+                        return;
+                    }
+                    crate::input::KeybindAction::ToggleHiddenWorkspaces => {
+                        self.toggle_show_hidden_workspaces();
+                        outcome.repaint = true;
+                        return;
+                    }
+                    _ => {}
+                }
                 if action == crate::input::KeybindAction::OpenNavigator {
                     self.open_navigator_overlay();
                     outcome.repaint = true;

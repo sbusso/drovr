@@ -357,6 +357,12 @@ pub struct KeysConfig {
     pub workspace_picker: BindingConfig,
     /// Open the session navigator. Default: "prefix+g"
     pub goto: BindingConfig,
+    /// sidebar project menu (andreconde fork). Default: "prefix+."
+    pub project_menu: BindingConfig,
+    /// jump to agent by number (andreconde fork). Default: "prefix+#"
+    pub jump_agent: BindingConfig,
+    /// show/conceal hidden workspaces (andreconde fork). Default: "prefix+alt+h"
+    pub toggle_hidden_workspaces: BindingConfig,
     /// Move workspace selection up in navigate mode. Default: "up".
     pub navigate_workspace_up: BindingConfig,
     /// Move workspace selection down in navigate mode. Default: "down".
@@ -494,6 +500,12 @@ pub(crate) struct KeysConfigOverlay {
     workspace_picker: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     goto: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_menu: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jump_agent: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toggle_hidden_workspaces: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     navigate_workspace_up: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -654,6 +666,9 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(close_workspace);
         apply_field!(workspace_picker);
         apply_field!(goto);
+        apply_field!(project_menu);
+        apply_field!(jump_agent);
+        apply_field!(toggle_hidden_workspaces);
         apply_field!(navigate_workspace_up);
         apply_field!(navigate_workspace_down);
         apply_field!(navigate_pane_left);
@@ -759,6 +774,9 @@ impl KeysConfig {
         copy_effective_action_field!(close_workspace, keybinds.close_workspace);
         copy_effective_action_field!(workspace_picker, keybinds.workspace_picker);
         copy_effective_action_field!(goto, keybinds.goto);
+        copy_effective_action_field!(project_menu, keybinds.project_menu);
+        copy_effective_action_field!(jump_agent, keybinds.jump_agent);
+        copy_effective_action_field!(toggle_hidden_workspaces, keybinds.toggle_hidden_workspaces);
         copy_effective_action_field!(navigate_workspace_up, keybinds.navigate.workspace_up);
         copy_effective_action_field!(navigate_workspace_down, keybinds.navigate.workspace_down);
         copy_effective_action_field!(navigate_pane_left, keybinds.navigate.pane_left);
@@ -1128,6 +1146,9 @@ impl Default for KeysConfig {
             close_workspace: BindingConfig::one("prefix+shift+d"),
             workspace_picker: BindingConfig::one("prefix+w"),
             goto: BindingConfig::one("prefix+g"),
+            project_menu: BindingConfig::one("prefix+."),
+            jump_agent: BindingConfig::one("prefix+#"),
+            toggle_hidden_workspaces: BindingConfig::one("prefix+alt+h"),
             navigate_workspace_up: BindingConfig::one("up"),
             navigate_workspace_down: BindingConfig::one("down"),
             navigate_pane_left: BindingConfig::one("h"),

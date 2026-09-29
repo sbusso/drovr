@@ -84,6 +84,8 @@ pub(super) enum ClientMobileTarget {
 #[derive(Default)]
 pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
+    /// andreconde fork: project header rows (rect, group name).
+    pub(super) projects: Vec<(Rect, String)>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -315,6 +317,17 @@ pub(super) enum ClientRenameTarget {
     Pane {
         pane_id: String,
     },
+    /// andreconde fork prompts (answered client-side, never sent to a server).
+    ProjectAssign {
+        key: String,
+    },
+    ProjectRename {
+        name: String,
+    },
+    ProjectRules {
+        name: String,
+    },
+    JumpAgent,
 }
 
 #[derive(Debug)]
@@ -525,6 +538,22 @@ pub(super) enum ClientContextMenuAction {
     Zoom,
     ToggleRightClickPassthrough,
     ClosePane,
+    // andreconde fork: project sidebar actions.
+    ProjectAssignTo(usize),
+    ProjectAssignNew,
+    ProjectRemove,
+    ProjectToggleHidden,
+    ProjectMoveUp,
+    ProjectMoveDown,
+    ProjectShowHidden,
+    ProjectTogglePin,
+    ProjectToggleCollapse,
+    ProjectRename,
+    ProjectRules,
+    ProjectDelete,
+    AgentToggleUnread,
+    AgentFocus,
+    AgentRename,
 }
 
 #[derive(Debug)]
@@ -548,6 +577,31 @@ pub(super) enum ClientContextMenuTarget {
         has_manual_label: bool,
         right_click_passthrough: bool,
     },
+    /// andreconde fork: a sidebar workspace on any machine. `base` carries the
+    /// stock workspace menu when the workspace is on the active machine.
+    ProjectWorkspace {
+        key: String,
+        explicit: bool,
+        grouped: bool,
+        hidden: bool,
+        show_hidden: bool,
+        groups: Vec<String>,
+        base: Option<Box<ClientContextMenuTarget>>,
+    },
+    Project {
+        name: String,
+        pinned: bool,
+        collapsed: bool,
+        show_hidden: bool,
+    },
+    Agent {
+        endpoint_id: ClientEndpointId,
+        pane_id: String,
+        unread_key: String,
+        workspace_key: Option<String>,
+        hidden: bool,
+        active: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -559,7 +613,7 @@ pub(super) struct ClientContextMenuOverlay {
 }
 
 pub(super) struct ClientContextMenuItem {
-    pub(super) label: &'static str,
+    pub(super) label: std::borrow::Cow<'static, str>,
     pub(super) action: ClientContextMenuAction,
 }
 

@@ -361,6 +361,9 @@ pub struct Keybinds {
     pub close_workspace: ActionKeybinds,
     pub workspace_picker: ActionKeybinds,
     pub goto: ActionKeybinds,
+    pub project_menu: ActionKeybinds,
+    pub jump_agent: ActionKeybinds,
+    pub toggle_hidden_workspaces: ActionKeybinds,
     pub detach: ActionKeybinds,
     pub reload_config: ActionKeybinds,
     pub open_notification_target: ActionKeybinds,
@@ -544,6 +547,9 @@ impl Config {
             close_workspace: empty_action!(),
             workspace_picker: empty_action!(),
             goto: empty_action!(),
+            project_menu: empty_action!(),
+            jump_agent: empty_action!(),
+            toggle_hidden_workspaces: empty_action!(),
             detach: empty_action!(),
             reload_config: empty_action!(),
             open_notification_target: empty_action!(),
@@ -673,6 +679,13 @@ impl Config {
             apply_action!(keybinds.close_workspace, close_workspace, source);
             apply_action!(keybinds.workspace_picker, workspace_picker, source);
             apply_action!(keybinds.goto, goto, source);
+            apply_action!(keybinds.project_menu, project_menu, source);
+            apply_action!(keybinds.jump_agent, jump_agent, source);
+            apply_action!(
+                keybinds.toggle_hidden_workspaces,
+                toggle_hidden_workspaces,
+                source
+            );
             apply_action!(keybinds.detach, detach, source);
             apply_action!(keybinds.reload_config, reload_config, source);
             apply_action!(

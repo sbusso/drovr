@@ -127,6 +127,7 @@ pub(super) fn aggregate_agent_rows<'a>(
             }
         }
         sort_aggregate_rows(&mut rows, sort);
+        apply_projects(endpoints, &mut rows, sort);
         return rows;
     }
 
@@ -153,7 +154,37 @@ pub(super) fn aggregate_agent_rows<'a>(
         })
         .collect::<Vec<_>>();
     sort_aggregate_rows(&mut rows, sort);
+    apply_projects(endpoints, &mut rows, sort);
     rows
+}
+
+/// andreconde fork: drop agents of hidden workspaces and, in the stable
+/// "grouped" order, list agents project by project across machines.
+fn apply_projects(
+    endpoints: &[ClientShellEndpoint],
+    rows: &mut Vec<AggregateAgentRow<'_>>,
+    sort: crate::config::AgentPanelSortConfig,
+) {
+    let layout = super::projects::layout();
+    let mut ranked = std::mem::take(rows)
+        .into_iter()
+        .filter_map(|row| {
+            let endpoint = &endpoints[row.endpoint.endpoint_index];
+            let label = row
+                .endpoint
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == row.agent.workspace_id)
+                .map(|workspace| workspace.label.as_str())
+                .unwrap_or_default();
+            super::projects::agent_rank(&layout, endpoint, label).map(|rank| (rank, row))
+        })
+        .collect::<Vec<_>>();
+    if sort == crate::config::AgentPanelSortConfig::Spaces {
+        ranked.sort_by_key(|(rank, _)| *rank);
+    }
+    rows.extend(ranked.into_iter().map(|(_, row)| row));
 }
 
 fn sort_aggregate_rows(

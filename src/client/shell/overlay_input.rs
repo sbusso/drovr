@@ -928,7 +928,10 @@ impl ClientShellState {
             return;
         };
         let trimmed = rename.input.trim();
-        let method = match rename.target {
+        let Some(target) = self.save_project_prompt(rename.target, &trimmed, outcome) else {
+            return;
+        };
+        let method = match target {
             ClientRenameTarget::NewWorkspace {
                 source_workspace_id,
                 cwd,
@@ -980,6 +983,7 @@ impl ClientShellState {
                     label: Some(trimmed.to_owned()),
                 },
             )),
+            _ => None,
         };
         if let Some(method) = method {
             self.push_endpoint_method(method, outcome);
