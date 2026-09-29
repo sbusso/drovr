@@ -45,6 +45,10 @@ impl ClientShellState {
                 }
                 // andreconde fork: sidebar project keys.
                 match action {
+                    crate::input::KeybindAction::NextAttentionAgent => {
+                        self.focus_next_attention_agent(outcome);
+                        return;
+                    }
                     crate::input::KeybindAction::ProjectMenu => {
                         self.open_focused_project_menu();
                         outcome.repaint = true;

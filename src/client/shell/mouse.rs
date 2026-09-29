@@ -1015,6 +1015,15 @@ impl ClientShellState {
         if self.handle_mobile_mouse(mouse, outcome) {
             return;
         }
+        if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
+            && super::projects::press().is_some()
+        {
+            // andreconde fork (sheprd): a sidebar row is being dragged.
+            if super::projects::drag_to(point) {
+                outcome.repaint = true;
+            }
+            return;
+        }
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
             match self.chrome_drag.as_ref() {
                 Some(ClientChromeDrag::SidebarWidth) => {
@@ -1251,12 +1260,9 @@ impl ClientShellState {
             }
         }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left)
-            && self.drop_workspace_on_project(point)
+            && self.finish_row_press(point, outcome)
         {
-            // andreconde fork: a workspace (any machine) released on a project header.
-            self.chrome_drag = None;
-            self.workspace_press = None;
-            outcome.repaint = true;
+            // andreconde fork (sheprd): click or drag-and-drop on a sidebar row.
             return;
         }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
@@ -2041,14 +2047,6 @@ impl ClientShellState {
                 if self.handle_project_click(point, outcome) {
                     return;
                 }
-                if super::contains(self.hits.agent_scope_toggle, point) {
-                    super::projects::update(|layout| {
-                        layout.agents_project_only = !layout.agents_project_only
-                    });
-                    self.agent_scroll = 0;
-                    outcome.repaint = true;
-                    return;
-                }
                 if self.handle_endpoint_machine_click(point, outcome) {
                     return;
                 }
@@ -2116,6 +2114,10 @@ impl ClientShellState {
                     self.toggle_collapsed_group(&endpoint_id, key);
                     outcome.repaint = true;
                     self.persist_chrome_preferences(outcome);
+                    return;
+                }
+                if self.begin_row_press(point) {
+                    // andreconde fork (sheprd): combined sidebar row.
                     return;
                 }
                 let workspace_press = self

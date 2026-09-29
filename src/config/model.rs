@@ -359,6 +359,8 @@ pub struct KeysConfig {
     pub goto: BindingConfig,
     /// sidebar project menu (andreconde fork). Default: "prefix+."
     pub project_menu: BindingConfig,
+    /// next agent that needs you (sheprd). Default: "prefix+u"
+    pub next_attention_agent: BindingConfig,
     /// jump to agent by number (andreconde fork). Default: "prefix+#"
     pub jump_agent: BindingConfig,
     /// show/conceal hidden workspaces (andreconde fork). Default: "prefix+alt+h"
@@ -502,6 +504,8 @@ pub(crate) struct KeysConfigOverlay {
     goto: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_menu: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_attention_agent: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jump_agent: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -667,6 +671,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(workspace_picker);
         apply_field!(goto);
         apply_field!(project_menu);
+        apply_field!(next_attention_agent);
         apply_field!(jump_agent);
         apply_field!(toggle_hidden_workspaces);
         apply_field!(navigate_workspace_up);
@@ -775,6 +780,7 @@ impl KeysConfig {
         copy_effective_action_field!(workspace_picker, keybinds.workspace_picker);
         copy_effective_action_field!(goto, keybinds.goto);
         copy_effective_action_field!(project_menu, keybinds.project_menu);
+        copy_effective_action_field!(next_attention_agent, keybinds.next_attention_agent);
         copy_effective_action_field!(jump_agent, keybinds.jump_agent);
         copy_effective_action_field!(toggle_hidden_workspaces, keybinds.toggle_hidden_workspaces);
         copy_effective_action_field!(navigate_workspace_up, keybinds.navigate.workspace_up);
@@ -1147,6 +1153,7 @@ impl Default for KeysConfig {
             workspace_picker: BindingConfig::one("prefix+w"),
             goto: BindingConfig::one("prefix+g"),
             project_menu: BindingConfig::one("prefix+."),
+            next_attention_agent: BindingConfig::one("prefix+u"),
             jump_agent: BindingConfig::one("prefix+#"),
             toggle_hidden_workspaces: BindingConfig::one("prefix+alt+h"),
             navigate_workspace_up: BindingConfig::one("up"),

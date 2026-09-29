@@ -127,7 +127,7 @@ pub(super) fn aggregate_agent_rows<'a>(
             }
         }
         sort_aggregate_rows(&mut rows, sort);
-        apply_projects(endpoints, active_endpoint_id, &mut rows, sort);
+        apply_projects(endpoints, &mut rows, sort);
         return rows;
     }
 
@@ -154,25 +154,18 @@ pub(super) fn aggregate_agent_rows<'a>(
         })
         .collect::<Vec<_>>();
     sort_aggregate_rows(&mut rows, sort);
-    apply_projects(endpoints, active_endpoint_id, &mut rows, sort);
+    apply_projects(endpoints, &mut rows, sort);
     rows
 }
 
-/// andreconde fork: drop agents of hidden workspaces, optionally keep only the
-/// focused workspace's project, and in the stable "grouped" order list agents
-/// project by project across machines.
+/// andreconde fork: drop agents of hidden workspaces and, in the stable
+/// "grouped" order, list agents project by project across machines.
 fn apply_projects(
     endpoints: &[ClientShellEndpoint],
-    active_endpoint_id: &ClientEndpointId,
     rows: &mut Vec<AggregateAgentRow<'_>>,
     sort: crate::config::AgentPanelSortConfig,
 ) {
     let layout = super::projects::layout();
-    let scope = layout
-        .agents_project_only
-        .then(|| super::projects::focused_group(&layout, endpoints, active_endpoint_id))
-        .flatten();
-    let order = layout.display_order();
     let mut ranked = std::mem::take(rows)
         .into_iter()
         .filter_map(|row| {
@@ -184,12 +177,6 @@ fn apply_projects(
                 .find(|workspace| workspace.workspace_id == row.agent.workspace_id)?;
             let paths = super::projects::workspace_paths(snapshot, workspace);
             let rank = super::projects::agent_rank(&layout, endpoint, &workspace.label, &paths)?;
-            if let Some(group) = scope {
-                let position = order.iter().position(|index| *index == group);
-                if Some(rank.0) != position {
-                    return None;
-                }
-            }
             Some((rank, row))
         })
         .collect::<Vec<_>>();

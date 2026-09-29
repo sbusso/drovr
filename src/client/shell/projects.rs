@@ -53,9 +53,21 @@ pub(super) struct ProjectLayout {
     /// Agents marked unread by hand (`machine/pane_id`); cleared when focused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) unread: Vec<String>,
-    /// Agents list shows only the focused workspace's project.
+    /// Compact view: one line per workspace instead of one row per agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(super) agents_project_only: bool,
+    pub(super) compact: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) other_collapsed: bool,
+    /// Show only agents that are working or need attention.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) active_only: bool,
+    /// Agents marked inactive by hand, as `machine/pane@state_change_seq`: the
+    /// mark lapses as soon as the agent changes state again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) dismissed: Vec<String>,
+    /// Workspaces dragged to "Other": never auto-matched into a project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) ungrouped: Vec<String>,
     #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
     pub(super) groups: Vec<ProjectGroup>,
 }
@@ -72,6 +84,10 @@ fn path() -> PathBuf {
 }
 
 fn read_file() -> (ProjectLayout, Option<SystemTime>) {
+    // Unit tests must never see (or depend on) the developer's real layout.
+    if cfg!(test) {
+        return (ProjectLayout::default(), None);
+    }
     let path = path();
     let mtime = std::fs::metadata(&path)
         .and_then(|meta| meta.modified())
@@ -107,9 +123,13 @@ pub(super) fn layout() -> ProjectLayout {
     }
     let mut guard = store.write().unwrap_or_else(|e| e.into_inner());
     guard.checked = Instant::now();
-    let mtime = std::fs::metadata(path())
-        .and_then(|meta| meta.modified())
-        .ok();
+    let mtime = if cfg!(test) {
+        None
+    } else {
+        std::fs::metadata(path())
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
     if mtime != guard.mtime {
         let (layout, mtime) = read_file();
         guard.layout = layout;
@@ -126,6 +146,9 @@ pub(super) fn update(change: impl FnOnce(&mut ProjectLayout)) {
     let before = guard.layout.clone();
     change(&mut guard.layout);
     if guard.layout == before {
+        return;
+    }
+    if cfg!(test) {
         return;
     }
     let path = path();
@@ -180,6 +203,9 @@ impl ProjectLayout {
     /// Group for a workspace: explicit membership wins, then the first rule that
     /// matches the workspace name or any folder its panes run in.
     pub(super) fn group_of(&self, key: &str, label: &str, paths: &[String]) -> Option<usize> {
+        if self.ungrouped.iter().any(|ungrouped| ungrouped == key) {
+            return None;
+        }
         self.explicit_group(key).or_else(|| {
             let label = label.to_lowercase();
             let paths = paths
@@ -205,12 +231,15 @@ impl ProjectLayout {
             .unwrap_or(usize::MAX)
     }
 
+    /// Move a workspace into `group_name`; an empty name moves it to Other.
     pub(super) fn assign(&mut self, key: &str, group_name: &str) {
         for group in &mut self.groups {
             group.members.retain(|member| member != key);
         }
+        self.ungrouped.retain(|ungrouped| ungrouped != key);
         let name = group_name.trim();
         if name.is_empty() {
+            self.ungrouped.push(key.to_owned());
             return;
         }
         match self
@@ -426,27 +455,110 @@ pub(super) fn agent_rank(
     })
 }
 
-/// Project of the workspace focused on the active machine, if it has one.
-pub(super) fn focused_group(
-    layout: &ProjectLayout,
-    endpoints: &[ClientShellEndpoint],
-    active_endpoint_id: &super::ClientEndpointId,
-) -> Option<usize> {
-    let endpoint = endpoints
-        .iter()
-        .find(|endpoint| &endpoint.endpoint_id == active_endpoint_id)?;
-    let snapshot = endpoint.snapshot.as_deref()?;
-    let focused = snapshot.focused_workspace_id.as_deref()?;
-    let workspace = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == focused)?;
-    layout.group_of(
-        &workspace_key(endpoint, &workspace.label),
-        &workspace.label,
-        &workspace_paths(snapshot, workspace),
-    )
+/// What the sidebar shows for an agent once manual marks are applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Presence {
+    Blocked,
+    Unread,
+    Done,
+    Working,
+    Idle,
 }
+
+impl Presence {
+    pub(super) fn needs_attention(self) -> bool {
+        matches!(self, Self::Blocked | Self::Unread | Self::Done)
+    }
+
+    pub(super) fn is_active(self) -> bool {
+        self != Self::Idle
+    }
+}
+
+impl ProjectLayout {
+    fn dismissed_key(key: &str, seq: u64) -> String {
+        format!("{key}@{seq}")
+    }
+
+    pub(super) fn presence(
+        &self,
+        key: &str,
+        seq: u64,
+        status: crate::api::schema::AgentStatus,
+    ) -> Presence {
+        use crate::api::schema::AgentStatus;
+        if self.is_unread(key) {
+            return Presence::Unread;
+        }
+        let dismissed = self
+            .dismissed
+            .iter()
+            .any(|entry| *entry == Self::dismissed_key(key, seq));
+        match status {
+            AgentStatus::Working => Presence::Working,
+            AgentStatus::Blocked if !dismissed => Presence::Blocked,
+            AgentStatus::Done if !dismissed => Presence::Done,
+            _ => Presence::Idle,
+        }
+    }
+
+    /// Manual status: unread (needs attention) or inactive (dismissed until the
+    /// agent's next state change).
+    pub(super) fn mark(&mut self, key: &str, seq: u64, unread: bool) {
+        self.unread.retain(|entry| entry != key);
+        let dismissed = Self::dismissed_key(key, seq);
+        let prefix = format!("{key}@");
+        self.dismissed.retain(|entry| !entry.starts_with(&prefix));
+        if unread {
+            self.unread.push(key.to_owned());
+        } else {
+            self.dismissed.push(dismissed);
+            let excess = self.dismissed.len().saturating_sub(200);
+            self.dismissed.drain(..excess);
+        }
+    }
+}
+
+/// A press on a sheprd sidebar row, kept until the button comes up so the
+/// same gesture can be a click (focus) or a drag (move to a project).
+#[derive(Clone, Debug)]
+pub(super) struct RowPress {
+    pub(super) endpoint_id: super::ClientEndpointId,
+    pub(super) workspace_id: String,
+    pub(super) pane_id: Option<String>,
+    pub(super) start: (u16, u16),
+    pub(super) dragging: Option<(u16, u16)>,
+}
+
+fn press_store() -> &'static std::sync::Mutex<Option<RowPress>> {
+    static PRESS: OnceLock<std::sync::Mutex<Option<RowPress>>> = OnceLock::new();
+    PRESS.get_or_init(Default::default)
+}
+
+pub(super) fn set_press(press: Option<RowPress>) {
+    *press_store().lock().unwrap_or_else(|e| e.into_inner()) = press;
+}
+
+pub(super) fn press() -> Option<RowPress> {
+    press_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub(super) fn drag_to(point: (u16, u16)) -> bool {
+    let mut guard = press_store().lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some(press) if press.start != point || press.dragging.is_some() => {
+            press.dragging = Some(point);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Header key used for the catch-all "Other" group.
+pub(super) const OTHER: &str = "\u{0}other";
 
 /// Clear the manual unread flag of an agent once it gains focus (on the focus
 /// transition only, so marking the focused agent itself still sticks).
@@ -528,6 +640,51 @@ mod tests {
         layout.assign("local/x", "A");
         assert_eq!(layout.groups[0].members, vec!["local/x".to_string()]);
         assert!(layout.groups[1].members.is_empty());
+    }
+
+    #[test]
+    fn manual_marks_override_until_state_changes() {
+        use crate::api::schema::AgentStatus;
+        let mut layout = ProjectLayout::default();
+        assert_eq!(
+            layout.presence("dev/p1", 4, AgentStatus::Done),
+            Presence::Done
+        );
+        layout.mark("dev/p1", 4, false);
+        assert_eq!(
+            layout.presence("dev/p1", 4, AgentStatus::Done),
+            Presence::Idle
+        );
+        assert_eq!(
+            layout.presence("dev/p1", 5, AgentStatus::Done),
+            Presence::Done
+        );
+        layout.mark("dev/p1", 5, true);
+        assert_eq!(
+            layout.presence("dev/p1", 5, AgentStatus::Idle),
+            Presence::Unread
+        );
+        assert!(layout.dismissed.is_empty());
+    }
+
+    #[test]
+    fn dragging_to_other_beats_rules_and_back() {
+        let mut layout = ProjectLayout {
+            groups: vec![group("A", &[], &["store"])],
+            ..ProjectLayout::default()
+        };
+        assert_eq!(
+            layout.group_of("local/Storefront", "Storefront", &[]),
+            Some(0)
+        );
+        layout.assign("local/Storefront", "");
+        assert_eq!(layout.group_of("local/Storefront", "Storefront", &[]), None);
+        layout.assign("local/Storefront", "A");
+        assert!(layout.ungrouped.is_empty());
+        assert_eq!(
+            layout.group_of("local/Storefront", "Storefront", &[]),
+            Some(0)
+        );
     }
 
     #[test]

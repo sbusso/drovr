@@ -15,56 +15,70 @@ sheprd does; this page lists only the differences.
 
 ## What sheprd adds
 
-### Projects across machines
-Group workspaces from **any** machine under one collapsible project header,
-instead of one list per machine. Remote members carry a dim machine tag.
+### One sidebar instead of two
+herdr splits the sidebar into *machines* (workspaces per machine) and *agents*.
+With several machines that means the same work appears twice, in two different
+orders. sheprd replaces both with **one list**: your projects, each showing its
+agents from **every** machine, then **Other** for everything not in a project.
 
 ```
+ ○ all agents       detailed      ← filter toggle · view toggle (click)
  ▾ ★ storefront
-   ● storefront-api    gpu-box
+ ● Fix checkout rounding      1   ← agent topic + jump number
+   gpu-box                        ← workspace (if ≠ project) · machine
  ▾ ★ billing
-   ○ billing-web
-   ○ invoices
-   ● billing-web       gpu-box
- ▸ infra                ○ 3     ← collapsed: worst status + member count
- ▾ gpu-box           38ms ●     ← ungrouped leftovers, with live latency
-   ○ scratch
+ ○ Invoice PDF layout         2
+   billing-web
+ ● Retry failed webhooks      3
+   billing-web · gpu-box
+ ▸ infra                   ○ 3    ← collapsed: worst status + count
+ ▾ Other
+ ○ Weekly notes               4
+   notes
+ new · Local   gpu-box 38ms menu  ← live latency per remote machine
 ```
-- **Assign**: drag a workspace onto a project header, or right-click → `→ Project`.
-- **Auto-assign**: a project's match rules catch workspaces whose *name or folder*
-  contains the rule (`storefront` catches `~/code/storefront-api` on every machine),
-  so new agents land in the right place with no clicks.
-- **Organise**: right-click a header → Collapse, Pin to top, Move up/down, Rename,
-  Auto-match rules, Delete. Left-click a header to collapse it.
-- **Hide** workspaces you rarely look at (right-click → Hide). `prefix+alt+h`
-  shows them again (dimmed with ⊘). Their agents leave the agents list too.
 
-### A calmer agents list
-- Follows **project order across machines** (no more "every agent on one machine, then the next").
-- **Jump numbers** on the right; `prefix+#` jumps to any number, not just 1–9.
-- Click the **`agents`** header to show **only the current project's agents**.
-- **Mark unread** (right-click an agent) → yellow `●` until you next focus it.
-- Right-click an agent → Go to, Mark unread/read, Rename pane, Move workspace to
-  project, Hide workspace.
+- **Two views** (click the right header label): *detailed*, one row per agent
+  with its topic, and *compact*, one line per workspace.
+- **Filter** (click the left header label): *all agents* or *active* (only
+  agents that are working or need you).
 
-### Remote
-- Smoothed **round-trip time** beside each saved machine (`gpu-box 38ms`), measured
-  from herdr's existing heartbeat, so you can tell a slow link from a slow herdr.
+### Projects across machines
+- **Drag** any row onto a project header to move its workspace there. Drop it on
+  **Other** to take it out, or on another row to place it just above that row.
+  Right-click → `→ project` does the same without the mouse gesture.
+- **Auto-assign**: a project's match rules catch workspaces whose *name or
+  folder* contains the rule (`storefront` catches `~/code/storefront-api` on
+  every machine), so new agents land in the right place with no clicks.
+  Dragging something to Other overrides its rules.
+- **Organise**: right-click a header → Collapse, Pin to top, Move up/down,
+  Rename, Auto-match rules, Delete. Left-click a header to collapse it.
+- **Hide** workspaces you rarely look at (right-click → Hide); `prefix+alt+h`
+  shows them again, dimmed with ⊘.
+
+### Attention you control
+- `prefix+u` jumps to the **next agent that needs you**: blocked, finished and
+  not looked at yet, or marked unread, in sidebar order.
+- Right-click an agent → **Mark unread** (a yellow `●` status that counts as
+  needing you until you visit it) or **Mark inactive** (drops a finished or
+  blocked agent out of the queue until its state changes again).
+- **Jump numbers** on every agent; `prefix+#` jumps to any number, not just 1–9.
 
 ### Keys (defaults; no config needed)
 | Key | Action |
 |---|---|
-| `prefix+.` | project menu for the focused workspace |
+| `prefix+u` | next agent that needs you |
 | `prefix+#` | jump to agent by number |
+| `prefix+.` | project menu for the focused workspace |
 | `prefix+alt+h` | show / conceal hidden workspaces |
 
 ## Configuration
-Project layout lives client-side in `~/.config/herdr/sidebar.toml`. The UI writes
+Everything lives client-side in `~/.config/herdr/sidebar.toml`. The UI writes
 it, and hand edits reload within a second:
 
 ```toml
-show_hidden = false
-agents_project_only = false
+compact = false                        # view: one row per agent / per workspace
+active_only = false                    # filter: all agents / active ones
 hidden = ["gpu-box/scratch"]           # machine/workspace
 
 [[group]]
@@ -74,8 +88,8 @@ match = ["storefront"]                 # name or folder substring
 members = ["local/notes"]              # explicit members, in display order
 ```
 
-Projects appear when the client is connected to 2+ machines (the federated
-sidebar). Stock herdr ignores this file.
+The combined sidebar appears when the client is connected to 2+ machines. With
+a single machine sheprd looks like herdr. Stock herdr ignores this file.
 
 ## Install
 Linux x86_64, static binary:
@@ -92,8 +106,9 @@ The server keeps running stock herdr; use the matching herdr version on each mac
 `sheprd-v<herdr version>-<n>`, e.g. `sheprd-v0.9.3-1` = herdr 0.9.3 + sheprd patch set 1.
 
 ## For maintainers of this fork
-- Fork code lives in `src/client/shell/projects.rs` (model) and
-  `src/client/shell/project_actions.rs` (menus, clicks, keys). Small hooks in
+- Fork code lives in `src/client/shell/projects.rs` (model),
+  `src/client/shell/sheprd_sidebar.rs` (the combined sidebar) and
+  `src/client/shell/project_actions.rs` (menus, clicks, drag, keys). Small hooks in
   upstream files are tagged: `grep -rn "andreconde fork" src`.
 - Rebase on a new herdr release: `git fetch origin --tags && git rebase --onto v<new> v<old> main`.
 - Release: `git tag sheprd-v<ver>-<n> && git push fork sheprd-v<ver>-<n>` → the

@@ -116,6 +116,10 @@ pub(crate) fn keybind_help_groups(
                 ),
                 entry(binding_label(&keybinds.goto), "session navigator"),
                 entry(
+                    binding_label(&keybinds.next_attention_agent),
+                    "next agent that needs you",
+                ),
+                entry(
                     binding_label(&keybinds.project_menu),
                     "sidebar project menu",
                 ),

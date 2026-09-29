@@ -1,0 +1,713 @@
+//! andreconde fork (sheprd): one combined sidebar for 2+ machines.
+//!
+//! Replaces upstream's "machines" + "agents" split with a single list:
+//! project headers (pinned first), then "Other" for everything ungrouped, with
+//! agents from every machine under them. Two views: detailed (one row per agent)
+//! and compact (one line per workspace). Layout state lives in `projects.rs`.
+
+use std::collections::HashMap;
+
+use super::projects::{self, Presence, ProjectLayout, OTHER};
+use super::render::{display_width, put_right_text, put_text, ShellRenderState};
+use super::*;
+use ratatui::style::Color;
+
+/// Where a sidebar row points; used for click (focus), drag and right-click.
+#[derive(Clone, Debug)]
+pub(super) struct RowHit {
+    pub(super) rect: Rect,
+    pub(super) endpoint_id: ClientEndpointId,
+    pub(super) workspace_id: String,
+    pub(super) pane_id: Option<String>,
+}
+
+enum Row {
+    Header {
+        key: String,
+        label: String,
+        pinned: bool,
+        collapsed: bool,
+        presence: Presence,
+        count: usize,
+    },
+    Agent {
+        endpoint: usize,
+        workspace_id: String,
+        pane_id: String,
+        presence: Presence,
+        focused: bool,
+        stale: bool,
+        title: String,
+        workspace: Option<String>,
+        machine: Option<String>,
+        number: Option<usize>,
+    },
+    Workspace {
+        endpoint: usize,
+        workspace_id: String,
+        label: String,
+        presence: Presence,
+        focused: bool,
+        stale: bool,
+        hidden: bool,
+        machine: Option<String>,
+        number: Option<usize>,
+    },
+}
+
+impl Row {
+    fn height(&self) -> u16 {
+        match self {
+            Row::Agent {
+                workspace, machine, ..
+            } if workspace.is_some() || machine.is_some() => 2,
+            _ => 1,
+        }
+    }
+}
+
+struct AgentInfo {
+    pane_id: String,
+    presence: Presence,
+    focused: bool,
+    stale: bool,
+    title: String,
+    number: Option<usize>,
+}
+
+fn agent_title(agent: &crate::protocol::ClientShellAgent) -> String {
+    [
+        agent.terminal_title_stripped.as_deref(),
+        agent.title.as_deref(),
+        agent.display_agent.as_deref(),
+        agent.name.as_deref(),
+        agent.agent.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|title| !title.is_empty())
+    .unwrap_or("agent")
+    .to_owned()
+}
+
+fn worst(presences: impl IntoIterator<Item = Presence>) -> Presence {
+    let rank = |presence: Presence| match presence {
+        Presence::Blocked => 5,
+        Presence::Unread => 4,
+        Presence::Done => 3,
+        Presence::Working => 2,
+        Presence::Idle => 1,
+    };
+    presences
+        .into_iter()
+        .max_by_key(|presence| rank(*presence))
+        .unwrap_or(Presence::Idle)
+}
+
+pub(super) fn presence_icon(
+    presence: Presence,
+    config: &ClientShellConfig,
+) -> (&'static str, Color) {
+    use crate::api::schema::AgentStatus;
+    let status = match presence {
+        Presence::Blocked => AgentStatus::Blocked,
+        Presence::Done => AgentStatus::Done,
+        Presence::Working => AgentStatus::Working,
+        Presence::Idle => AgentStatus::Idle,
+        Presence::Unread => return ("●", Color::Yellow),
+    };
+    (
+        status_icon(status, config.status_indicators),
+        status_color(status, &config.palette),
+    )
+}
+
+fn workspace_presence(
+    layout: &ProjectLayout,
+    endpoint: &ClientShellEndpoint,
+    snapshot: &ClientShellSnapshot,
+    workspace_id: &str,
+) -> Presence {
+    worst(
+        snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.workspace_id == workspace_id)
+            .map(|agent| {
+                layout.presence(
+                    &projects::agent_key(endpoint, &agent.pane_id),
+                    agent.state_change_seq,
+                    agent.agent_status,
+                )
+            }),
+    )
+}
+
+fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> {
+    let endpoints = state.endpoints;
+    // Agents in navigation order (the same list prefix+alt+N / prefix+# use).
+    let mut agents: HashMap<(usize, String), Vec<AgentInfo>> = HashMap::new();
+    let mut next_number = 0usize;
+    for row in super::aggregate_navigation::aggregate_agent_rows(
+        endpoints,
+        state.active_endpoint_id,
+        crate::config::AgentPanelSortConfig::Spaces,
+    ) {
+        let endpoint = &endpoints[row.endpoint.endpoint_index];
+        let stale = row.endpoint.stale();
+        let number = (!stale).then(|| {
+            next_number += 1;
+            next_number
+        });
+        agents
+            .entry((row.endpoint.endpoint_index, row.agent.workspace_id.clone()))
+            .or_default()
+            .push(AgentInfo {
+                pane_id: row.agent.pane_id.clone(),
+                presence: layout.presence(
+                    &projects::agent_key(endpoint, &row.agent.pane_id),
+                    row.agent.state_change_seq,
+                    row.agent.agent_status,
+                ),
+                focused: row.agent.focused && &endpoint.endpoint_id == state.active_endpoint_id,
+                stale,
+                title: agent_title(row.agent),
+                number,
+            });
+    }
+
+    // Groups in display order, then Other.
+    let (sections, claimed) = projects::sections(layout, endpoints);
+    let mut groups = sections
+        .into_iter()
+        .map(|section| {
+            let group = &layout.groups[section.group];
+            (
+                group.name.clone(),
+                group.name.clone(),
+                group.pinned,
+                group.collapsed,
+                section
+                    .members
+                    .into_iter()
+                    .map(|member| (member.endpoint, member.index, member.hidden))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut other = Vec::new();
+    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+        let Some(snapshot) = endpoint.snapshot.as_deref() else {
+            continue;
+        };
+        for (index, workspace) in snapshot.workspaces.iter().enumerate() {
+            if !claimed.contains(&(endpoint_index, index)) {
+                let hidden = layout.is_hidden(&projects::workspace_key(endpoint, &workspace.label));
+                other.push((endpoint_index, index, hidden));
+            }
+        }
+    }
+    groups.push((
+        OTHER.to_owned(),
+        "Other".to_owned(),
+        false,
+        layout.other_collapsed,
+        other,
+    ));
+
+    let mut rows = Vec::new();
+    for (key, label, pinned, collapsed, members) in groups {
+        let mut body = Vec::new();
+        let mut presences = Vec::new();
+        let mut count = 0usize;
+        for (endpoint_index, index, hidden) in members {
+            if hidden && !layout.show_hidden {
+                continue;
+            }
+            let endpoint = &endpoints[endpoint_index];
+            let Some(snapshot) = endpoint.snapshot.as_deref() else {
+                continue;
+            };
+            let Some(workspace) = snapshot.workspaces.get(index) else {
+                continue;
+            };
+            let stale = endpoint.status != ClientEndpointStatus::Online;
+            let machine = (!endpoint.endpoint_id.is_local()).then(|| endpoint.label.clone());
+            let workspace_agents = agents
+                .remove(&(endpoint_index, workspace.workspace_id.clone()))
+                .unwrap_or_default();
+            let presence = workspace_presence(layout, endpoint, snapshot, &workspace.workspace_id);
+            if layout.active_only && !presence.is_active() {
+                continue;
+            }
+            presences.push(presence);
+            count += 1;
+            let focused = workspace.focused && &endpoint.endpoint_id == state.active_endpoint_id;
+            if layout.compact || workspace_agents.is_empty() {
+                body.push(Row::Workspace {
+                    endpoint: endpoint_index,
+                    workspace_id: workspace.workspace_id.clone(),
+                    label: workspace.label.clone(),
+                    presence,
+                    focused,
+                    stale,
+                    hidden,
+                    machine,
+                    number: workspace_agents.first().and_then(|agent| agent.number),
+                });
+                continue;
+            }
+            let show_workspace = !workspace.label.eq_ignore_ascii_case(&label);
+            for agent in workspace_agents {
+                if layout.active_only && !agent.presence.is_active() {
+                    continue;
+                }
+                body.push(Row::Agent {
+                    endpoint: endpoint_index,
+                    workspace_id: workspace.workspace_id.clone(),
+                    pane_id: agent.pane_id,
+                    presence: agent.presence,
+                    focused: agent.focused,
+                    stale: agent.stale,
+                    title: agent.title,
+                    workspace: show_workspace.then(|| workspace.label.clone()),
+                    machine: machine.clone(),
+                    number: agent.number,
+                });
+            }
+        }
+        if count == 0 && (layout.active_only || key == OTHER) {
+            continue;
+        }
+        rows.push(Row::Header {
+            key,
+            label,
+            pinned,
+            collapsed,
+            presence: worst(presences),
+            count,
+        });
+        if !collapsed {
+            rows.extend(body);
+        }
+    }
+    rows
+}
+
+pub(super) fn render(
+    buffer: &mut Buffer,
+    area: Rect,
+    config: &ClientShellConfig,
+    state: &mut ShellRenderState<'_>,
+    hits: &mut ShellHitMap,
+) {
+    let palette = &config.palette;
+    super::render::render_sidebar_background(buffer, area, palette);
+    hits.sidebar_divider = if area.is_empty() {
+        Rect::default()
+    } else {
+        Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+    };
+    hits.sidebar_section_divider = Rect::default();
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+    let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let layout = projects::layout();
+
+    // Header: filter toggle (left) and view toggle (right).
+    let filter = if layout.active_only {
+        " ◉ active"
+    } else {
+        " ○ all agents"
+    };
+    hits.sheprd_filter_toggle = Rect::new(inner.x, inner.y, display_width(filter), 1);
+    put_text(
+        buffer,
+        inner.x,
+        inner.y,
+        inner.width,
+        filter,
+        Style::default()
+            .fg(if layout.active_only {
+                palette.accent
+            } else {
+                palette.overlay0
+            })
+            .add_modifier(Modifier::BOLD),
+    );
+    let view = if layout.compact {
+        "compact "
+    } else {
+        "detailed "
+    };
+    let view_width = display_width(view);
+    hits.sheprd_view_toggle = Rect::new(
+        inner.right().saturating_sub(view_width),
+        inner.y,
+        view_width,
+        1,
+    );
+    put_right_text(
+        buffer,
+        inner,
+        inner.y,
+        view,
+        Style::default()
+            .fg(palette.overlay0)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows = build_rows(state, &layout);
+    let body = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+    hits.workspace_body = body;
+    let row_heights = rows.iter().map(Row::height).collect::<Vec<_>>();
+    let gaps = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| match (row, rows.get(index + 1)) {
+            (_, Some(Row::Header { .. })) => 1,
+            (Row::Agent { .. }, Some(Row::Agent { .. })) if !layout.compact => {
+                config.agents.row_gap
+            }
+            _ => 0,
+        })
+        .collect::<Vec<_>>();
+    let _ = std::mem::take(state.reveal_navigation_workspace);
+    if std::mem::take(state.reveal_focused_workspace) {
+        if let Some(target) = rows.iter().position(|row| match row {
+            Row::Agent { focused, .. } | Row::Workspace { focused, .. } => *focused,
+            Row::Header { .. } => false,
+        }) {
+            *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
+                &row_heights,
+                &gaps,
+                body.height,
+                *state.workspace_scroll,
+                target,
+            );
+        }
+    }
+    let metrics = super::scroll::list_scroll_metrics(
+        &row_heights,
+        &gaps,
+        body.height,
+        *state.workspace_scroll,
+    );
+    hits.workspace_max_scroll = metrics.max_offset_from_bottom;
+    hits.workspace_scroll_metrics = Some(metrics);
+    *state.workspace_scroll = metrics
+        .max_offset_from_bottom
+        .saturating_sub(metrics.offset_from_bottom);
+    let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
+    let width = body.width.saturating_sub(u16::from(show_scrollbar));
+    let drag_point = projects::press().and_then(|press| press.dragging);
+
+    let mut y = body.y;
+    for (index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
+        let height = row_heights[index];
+        if y.saturating_add(height) > body.bottom() {
+            break;
+        }
+        let rect = Rect::new(body.x, y, width, height);
+        render_row(buffer, rect, row, &layout, state, config, drag_point, hits);
+        y = y.saturating_add(height).saturating_add(gaps[index]);
+    }
+    if show_scrollbar {
+        let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+        hits.workspace_scrollbar = track;
+        super::scroll::render_list_scrollbar(buffer, track, metrics, palette);
+    }
+
+    // Footer: new workspace, menu, collapse.
+    let footer_y = inner.bottom().saturating_sub(1);
+    if config.mouse_capture {
+        let active_label = state
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == state.active_endpoint_id)
+            .map_or("Local", |endpoint| endpoint.label.as_str());
+        let label = format!(" new · {active_label}");
+        hits.new_workspace =
+            Rect::new(inner.x, footer_y, display_width(&label).min(inner.width), 1);
+        put_text(
+            buffer,
+            inner.x,
+            footer_y,
+            inner.width,
+            &label,
+            Style::default().fg(palette.overlay0),
+        );
+        hits.global_launcher = Rect::new(inner.right().saturating_sub(8), footer_y, 6, 1);
+        put_right_text(
+            buffer,
+            Rect::new(inner.x, footer_y, inner.width.saturating_sub(2), 1),
+            footer_y,
+            "menu",
+            Style::default().fg(palette.overlay0),
+        );
+        // Remote machines: live latency, or their state when not online.
+        let machines = state
+            .endpoints
+            .iter()
+            .filter(|endpoint| !endpoint.endpoint_id.is_local())
+            .map(|endpoint| match endpoint.status {
+                ClientEndpointStatus::Online => {
+                    match crate::client::endpoint::endpoint_rtt_ms(&endpoint.endpoint_id) {
+                        Some(rtt) => format!("{} {rtt}ms", endpoint.label),
+                        None => endpoint.label.clone(),
+                    }
+                }
+                _ => {
+                    let (glyph, text, _) = endpoint_status_presentation(endpoint.status, palette);
+                    format!("{} {glyph} {text}", endpoint.label)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let used = display_width(&label) + 7;
+        if !machines.is_empty() && display_width(&machines) + used < inner.width {
+            put_right_text(
+                buffer,
+                Rect::new(inner.x, footer_y, inner.width.saturating_sub(7), 1),
+                footer_y,
+                &machines,
+                Style::default().fg(palette.overlay0),
+            );
+        }
+    }
+    hits.sidebar_toggle = Rect::new(area.right().saturating_sub(2), footer_y, 1, 1);
+    put_text(
+        buffer,
+        hits.sidebar_toggle.x,
+        footer_y,
+        1,
+        "«",
+        Style::default().fg(palette.overlay0),
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // one render pass; splitting only shuffles args
+fn render_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    row: &Row,
+    layout: &ProjectLayout,
+    state: &ShellRenderState<'_>,
+    config: &ClientShellConfig,
+    drag_point: Option<(u16, u16)>,
+    hits: &mut ShellHitMap,
+) {
+    let palette = &config.palette;
+    let gutter = |buffer: &mut Buffer, number: Option<usize>, y: u16| {
+        if let Some(number) = number {
+            put_right_text(
+                buffer,
+                rect,
+                y,
+                &format!("{number} "),
+                Style::default().fg(palette.overlay0),
+            );
+        }
+    };
+    match row {
+        Row::Header {
+            key,
+            label,
+            pinned,
+            collapsed,
+            presence,
+            count,
+        } => {
+            if drag_point.is_some_and(|point| super::contains(rect, point)) {
+                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            }
+            let marker = if *collapsed { "▸" } else { "▾" };
+            let pin = if *pinned { "★ " } else { "" };
+            let other = key == OTHER;
+            put_text(
+                buffer,
+                rect.x,
+                rect.y,
+                rect.width.saturating_sub(6),
+                &format!(" {marker} {pin}{label}"),
+                Style::default()
+                    .fg(if other {
+                        palette.overlay0
+                    } else {
+                        palette.accent
+                    })
+                    .add_modifier(Modifier::BOLD),
+            );
+            if *collapsed {
+                let (icon, color) = presence_icon(*presence, config);
+                put_right_text(
+                    buffer,
+                    rect,
+                    rect.y,
+                    &format!("{icon} {count} "),
+                    Style::default().fg(color),
+                );
+            }
+            hits.projects.push((rect, key.clone()));
+        }
+        Row::Agent {
+            endpoint,
+            workspace_id,
+            pane_id,
+            presence,
+            focused,
+            stale,
+            title,
+            workspace,
+            machine,
+            number,
+        } => {
+            let endpoint = &state.endpoints[*endpoint];
+            if *focused {
+                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            }
+            let (icon, color) = presence_icon(*presence, config);
+            let number_width = number.map_or(0, |number| display_width(&format!("{number} ")) + 1);
+            put_text(
+                buffer,
+                rect.x + 1,
+                rect.y,
+                1,
+                icon,
+                Style::default().fg(color),
+            );
+            put_text(
+                buffer,
+                rect.x + 3,
+                rect.y,
+                rect.width.saturating_sub(3 + number_width),
+                title,
+                Style::default()
+                    .fg(if *focused {
+                        palette.text
+                    } else {
+                        palette.subtext0
+                    })
+                    .add_modifier(Modifier::BOLD),
+            );
+            gutter(buffer, *number, rect.y);
+            if rect.height > 1 {
+                let mut x = rect.x + 3;
+                let right = rect.right();
+                if let Some(workspace) = workspace {
+                    put_text(
+                        buffer,
+                        x,
+                        rect.y + 1,
+                        right.saturating_sub(x),
+                        workspace,
+                        Style::default().fg(palette.overlay0),
+                    );
+                    x = x.saturating_add(display_width(workspace));
+                    if machine.is_some() {
+                        put_text(
+                            buffer,
+                            x,
+                            rect.y + 1,
+                            right.saturating_sub(x),
+                            " · ",
+                            Style::default().fg(palette.overlay0),
+                        );
+                        x = x.saturating_add(3);
+                    }
+                }
+                if let Some(machine) = machine {
+                    put_text(
+                        buffer,
+                        x,
+                        rect.y + 1,
+                        right.saturating_sub(x),
+                        machine,
+                        Style::default()
+                            .fg(palette.subtext0)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+            if *stale {
+                buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            hits.endpoint_agents
+                .push((rect, endpoint.endpoint_id.clone(), pane_id.clone()));
+            hits.sheprd_rows.push(RowHit {
+                rect,
+                endpoint_id: endpoint.endpoint_id.clone(),
+                workspace_id: workspace_id.clone(),
+                pane_id: Some(pane_id.clone()),
+            });
+        }
+        Row::Workspace {
+            endpoint,
+            workspace_id,
+            label,
+            presence,
+            focused,
+            stale,
+            hidden,
+            machine,
+            number,
+        } => {
+            let endpoint = &state.endpoints[*endpoint];
+            if *focused {
+                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            }
+            let (icon, color) = presence_icon(*presence, config);
+            put_text(
+                buffer,
+                rect.x + 1,
+                rect.y,
+                1,
+                if *hidden { "⊘" } else { icon },
+                Style::default().fg(color),
+            );
+            let tag = match (machine, number) {
+                (Some(machine), Some(number)) => format!("{machine} {number} "),
+                (Some(machine), None) => format!("{machine} "),
+                (None, Some(number)) => format!("{number} "),
+                (None, None) => String::new(),
+            };
+            put_text(
+                buffer,
+                rect.x + 3,
+                rect.y,
+                rect.width.saturating_sub(4 + display_width(&tag)),
+                label,
+                Style::default().fg(if *focused {
+                    palette.text
+                } else if layout.compact {
+                    palette.subtext0
+                } else {
+                    palette.overlay0
+                }),
+            );
+            put_right_text(
+                buffer,
+                rect,
+                rect.y,
+                &tag,
+                Style::default().fg(palette.overlay0),
+            );
+            if *stale || *hidden {
+                buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            hits.sheprd_rows.push(RowHit {
+                rect,
+                endpoint_id: endpoint.endpoint_id.clone(),
+                workspace_id: workspace_id.clone(),
+                pane_id: None,
+            });
+        }
+    }
+}

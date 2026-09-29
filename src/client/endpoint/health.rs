@@ -56,32 +56,61 @@ impl EndpointHealth {
     pub(super) fn ping_sent(&mut self, now: Instant) {
         self.ping_sent_at = Some(now);
     }
-
-    /// andreconde fork: time since the outstanding ping, if any. Pings only go
-    /// out after HEARTBEAT_INTERVAL of silence, so the next message is almost
-    /// always the pong.
-    pub(super) fn rtt_sample(&self, now: Instant) -> Option<Duration> {
-        self.ping_sent_at
-            .map(|sent_at| now.saturating_duration_since(sent_at))
-    }
 }
 
-/// andreconde fork: smoothed round-trip time per endpoint, for the sidebar.
-fn rtt_store() -> &'static std::sync::Mutex<std::collections::HashMap<super::ClientEndpointId, f64>>
-{
+/// andreconde fork (sheprd): smoothed round-trip time per endpoint, for the
+/// sidebar. herdr only pings after HEARTBEAT_INTERVAL of silence, so a busy
+/// link would never be measured; sheprd sends its own light probe every
+/// RTT_PROBE_INTERVAL and times the matching pong.
+pub(super) const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct RttState {
+    smoothed_ms: Option<f64>,
+    probe_sent_at: Option<Instant>,
+    last_probe: Option<Instant>,
+}
+
+fn rtt_store(
+) -> &'static std::sync::Mutex<std::collections::HashMap<super::ClientEndpointId, RttState>> {
     static STORE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<super::ClientEndpointId, f64>>,
+        std::sync::Mutex<std::collections::HashMap<super::ClientEndpointId, RttState>>,
     > = std::sync::OnceLock::new();
     STORE.get_or_init(Default::default)
 }
 
-pub(super) fn record_rtt(endpoint_id: &super::ClientEndpointId, sample: Duration) {
-    let sample = sample.as_secs_f64() * 1000.0;
+/// True when a latency probe should go out now; records it as sent.
+pub(super) fn rtt_probe_due(endpoint_id: &super::ClientEndpointId, now: Instant) -> bool {
     let mut store = rtt_store().lock().unwrap_or_else(|e| e.into_inner());
-    let smoothed = store
-        .get(endpoint_id)
-        .map_or(sample, |previous| previous * 0.7 + sample * 0.3);
-    store.insert(endpoint_id.clone(), smoothed);
+    let state = store.entry(endpoint_id.clone()).or_default();
+    let outstanding = state
+        .probe_sent_at
+        .is_some_and(|sent| now.saturating_duration_since(sent) < HEARTBEAT_TIMEOUT);
+    let due = state
+        .last_probe
+        .is_none_or(|last| now.saturating_duration_since(last) >= RTT_PROBE_INTERVAL);
+    if outstanding || !due {
+        return false;
+    }
+    state.probe_sent_at = Some(now);
+    state.last_probe = Some(now);
+    true
+}
+
+pub(crate) fn rtt_pong(endpoint_id: &super::ClientEndpointId) {
+    let mut store = rtt_store().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = store.get_mut(endpoint_id) else {
+        return;
+    };
+    let Some(sent) = state.probe_sent_at.take() else {
+        return;
+    };
+    let sample = sent.elapsed().as_secs_f64() * 1000.0;
+    state.smoothed_ms = Some(
+        state
+            .smoothed_ms
+            .map_or(sample, |previous| previous * 0.7 + sample * 0.3),
+    );
 }
 
 pub(crate) fn endpoint_rtt_ms(endpoint_id: &super::ClientEndpointId) -> Option<u32> {
@@ -89,6 +118,7 @@ pub(crate) fn endpoint_rtt_ms(endpoint_id: &super::ClientEndpointId) -> Option<u
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(endpoint_id)
+        .and_then(|state| state.smoothed_ms)
         .map(|ms| ms.round() as u32)
 }
 

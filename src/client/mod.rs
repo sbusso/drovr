@@ -2045,7 +2045,11 @@ async fn run_client_loop(
                             continue;
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
-                            Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::HealthPong) => {
+                                // andreconde fork (sheprd): time the latency probe.
+                                endpoint::rtt_pong(&endpoint_id);
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 projection,
                             )) => {

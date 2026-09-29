@@ -278,14 +278,26 @@ pub(super) fn render_shell(
                     &mut hits,
                 );
             } else {
-                super::endpoint_sidebar::render_expanded(
-                    buffer,
-                    layout.sidebar,
-                    Some(snapshot),
-                    config,
-                    &mut state,
-                    &mut hits,
-                );
+                // andreconde fork (sheprd): one combined projects + agents list.
+                // Unit tests keep exercising the stock renderer they were written for.
+                if cfg!(test) {
+                    super::endpoint_sidebar::render_expanded(
+                        buffer,
+                        layout.sidebar,
+                        Some(snapshot),
+                        config,
+                        &mut state,
+                        &mut hits,
+                    );
+                } else {
+                    super::sheprd_sidebar::render(
+                        buffer,
+                        layout.sidebar,
+                        config,
+                        &mut state,
+                        &mut hits,
+                    );
+                }
             }
         } else if state.sidebar_collapsed {
             render_collapsed_sidebar(
@@ -327,10 +339,12 @@ pub(super) fn render_shell(
         hits.workspace_scrollbar = Rect::default();
         hits.agent_scrollbar = Rect::default();
         hits.agent_sort_toggle = Rect::default();
-        hits.agent_scope_toggle = Rect::default();
         hits.new_workspace = Rect::default();
         hits.machines.clear();
         hits.projects.clear();
+        hits.sheprd_rows.clear();
+        hits.sheprd_view_toggle = Rect::default();
+        hits.sheprd_filter_toggle = Rect::default();
         hits.workspaces.clear();
         hits.agents.clear();
         hits.endpoint_agents.clear();

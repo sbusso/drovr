@@ -86,6 +86,10 @@ pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
     /// andreconde fork: project header rows (rect, group name).
     pub(super) projects: Vec<(Rect, String)>,
+    /// andreconde fork (sheprd): combined sidebar rows and header toggles.
+    pub(super) sheprd_rows: Vec<super::sheprd_sidebar::RowHit>,
+    pub(super) sheprd_view_toggle: Rect,
+    pub(super) sheprd_filter_toggle: Rect,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -102,8 +106,6 @@ pub(super) struct ShellHitMap {
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) agent_max_scroll: usize,
     pub(super) agent_sort_toggle: Rect,
-    /// andreconde fork: agents header label (all / this project).
-    pub(super) agent_scope_toggle: Rect,
     pub(super) sidebar_divider: Rect,
     pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
@@ -547,13 +549,13 @@ pub(super) enum ClientContextMenuAction {
     ProjectToggleHidden,
     ProjectMoveUp,
     ProjectMoveDown,
-    ProjectShowHidden,
     ProjectTogglePin,
     ProjectToggleCollapse,
     ProjectRename,
     ProjectRules,
     ProjectDelete,
-    AgentToggleUnread,
+    AgentMarkUnread,
+    AgentMarkInactive,
     AgentFocus,
     AgentRename,
 }
@@ -583,10 +585,8 @@ pub(super) enum ClientContextMenuTarget {
     /// stock workspace menu when the workspace is on the active machine.
     ProjectWorkspace {
         key: String,
-        explicit: bool,
         grouped: bool,
         hidden: bool,
-        show_hidden: bool,
         groups: Vec<String>,
         base: Option<Box<ClientContextMenuTarget>>,
     },
@@ -594,15 +594,18 @@ pub(super) enum ClientContextMenuTarget {
         name: String,
         pinned: bool,
         collapsed: bool,
-        show_hidden: bool,
     },
     Agent {
         endpoint_id: ClientEndpointId,
         pane_id: String,
         unread_key: String,
+        seq: u64,
+        status: crate::api::schema::AgentStatus,
         workspace_key: Option<String>,
         hidden: bool,
         active: bool,
+        groups: Vec<String>,
+        grouped: bool,
     },
 }
 

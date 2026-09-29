@@ -1,9 +1,6 @@
 use super::render::put_text;
 use super::*;
 
-/// andreconde fork: manual unread marker colour (terminal palette yellow).
-const UNREAD: ratatui::style::Color = ratatui::style::Color::Yellow;
-
 pub(super) fn render_collapsed(
     buffer: &mut Buffer,
     area: Rect,
@@ -75,40 +72,7 @@ pub(super) fn render_expanded(
         hits,
         |row| row.agent.rows.len(),
         |buffer, rect, row, hits| {
-            // andreconde fork: reserve a right-hand column for the jump number
-            // and the manual unread dot.
-            let gutter = 4.min(rect.width);
-            let body = Rect::new(rect.x, rect.y, rect.width - gutter, rect.height);
-            super::agent_sidebar::render_agent_row(buffer, body, &row.agent, config);
-            let gutter_rect = Rect::new(body.right(), rect.y, gutter, 1);
-            if row.agent.focused {
-                buffer.set_style(
-                    Rect::new(body.right(), rect.y, gutter, rect.height),
-                    Style::default().bg(config.palette.active_row_bg),
-                );
-            }
-            let number = row
-                .number
-                .map(|number| format!("{number:>3}"))
-                .unwrap_or_default();
-            if row.unread {
-                put_text(
-                    buffer,
-                    gutter_rect.x,
-                    gutter_rect.y,
-                    1,
-                    "●",
-                    Style::default().fg(UNREAD),
-                );
-            }
-            put_text(
-                buffer,
-                gutter_rect.x + 1.min(gutter),
-                gutter_rect.y,
-                gutter.saturating_sub(1),
-                &number,
-                Style::default().fg(config.palette.overlay0),
-            );
+            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
             if row.stale {
                 buffer.set_style(
                     rect,
@@ -163,9 +127,6 @@ struct EndpointAgentRow {
     machine_label: String,
     stale: bool,
     agent: super::agent_sidebar::AgentRow,
-    /// andreconde fork: 1-based jump number (matches focus_agent / jump_agent).
-    number: Option<usize>,
-    unread: bool,
 }
 
 fn agent_rows(
@@ -195,9 +156,7 @@ fn agent_rows(
         .flatten()
         .collect::<HashMap<_, _>>();
 
-    let layout = super::projects::layout();
-    let mut next_number = 0usize;
-    let rows = super::aggregate_navigation::aggregate_agent_rows(
+    super::aggregate_navigation::aggregate_agent_rows(
         endpoints,
         active_endpoint_id,
         config.agent_panel_sort,
@@ -207,21 +166,12 @@ fn agent_rows(
         let key = (row.endpoint.endpoint_id.clone(), row.agent.pane_id.clone());
         let mut agent = rendered_rows.remove(&key)?;
         agent.focused &= row.endpoint.endpoint_id == active_endpoint_id;
-        let unread_key = format!("{}/{}", row.endpoint.label.to_lowercase(), agent.pane_id);
-        let stale = row.endpoint.stale();
-        let number = (!stale).then(|| {
-            next_number += 1;
-            next_number
-        });
         Some(EndpointAgentRow {
             endpoint_id: row.endpoint.endpoint_id.clone(),
             machine_label: row.endpoint.label.to_owned(),
-            stale,
-            unread: layout.is_unread(&unread_key),
+            stale: row.endpoint.stale(),
             agent,
-            number,
         })
     })
-    .collect::<Vec<_>>();
-    rows
+    .collect()
 }

@@ -186,9 +186,6 @@ impl EndpointRegistry {
             .filter(|connection| connection.generation == generation)
             .and_then(|connection| connection.health.as_mut())
         {
-            if let Some(sample) = health.rtt_sample(now) {
-                super::health::record_rtt(endpoint_id, sample);
-            }
             health.received(now);
         }
     }
@@ -216,6 +213,24 @@ impl EndpointRegistry {
             })
             .filter(|(_, action)| *action != HealthAction::None)
             .collect::<Vec<_>>();
+        // andreconde fork (sheprd): periodic latency probe on remote machines.
+        let probes = self
+            .connections
+            .iter()
+            .filter(|(endpoint_id, connection)| {
+                !endpoint_id.is_local()
+                    && connection.health.is_some()
+                    && super::health::rtt_probe_due(endpoint_id, now)
+            })
+            .map(|(endpoint_id, _)| endpoint_id.clone())
+            .collect::<Vec<_>>();
+        for endpoint_id in probes {
+            let ping = ClientMessage::EndpointControl {
+                kind: crate::protocol::endpoint::HEALTH_PING_KIND.into(),
+                data: String::new(),
+            };
+            let _ = self.send_to(&endpoint_id, &ping);
+        }
         for (endpoint_id, action) in actions {
             match action {
                 HealthAction::None => {}

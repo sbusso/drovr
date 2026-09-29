@@ -71,6 +71,7 @@ pub(crate) enum KeybindAction {
     Detach,
     OpenNavigator,
     ProjectMenu,
+    NextAttentionAgent,
     JumpAgent,
     ToggleHiddenWorkspaces,
 }
@@ -158,6 +159,10 @@ pub(crate) fn resolve_non_indexed_action(
         (&keybinds.detach, KeybindAction::Detach),
         (&keybinds.goto, KeybindAction::OpenNavigator),
         (&keybinds.project_menu, KeybindAction::ProjectMenu),
+        (
+            &keybinds.next_attention_agent,
+            KeybindAction::NextAttentionAgent,
+        ),
         (&keybinds.jump_agent, KeybindAction::JumpAgent),
         (
             &keybinds.toggle_hidden_workspaces,
