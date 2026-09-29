@@ -1,10 +1,12 @@
+<p align="center"><img src="sheprd-logo.svg" width="112" alt="sheprd logo"></p>
+
 # sheprd
 
 **A herdr fork for people who run many agents on more than one machine.**
 A shepherd tends the herd: same runtime, smarter pasture.
 
 sheprd is a *client-side* fork of [herdr](https://github.com/herdrdev/herdr) by
-herdrdev. The server is unchanged, so the `sheprd` client attaches to stock
+herdrdev, with its own logo and name so the two are never confused. The server is unchanged, so the `sheprd` client attaches to stock
 `herdr` servers of the same version, locally and over SSH. Everything herdr does,
 sheprd does; this page lists only the differences.
 
@@ -18,20 +20,19 @@ Group workspaces from **any** machine under one collapsible project header,
 instead of one list per machine. Remote members carry a dim machine tag.
 
 ```
- ▾ ★ TheCalendar
-   ● TheCalendar       dev
- ▾ ★ LF
-   ○ lf-seguros-web
-   ○ LF Contracts
-   ● lf-seguros-web    dev
- ▸ Infrastructure       ○ 3     ← collapsed: worst status + member count
- ▾ dev               74ms ●     ← ungrouped leftovers, with live latency
-   ○ DTech
+ ▾ ★ storefront
+   ● storefront-api    gpu-box
+ ▾ ★ billing
+   ○ billing-web
+   ○ invoices
+   ● billing-web       gpu-box
+ ▸ infra                ○ 3     ← collapsed: worst status + member count
+ ▾ gpu-box           38ms ●     ← ungrouped leftovers, with live latency
+   ○ scratch
 ```
-
 - **Assign**: drag a workspace onto a project header, or right-click → `→ Project`.
 - **Auto-assign**: a project's match rules catch workspaces whose *name or folder*
-  contains the rule (`calendar` catches `~/Projects/TheCalendar` on every machine),
+  contains the rule (`storefront` catches `~/code/storefront-api` on every machine),
   so new agents land in the right place with no clicks.
 - **Organise**: right-click a header → Collapse, Pin to top, Move up/down, Rename,
   Auto-match rules, Delete. Left-click a header to collapse it.
@@ -39,7 +40,7 @@ instead of one list per machine. Remote members carry a dim machine tag.
   shows them again (dimmed with ⊘). Their agents leave the agents list too.
 
 ### A calmer agents list
-- Follows **project order across machines** (no more "all Local, then all dev").
+- Follows **project order across machines** (no more "every agent on one machine, then the next").
 - **Jump numbers** on the right; `prefix+#` jumps to any number, not just 1–9.
 - Click the **`agents`** header to show **only the current project's agents**.
 - **Mark unread** (right-click an agent) → yellow `●` until you next focus it.
@@ -47,7 +48,7 @@ instead of one list per machine. Remote members carry a dim machine tag.
   project, Hide workspace.
 
 ### Remote
-- Smoothed **round-trip time** beside each saved machine (`dev 74ms`), measured
+- Smoothed **round-trip time** beside each saved machine (`gpu-box 38ms`), measured
   from herdr's existing heartbeat, so you can tell a slow link from a slow herdr.
 
 ### Keys (defaults; no config needed)
@@ -64,13 +65,13 @@ it, and hand edits reload within a second:
 ```toml
 show_hidden = false
 agents_project_only = false
-hidden = ["dev/Vaultwarden"]           # machine/workspace
+hidden = ["gpu-box/scratch"]           # machine/workspace
 
 [[group]]
-name = "TheCalendar"
+name = "storefront"
 pinned = true
-match = ["calendar"]                   # name or folder substring
-members = ["local/Finance"]            # explicit members, in display order
+match = ["storefront"]                 # name or folder substring
+members = ["local/notes"]              # explicit members, in display order
 ```
 
 Projects appear when the client is connected to 2+ machines (the federated

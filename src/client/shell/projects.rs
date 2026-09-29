@@ -1,20 +1,20 @@
 //! andreconde fork (sheprd): client-local project groups for the federated sidebar.
 //! User-facing docs: .github/README.md.
 //!
-//! Projects group workspaces from any machine (Local, dev, ...) under one header,
+//! Projects group workspaces from any machine (Local, gpu-box, ...) under one header,
 //! independent of where the panes live. The layout is purely client-side and
 //! lives in `<config_dir>/sidebar.toml`, so the stock server never sees it. It is
 //! hand-editable; UI actions (right-click menus, keys) rewrite it.
 //!
 //! ```toml
 //! show_hidden = false
-//! hidden = ["dev/Vaultwarden"]
+//! hidden = ["gpu-box/scratch"]
 //!
 //! [[group]]
-//! name = "TheCalendar"
+//! name = "Storefront"
 //! pinned = true
-//! members = ["dev/TheCalendar", "local/TheCalendar"]   # machine/workspace label
-//! match = ["calendar"]                                 # auto-assign by label substring
+//! members = ["gpu-box/Storefront", "local/Storefront"]   # machine/workspace label
+//! match = ["storefront"]                                 # auto-assign by label substring
 //! ```
 //!
 //! Kept in its own module behind a process-wide lock so the upstream render and
@@ -484,22 +484,22 @@ mod tests {
     fn explicit_membership_beats_rules() {
         let layout = ProjectLayout {
             groups: vec![
-                group("A", &[], &["cal"]),
-                group("B", &["dev/TheCalendar"], &[]),
+                group("A", &[], &["store"]),
+                group("B", &["gpu-box/Storefront"], &[]),
             ],
             ..ProjectLayout::default()
         };
         assert_eq!(
-            layout.group_of("dev/TheCalendar", "TheCalendar", &[]),
+            layout.group_of("gpu-box/Storefront", "Storefront", &[]),
             Some(1)
         );
         assert_eq!(
-            layout.group_of("local/TheCalendar", "TheCalendar", &[]),
+            layout.group_of("local/Storefront", "Storefront", &[]),
             Some(0)
         );
-        assert_eq!(layout.group_of("local/Finance", "Finance", &[]), None);
+        assert_eq!(layout.group_of("local/Notes", "Notes", &[]), None);
         assert_eq!(
-            layout.group_of("dev/tc", "tc", &["/root/Projects/TheCalendar".into()]),
+            layout.group_of("gpu-box/sf", "sf", &["/home/me/code/Storefront".into()]),
             Some(0)
         );
     }

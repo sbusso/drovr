@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="sheprd">
+  <title>sheprd</title>
+  <!-- Rounded tile -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#1f2a24"/>
+  <!-- Shepherd's crook: a staff whose hook curls over the flock -->
+  <path d="M46 108 V52 a22 22 0 1 1 44 0 v4" fill="none" stroke="#e8d9a8" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- The flock: three grouped dots, one per machine -->
+  <circle cx="72" cy="92" r="8" fill="#8fd694"/>
+  <circle cx="92" cy="92" r="8" fill="#8fd694"/>
+  <circle cx="82" cy="75" r="8" fill="#f2c14e"/>
+</svg>
