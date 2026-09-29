@@ -16,6 +16,7 @@ mod writer;
 pub(crate) use activation::*;
 pub(crate) use catalog::*;
 pub(crate) use control::*;
+pub(crate) use health::endpoint_rtt_ms;
 pub(crate) use message_policy::*;
 pub(crate) use registry::*;
 pub(crate) use ssh_metadata::{SshMachineMetadata, SshMetadataCache};

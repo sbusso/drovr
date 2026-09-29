@@ -56,6 +56,40 @@ impl EndpointHealth {
     pub(super) fn ping_sent(&mut self, now: Instant) {
         self.ping_sent_at = Some(now);
     }
+
+    /// andreconde fork: time since the outstanding ping, if any. Pings only go
+    /// out after HEARTBEAT_INTERVAL of silence, so the next message is almost
+    /// always the pong.
+    pub(super) fn rtt_sample(&self, now: Instant) -> Option<Duration> {
+        self.ping_sent_at
+            .map(|sent_at| now.saturating_duration_since(sent_at))
+    }
+}
+
+/// andreconde fork: smoothed round-trip time per endpoint, for the sidebar.
+fn rtt_store() -> &'static std::sync::Mutex<std::collections::HashMap<super::ClientEndpointId, f64>>
+{
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<super::ClientEndpointId, f64>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(Default::default)
+}
+
+pub(super) fn record_rtt(endpoint_id: &super::ClientEndpointId, sample: Duration) {
+    let sample = sample.as_secs_f64() * 1000.0;
+    let mut store = rtt_store().lock().unwrap_or_else(|e| e.into_inner());
+    let smoothed = store
+        .get(endpoint_id)
+        .map_or(sample, |previous| previous * 0.7 + sample * 0.3);
+    store.insert(endpoint_id.clone(), smoothed);
+}
+
+pub(crate) fn endpoint_rtt_ms(endpoint_id: &super::ClientEndpointId) -> Option<u32> {
+    rtt_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(endpoint_id)
+        .map(|ms| ms.round() as u32)
 }
 
 #[cfg(test)]

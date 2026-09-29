@@ -196,7 +196,6 @@ fn agent_rows(
         .collect::<HashMap<_, _>>();
 
     let layout = super::projects::layout();
-    let mut focused_key = None;
     let mut next_number = 0usize;
     let rows = super::aggregate_navigation::aggregate_agent_rows(
         endpoints,
@@ -209,9 +208,6 @@ fn agent_rows(
         let mut agent = rendered_rows.remove(&key)?;
         agent.focused &= row.endpoint.endpoint_id == active_endpoint_id;
         let unread_key = format!("{}/{}", row.endpoint.label.to_lowercase(), agent.pane_id);
-        if agent.focused {
-            focused_key = Some(unread_key.clone());
-        }
         let stale = row.endpoint.stale();
         let number = (!stale).then(|| {
             next_number += 1;
@@ -227,6 +223,5 @@ fn agent_rows(
         })
     })
     .collect::<Vec<_>>();
-    super::projects::note_focused_agent(focused_key);
     rows
 }

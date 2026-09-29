@@ -1,4 +1,5 @@
-//! andreconde fork: client-local project groups for the federated sidebar.
+//! andreconde fork (sheprd): client-local project groups for the federated sidebar.
+//! User-facing docs: .github/README.md.
 //!
 //! Projects group workspaces from any machine (Local, dev, ...) under one header,
 //! independent of where the panes live. The layout is purely client-side and
@@ -52,6 +53,9 @@ pub(super) struct ProjectLayout {
     /// Agents marked unread by hand (`machine/pane_id`); cleared when focused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) unread: Vec<String>,
+    /// Agents list shows only the focused workspace's project.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) agents_project_only: bool,
     #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
     pub(super) groups: Vec<ProjectGroup>,
 }
@@ -173,15 +177,21 @@ impl ProjectLayout {
             .position(|group| group.members.iter().any(|member| member == key))
     }
 
-    /// Group for a workspace: explicit membership wins, then the first rule match.
-    pub(super) fn group_of(&self, key: &str, label: &str) -> Option<usize> {
+    /// Group for a workspace: explicit membership wins, then the first rule that
+    /// matches the workspace name or any folder its panes run in.
+    pub(super) fn group_of(&self, key: &str, label: &str, paths: &[String]) -> Option<usize> {
         self.explicit_group(key).or_else(|| {
             let label = label.to_lowercase();
+            let paths = paths
+                .iter()
+                .map(|path| path.to_lowercase())
+                .collect::<Vec<_>>();
             self.groups.iter().position(|group| {
-                group
-                    .rules
-                    .iter()
-                    .any(|rule| !rule.is_empty() && label.contains(&rule.to_lowercase()))
+                group.rules.iter().any(|rule| {
+                    let rule = rule.to_lowercase();
+                    !rule.is_empty()
+                        && (label.contains(&rule) || paths.iter().any(|path| path.contains(&rule)))
+                })
             })
         })
     }
@@ -273,6 +283,24 @@ impl ProjectLayout {
     }
 }
 
+/// Folders a workspace lives in: its new-pane cwd plus every pane's cwd.
+pub(super) fn workspace_paths(
+    snapshot: &crate::protocol::ClientShellSnapshot,
+    workspace: &crate::protocol::ClientShellWorkspace,
+) -> Vec<String> {
+    let mut paths = vec![workspace.new_workspace_cwd.clone()];
+    for pane in snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.workspace_id == workspace.workspace_id)
+    {
+        paths.extend(pane.foreground_cwd.iter().cloned());
+        paths.extend(pane.cwd.iter().cloned());
+    }
+    paths.retain(|path| !path.is_empty());
+    paths
+}
+
 /// One workspace placed in the federated sidebar.
 #[derive(Clone, Debug)]
 pub(super) struct PlacedWorkspace {
@@ -308,7 +336,8 @@ pub(super) fn sections(
         };
         for (index, workspace) in snapshot.workspaces.iter().enumerate() {
             let key = workspace_key(endpoint, &workspace.label);
-            let Some(group) = layout.group_of(&key, &workspace.label) else {
+            let paths = workspace_paths(snapshot, workspace);
+            let Some(group) = layout.group_of(&key, &workspace.label, &paths) else {
                 continue;
             };
             claimed.insert((endpoint_index, index));
@@ -381,19 +410,42 @@ pub(super) fn agent_rank(
     layout: &ProjectLayout,
     endpoint: &ClientShellEndpoint,
     workspace_label: &str,
+    paths: &[String],
 ) -> Option<(usize, usize)> {
     let key = workspace_key(endpoint, workspace_label);
     if layout.is_hidden(&key) && !layout.show_hidden {
         return None;
     }
     let order = layout.display_order();
-    Some(match layout.group_of(&key, workspace_label) {
+    Some(match layout.group_of(&key, workspace_label, paths) {
         Some(group) => (
             order.iter().position(|index| *index == group).unwrap_or(0),
             layout.member_rank(group, &key),
         ),
         None => (usize::MAX, 0),
     })
+}
+
+/// Project of the workspace focused on the active machine, if it has one.
+pub(super) fn focused_group(
+    layout: &ProjectLayout,
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &super::ClientEndpointId,
+) -> Option<usize> {
+    let endpoint = endpoints
+        .iter()
+        .find(|endpoint| &endpoint.endpoint_id == active_endpoint_id)?;
+    let snapshot = endpoint.snapshot.as_deref()?;
+    let focused = snapshot.focused_workspace_id.as_deref()?;
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == focused)?;
+    layout.group_of(
+        &workspace_key(endpoint, &workspace.label),
+        &workspace.label,
+        &workspace_paths(snapshot, workspace),
+    )
 }
 
 /// Clear the manual unread flag of an agent once it gains focus (on the focus
@@ -437,9 +489,19 @@ mod tests {
             ],
             ..ProjectLayout::default()
         };
-        assert_eq!(layout.group_of("dev/TheCalendar", "TheCalendar"), Some(1));
-        assert_eq!(layout.group_of("local/TheCalendar", "TheCalendar"), Some(0));
-        assert_eq!(layout.group_of("local/Finance", "Finance"), None);
+        assert_eq!(
+            layout.group_of("dev/TheCalendar", "TheCalendar", &[]),
+            Some(1)
+        );
+        assert_eq!(
+            layout.group_of("local/TheCalendar", "TheCalendar", &[]),
+            Some(0)
+        );
+        assert_eq!(layout.group_of("local/Finance", "Finance", &[]), None);
+        assert_eq!(
+            layout.group_of("dev/tc", "tc", &["/root/Projects/TheCalendar".into()]),
+            Some(0)
+        );
     }
 
     #[test]

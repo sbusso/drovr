@@ -102,6 +102,8 @@ pub(super) struct ShellHitMap {
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) agent_max_scroll: usize,
     pub(super) agent_sort_toggle: Rect,
+    /// andreconde fork: agents header label (all / this project).
+    pub(super) agent_scope_toggle: Rect,
     pub(super) sidebar_divider: Rect,
     pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
@@ -1627,6 +1629,19 @@ impl ClientShellState {
             }
         }
         self.snapshot = Some(snapshot);
+        // andreconde fork: focusing an agent clears its manual unread mark.
+        let focused_agent = self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.focused_pane_id.as_deref())
+            .map(|pane_id| {
+                format!(
+                    "{}/{}",
+                    self.active_endpoint_label().to_lowercase(),
+                    pane_id
+                )
+            });
+        super::projects::note_focused_agent(focused_agent);
         self.reconcile_pending_workspace_highlight();
         let pending_surface = self.pending_pane_surface.take();
         if let Some(surface) = pending_surface {

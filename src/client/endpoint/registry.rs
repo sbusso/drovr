@@ -186,6 +186,9 @@ impl EndpointRegistry {
             .filter(|connection| connection.generation == generation)
             .and_then(|connection| connection.health.as_mut())
         {
+            if let Some(sample) = health.rtt_sample(now) {
+                super::health::record_rtt(endpoint_id, sample);
+            }
             health.received(now);
         }
     }

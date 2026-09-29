@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Install/update sheprd (client-side herdr fork) from GitHub releases.
+# Usage: sheprd-install [tag]   (default: latest sheprd-v* release)
+# Installs ~/.local/share/sheprd/sheprd and a ~/.local/bin/sheprd symlink.
+# Leaves any existing herdr install untouched.
+set -euo pipefail
+repo=andreconde21/sheprd
+tag=${1:-$(curl -fsSL "https://api.github.com/repos/$repo/releases" | grep -o '"tag_name": *"sheprd-v[^"]*"' | head -1 | sed 's/.*"\(sheprd-v[^"]*\)"/\1/')}
+[ -n "$tag" ] || { echo "no sheprd-v* release found" >&2; exit 1; }
+dir="$HOME/.local/share/sheprd"
+mkdir -p "$dir" "$HOME/.local/bin"
+base="https://github.com/$repo/releases/download/$tag"
+curl -fsSL "$base/sheprd-linux-x86_64" -o "$dir/sheprd.new"
+expected=$(curl -fsSL "$base/sheprd-linux-x86_64.sha256" | awk '{print $1}')
+actual=$(sha256sum "$dir/sheprd.new" | awk '{print $1}')
+[ "$expected" = "$actual" ] || { echo "checksum mismatch" >&2; rm -f "$dir/sheprd.new"; exit 1; }
+chmod +x "$dir/sheprd.new" && mv "$dir/sheprd.new" "$dir/sheprd"
+ln -sfn "$dir/sheprd" "$HOME/.local/bin/sheprd"
+echo "$tag" > "$dir/VERSION"
+echo "installed sheprd $tag -> $dir/sheprd"

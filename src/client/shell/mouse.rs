@@ -1250,6 +1250,15 @@ impl ClientShellState {
                 return;
             }
         }
+        if mouse.kind == MouseEventKind::Up(MouseButton::Left)
+            && self.drop_workspace_on_project(point)
+        {
+            // andreconde fork: a workspace (any machine) released on a project header.
+            self.chrome_drag = None;
+            self.workspace_press = None;
+            outcome.repaint = true;
+            return;
+        }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
             if let Some(drag) = self.chrome_drag.take() {
                 self.workspace_press = None;
@@ -2030,6 +2039,14 @@ impl ClientShellState {
                     return;
                 }
                 if self.handle_project_click(point, outcome) {
+                    return;
+                }
+                if super::contains(self.hits.agent_scope_toggle, point) {
+                    super::projects::update(|layout| {
+                        layout.agents_project_only = !layout.agents_project_only
+                    });
+                    self.agent_scroll = 0;
+                    outcome.repaint = true;
                     return;
                 }
                 if self.handle_endpoint_machine_click(point, outcome) {

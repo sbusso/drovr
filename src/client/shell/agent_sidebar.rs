@@ -108,16 +108,37 @@ pub(super) fn render_agent_panel_header(
     if area.height < 2 {
         return false;
     }
+    // andreconde fork: the label toggles "all agents" / "this project only".
+    let project_only = super::projects::layout().agents_project_only;
+    let label = if project_only {
+        " agents · project"
+    } else {
+        " agents"
+    };
     put_text(
         buffer,
         area.x,
         area.y + 1,
         area.width,
-        " agents",
+        label,
         Style::default()
-            .fg(config.palette.overlay0)
+            .fg(if project_only {
+                config.palette.accent
+            } else {
+                config.palette.overlay0
+            })
             .add_modifier(Modifier::BOLD),
     );
+    hits.agent_scope_toggle = if config.mouse_capture {
+        Rect::new(
+            area.x,
+            area.y + 1,
+            display_width(label).min(area.width as usize) as u16,
+            1,
+        )
+    } else {
+        Rect::default()
+    };
     let sort_label = agent_view_label.unwrap_or(match config.agent_panel_sort {
         crate::config::AgentPanelSortConfig::Spaces => "grouped",
         crate::config::AgentPanelSortConfig::Priority => "priority",

@@ -721,7 +721,11 @@ fn render_endpoint_row(
     } else if endpoint.endpoint_id.is_local() {
         String::new()
     } else if state.is_empty() {
-        glyph.to_owned()
+        // andreconde fork: smoothed latency beside online machines.
+        match crate::client::endpoint::endpoint_rtt_ms(&endpoint.endpoint_id) {
+            Some(rtt) => format!("{rtt}ms {glyph}"),
+            None => glyph.to_owned(),
+        }
     } else {
         format!("{glyph} {state}")
     };

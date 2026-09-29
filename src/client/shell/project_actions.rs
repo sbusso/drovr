@@ -184,9 +184,20 @@ impl ClientShellState {
             None
         };
         let layout = projects::layout();
+        let paths = self
+            .endpoint_by_id(endpoint_id)
+            .and_then(|endpoint| {
+                let snapshot = endpoint.snapshot.as_deref()?;
+                let workspace = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)?;
+                Some(projects::workspace_paths(snapshot, workspace))
+            })
+            .unwrap_or_default();
         Some(ClientContextMenuTarget::ProjectWorkspace {
             explicit: layout.explicit_group(&key).is_some(),
-            grouped: layout.group_of(&key, &label).is_some(),
+            grouped: layout.group_of(&key, &label, &paths).is_some(),
             hidden: layout.is_hidden(&key),
             show_hidden: layout.show_hidden,
             groups: layout
@@ -287,6 +298,38 @@ impl ClientShellState {
             return true;
         }
         false
+    }
+
+    /// Drag-and-drop: if a workspace press is released on a project header,
+    /// move that workspace into the project. Returns true when it did.
+    pub(super) fn drop_workspace_on_project(&mut self, point: (u16, u16)) -> bool {
+        let Some(press) = self.workspace_press.as_ref() else {
+            return false;
+        };
+        if (press.start_column, press.start_row) == point {
+            return false;
+        }
+        let Some(name) = self
+            .hits
+            .projects
+            .iter()
+            .find(|(rect, _)| super::contains(*rect, point))
+            .map(|(_, name)| name.clone())
+        else {
+            return false;
+        };
+        let Some(key) =
+            self.workspace_key_for(&press.endpoint_id.clone(), &press.workspace_id.clone())
+        else {
+            return false;
+        };
+        projects::update(|layout| {
+            layout.assign(&key, &name);
+            if let Some(group) = layout.group_mut(&name) {
+                group.collapsed = false;
+            }
+        });
+        true
     }
 
     /// Left-click on a project header toggles it.
