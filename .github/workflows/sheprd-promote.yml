@@ -1,0 +1,41 @@
+# sheprd: ship a ready rebase. Moves main to rebase/<herdr tag>, tags
+# sheprd-<herdr tag>-1 and builds the release (a tag pushed by a workflow does
+# not trigger other workflows, so the release build is called directly).
+name: sheprd promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      herdr_tag:
+        description: 'herdr release the ready rebase is based on, e.g. v0.9.4'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.push.outputs.tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - id: push
+        run: |
+          herdr_tag=${{ inputs.herdr_tag }}
+          git fetch origin "rebase/$herdr_tag"
+          tag="sheprd-$herdr_tag-1"
+          # The rebase rewrote sheprd's commits on top of the new herdr, so main
+          # moves to it (this is the one intentional force-push).
+          git push --force origin "origin/rebase/$herdr_tag:refs/heads/main"
+          git tag "$tag" "origin/rebase/$herdr_tag" && git push origin "$tag"
+          git push origin --delete "rebase/$herdr_tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: promote
+    uses: ./.github/workflows/sheprd-release.yml
+    with:
+      tag: ${{ needs.promote.outputs.tag }}

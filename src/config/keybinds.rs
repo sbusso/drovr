@@ -362,6 +362,7 @@ pub struct Keybinds {
     pub workspace_picker: ActionKeybinds,
     pub goto: ActionKeybinds,
     pub project_menu: ActionKeybinds,
+    pub new_workspace_on: ActionKeybinds,
     pub next_attention_agent: ActionKeybinds,
     pub jump_agent: ActionKeybinds,
     pub toggle_hidden_workspaces: ActionKeybinds,
@@ -549,6 +550,7 @@ impl Config {
             workspace_picker: empty_action!(),
             goto: empty_action!(),
             project_menu: empty_action!(),
+            new_workspace_on: empty_action!(),
             next_attention_agent: empty_action!(),
             jump_agent: empty_action!(),
             toggle_hidden_workspaces: empty_action!(),
@@ -682,6 +684,7 @@ impl Config {
             apply_action!(keybinds.workspace_picker, workspace_picker, source);
             apply_action!(keybinds.goto, goto, source);
             apply_action!(keybinds.project_menu, project_menu, source);
+            apply_action!(keybinds.new_workspace_on, new_workspace_on, source);
             apply_action!(keybinds.next_attention_agent, next_attention_agent, source);
             apply_action!(keybinds.jump_agent, jump_agent, source);
             apply_action!(

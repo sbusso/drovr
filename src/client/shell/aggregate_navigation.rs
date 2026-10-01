@@ -176,7 +176,7 @@ fn apply_projects(
                 .iter()
                 .find(|workspace| workspace.workspace_id == row.agent.workspace_id)?;
             let paths = super::projects::workspace_paths(snapshot, workspace);
-            let rank = super::projects::agent_rank(&layout, endpoint, &workspace.label, &paths)?;
+            let rank = super::projects::agent_rank(&layout, endpoint, workspace, &paths)?;
             Some((rank, row))
         })
         .collect::<Vec<_>>();

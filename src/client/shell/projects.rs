@@ -29,7 +29,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{ClientEndpointStatus, ClientShellEndpoint};
+use super::ClientShellEndpoint;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub(super) struct ProjectGroup {
@@ -65,6 +65,12 @@ pub(super) struct ProjectLayout {
     /// mark lapses as soon as the agent changes state again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) dismissed: Vec<String>,
+    /// Agents pinned to the active view by hand (`machine/pane`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) kept: Vec<String>,
+    /// How long an idle agent still counts as active (default 24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recent_hours: Option<u64>,
     /// Workspaces dragged to "Other": never auto-matched into a project.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) ungrouped: Vec<String>,
@@ -170,8 +176,43 @@ pub(super) fn machine_key(endpoint: &ClientShellEndpoint) -> String {
     endpoint.label.to_lowercase()
 }
 
-pub(super) fn workspace_key(endpoint: &ClientShellEndpoint, label: &str) -> String {
-    format!("{}/{}", machine_key(endpoint), label)
+/// Stable identity of a workspace: `machine/id:label`. The id survives renames
+/// and tells apart workspaces that share a name; the label is only there so the
+/// file stays readable. Older name-only entries (`machine/label`) still match.
+pub(super) fn workspace_key(
+    endpoint: &ClientShellEndpoint,
+    workspace: &crate::protocol::ClientShellWorkspace,
+) -> String {
+    format!(
+        "{}/{}:{}",
+        machine_key(endpoint),
+        workspace.workspace_id,
+        workspace.label
+    )
+}
+
+fn split_id(rest: &str) -> Option<(&str, &str)> {
+    let (id, label) = rest.split_once(':')?;
+    let looks_like_id =
+        id.len() > 1 && id.starts_with('w') && id[1..].chars().all(|c| c.is_ascii_alphanumeric());
+    looks_like_id.then_some((id, label))
+}
+
+/// Does a stored entry (new or legacy form) refer to the workspace `key`?
+pub(super) fn same_workspace(entry: &str, key: &str) -> bool {
+    let (Some((entry_machine, entry_rest)), Some((machine, rest))) =
+        (entry.split_once('/'), key.split_once('/'))
+    else {
+        return entry == key;
+    };
+    if entry_machine != machine {
+        return false;
+    }
+    match (split_id(entry_rest), split_id(rest)) {
+        (Some((entry_id, _)), Some((id, _))) => entry_id == id,
+        (None, Some((_, label))) => entry_rest == label,
+        _ => entry_rest == rest,
+    }
 }
 
 pub(super) fn agent_key(endpoint: &ClientShellEndpoint, pane_id: &str) -> String {
@@ -187,7 +228,16 @@ impl ProjectLayout {
     }
 
     pub(super) fn is_hidden(&self, key: &str) -> bool {
-        self.hidden.iter().any(|hidden| hidden == key)
+        self.hidden.iter().any(|hidden| same_workspace(hidden, key))
+    }
+
+    /// Hide or unhide one workspace.
+    pub(super) fn toggle_hidden(&mut self, key: &str) {
+        if self.is_hidden(key) {
+            self.hidden.retain(|hidden| !same_workspace(hidden, key));
+        } else {
+            self.hidden.push(key.to_owned());
+        }
     }
 
     pub(super) fn is_unread(&self, key: &str) -> bool {
@@ -195,15 +245,22 @@ impl ProjectLayout {
     }
 
     pub(super) fn explicit_group(&self, key: &str) -> Option<usize> {
-        self.groups
-            .iter()
-            .position(|group| group.members.iter().any(|member| member == key))
+        self.groups.iter().position(|group| {
+            group
+                .members
+                .iter()
+                .any(|member| same_workspace(member, key))
+        })
     }
 
     /// Group for a workspace: explicit membership wins, then the first rule that
     /// matches the workspace name or any folder its panes run in.
     pub(super) fn group_of(&self, key: &str, label: &str, paths: &[String]) -> Option<usize> {
-        if self.ungrouped.iter().any(|ungrouped| ungrouped == key) {
+        if self
+            .ungrouped
+            .iter()
+            .any(|ungrouped| same_workspace(ungrouped, key))
+        {
             return None;
         }
         self.explicit_group(key).or_else(|| {
@@ -227,16 +284,17 @@ impl ProjectLayout {
         self.groups[group]
             .members
             .iter()
-            .position(|member| member == key)
+            .position(|member| same_workspace(member, key))
             .unwrap_or(usize::MAX)
     }
 
     /// Move a workspace into `group_name`; an empty name moves it to Other.
     pub(super) fn assign(&mut self, key: &str, group_name: &str) {
         for group in &mut self.groups {
-            group.members.retain(|member| member != key);
+            group.members.retain(|member| !same_workspace(member, key));
         }
-        self.ungrouped.retain(|ungrouped| ungrouped != key);
+        self.ungrouped
+            .retain(|ungrouped| !same_workspace(ungrouped, key));
         let name = group_name.trim();
         if name.is_empty() {
             self.ungrouped.push(key.to_owned());
@@ -253,14 +311,6 @@ impl ProjectLayout {
                 members: vec![key.to_owned()],
                 ..ProjectGroup::default()
             }),
-        }
-    }
-
-    pub(super) fn toggle(list: &mut Vec<String>, key: &str) {
-        if let Some(index) = list.iter().position(|item| item == key) {
-            list.remove(index);
-        } else {
-            list.push(key.to_owned());
         }
     }
 
@@ -364,7 +414,7 @@ pub(super) fn sections(
             continue;
         };
         for (index, workspace) in snapshot.workspaces.iter().enumerate() {
-            let key = workspace_key(endpoint, &workspace.label);
+            let key = workspace_key(endpoint, workspace);
             let paths = workspace_paths(snapshot, workspace);
             let Some(group) = layout.group_of(&key, &workspace.label, &paths) else {
                 continue;
@@ -409,39 +459,16 @@ pub(super) fn group_members_in_view(
         .unwrap_or_default()
 }
 
-/// Worst (most attention-worthy) status among a section's members.
-pub(super) fn section_status(
-    section: &ProjectSection,
-    endpoints: &[ClientShellEndpoint],
-) -> crate::api::schema::AgentStatus {
-    section
-        .members
-        .iter()
-        .filter_map(|member| {
-            let endpoint = &endpoints[member.endpoint];
-            if endpoint.status != ClientEndpointStatus::Online {
-                return None;
-            }
-            endpoint
-                .snapshot
-                .as_deref()?
-                .workspaces
-                .get(member.index)
-                .map(|workspace| workspace.agent_status)
-        })
-        .max_by_key(|status| super::status_priority(*status))
-        .unwrap_or(crate::api::schema::AgentStatus::Unknown)
-}
-
 /// Sort key that puts agents in project order; ungrouped agents keep their
 /// original relative order after every project. `None` = hidden, drop it.
 pub(super) fn agent_rank(
     layout: &ProjectLayout,
     endpoint: &ClientShellEndpoint,
-    workspace_label: &str,
+    workspace: &crate::protocol::ClientShellWorkspace,
     paths: &[String],
 ) -> Option<(usize, usize)> {
-    let key = workspace_key(endpoint, workspace_label);
+    let workspace_label = workspace.label.as_str();
+    let key = workspace_key(endpoint, workspace);
     if layout.is_hidden(&key) && !layout.show_hidden {
         return None;
     }
@@ -517,6 +544,166 @@ impl ProjectLayout {
             self.dismissed.drain(..excess);
         }
     }
+}
+
+impl ProjectLayout {
+    pub(super) fn is_kept(&self, key: &str) -> bool {
+        self.kept.iter().any(|kept| kept == key)
+    }
+
+    pub(super) fn toggle_kept(&mut self, key: &str) {
+        if self.is_kept(key) {
+            self.kept.retain(|kept| kept != key);
+        } else {
+            self.kept.push(key.to_owned());
+        }
+    }
+
+    pub(super) fn recent_secs(&self) -> u64 {
+        self.recent_hours.unwrap_or(24) * 3600
+    }
+}
+
+/// When each agent last changed state (unix seconds), as observed by this
+/// client. herdr sends no timestamps, so sheprd records them itself and keeps
+/// them in `<state_dir>/sheprd-activity.json` so restarts don't reset them.
+#[derive(Default, Deserialize, Serialize)]
+struct Activity {
+    #[serde(default)]
+    agents: std::collections::HashMap<String, (u64, u64)>,
+    #[serde(skip)]
+    dirty: bool,
+    #[serde(skip)]
+    saved: Option<Instant>,
+}
+
+fn activity_path() -> PathBuf {
+    crate::config::state_dir().join("sheprd-activity.json")
+}
+
+fn activity() -> &'static std::sync::Mutex<Activity> {
+    static ACTIVITY: OnceLock<std::sync::Mutex<Activity>> = OnceLock::new();
+    ACTIVITY.get_or_init(|| {
+        let loaded = if cfg!(test) {
+            None
+        } else {
+            std::fs::read_to_string(activity_path())
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+        };
+        std::sync::Mutex::new(loaded.unwrap_or_default())
+    })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Record state changes from a fresh endpoint snapshot. Agents seen for the
+/// first time get no timestamp (unknown age = treated as old), except ones that
+/// are working, which are clearly current.
+pub(super) fn observe_activity(endpoint: &ClientShellEndpoint) {
+    let Some(snapshot) = endpoint.snapshot.as_deref() else {
+        return;
+    };
+    let now = unix_now();
+    let mut store = activity().lock().unwrap_or_else(|e| e.into_inner());
+    for agent in &snapshot.agents {
+        let key = agent_key(endpoint, &agent.pane_id);
+        match store.agents.get(&key) {
+            Some((seq, _)) if *seq == agent.state_change_seq => {}
+            Some(_) => {
+                store.agents.insert(key, (agent.state_change_seq, now));
+                store.dirty = true;
+            }
+            None => {
+                let at = if agent.agent_status == crate::api::schema::AgentStatus::Working {
+                    now
+                } else {
+                    0
+                };
+                store.agents.insert(key, (agent.state_change_seq, at));
+                store.dirty = true;
+            }
+        }
+    }
+    let due = store
+        .saved
+        .is_none_or(|saved| saved.elapsed().as_secs() >= 10);
+    if store.dirty && due && !cfg!(test) {
+        let month = 30 * 24 * 3600;
+        store
+            .agents
+            .retain(|_, (_, at)| *at == 0 || now.saturating_sub(*at) < month);
+        if let Ok(content) = serde_json::to_vec(&*store) {
+            let path = activity_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, content).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                store.dirty = false;
+                store.saved = Some(Instant::now());
+            }
+        }
+    }
+}
+
+/// Seconds since the agent last changed state, if known.
+pub(super) fn idle_secs(key: &str) -> Option<u64> {
+    let store = activity().lock().unwrap_or_else(|e| e.into_inner());
+    store
+        .agents
+        .get(key)
+        .and_then(|(_, at)| (*at > 0).then(|| unix_now().saturating_sub(*at)))
+}
+
+pub(super) fn format_age(secs: u64) -> String {
+    match secs {
+        0..=59 => "now".to_owned(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// A workspace sheprd just asked a machine to create, waiting to appear so the
+/// agent command can be typed into it.
+#[derive(Clone, Debug)]
+pub(super) struct PendingLaunch {
+    pub(super) endpoint_id: super::ClientEndpointId,
+    pub(super) label: String,
+    pub(super) known: HashSet<String>,
+    pub(super) command: Option<String>,
+    pub(super) since: Instant,
+}
+
+fn launch_store() -> &'static std::sync::Mutex<Option<PendingLaunch>> {
+    static LAUNCH: OnceLock<std::sync::Mutex<Option<PendingLaunch>>> = OnceLock::new();
+    LAUNCH.get_or_init(Default::default)
+}
+
+pub(super) fn set_launch(launch: Option<PendingLaunch>) {
+    *launch_store().lock().unwrap_or_else(|e| e.into_inner()) = launch;
+}
+
+pub(super) fn launch() -> Option<PendingLaunch> {
+    launch_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+static HINTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn set_hinting(on: bool) {
+    HINTING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn hinting() -> bool {
+    HINTING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A press on a sheprd sidebar row, kept until the button comes up so the

@@ -332,6 +332,12 @@ pub(super) enum ClientRenameTarget {
         name: String,
     },
     JumpAgent,
+    NewWorkspaceOn {
+        endpoint_id: ClientEndpointId,
+        project: Option<String>,
+        run_agent: bool,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -556,6 +562,10 @@ pub(super) enum ClientContextMenuAction {
     ProjectDelete,
     AgentMarkUnread,
     AgentMarkInactive,
+    AgentToggleKeep,
+    NewOnMachine(usize),
+    ProjectNewWorkspace,
+    ProjectNewAgent,
     AgentFocus,
     AgentRename,
 }
@@ -594,6 +604,12 @@ pub(super) enum ClientContextMenuTarget {
         name: String,
         pinned: bool,
         collapsed: bool,
+    },
+    /// Pick the machine for a new workspace (sheprd).
+    NewWorkspacePicker {
+        machines: Vec<(ClientEndpointId, String)>,
+        project: Option<String>,
+        run_agent: bool,
     },
     Agent {
         endpoint_id: ClientEndpointId,

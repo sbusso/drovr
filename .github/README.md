@@ -24,12 +24,12 @@ agents from **every** machine, then **Other** for everything not in a project.
 ```
  ○ all agents       detailed      ← filter toggle · view toggle (click)
  ▾ ★ storefront
- ● Fix checkout rounding      1   ← agent topic + jump number
+ ● Fix checkout rounding          ← agent topic
    gpu-box                        ← workspace (if ≠ project) · machine
  ▾ ★ billing
- ○ Invoice PDF layout         2
+ ○ ⚑ Invoice PDF layout      2h   ← ⚑ kept active · idle for 2h
    billing-web
- ● Retry failed webhooks      3
+ ● Retry failed webhooks
    billing-web · gpu-box
  ▸ infra                   ○ 3    ← collapsed: worst status + count
  ▾ Other
@@ -40,8 +40,10 @@ agents from **every** machine, then **Other** for everything not in a project.
 
 - **Two views** (click the right header label): *detailed*, one row per agent
   with its topic, and *compact*, one line per workspace.
-- **Filter** (click the left header label): *all agents* or *active* (only
-  agents that are working or need you).
+- **Filter** (click the left header label): *all agents* or *active*. Active
+  keeps agents that are working, need you, are kept, or went idle less than
+  24 h ago (`recent_hours`), so something you just read doesn't vanish.
+  Older idle agents are dimmed in *all agents*.
 
 ### Projects across machines
 - **Drag** any row onto a project header to move its workspace there. Drop it on
@@ -62,13 +64,29 @@ agents from **every** machine, then **Other** for everything not in a project.
 - Right-click an agent → **Mark unread** (a yellow `●` status that counts as
   needing you until you visit it) or **Mark inactive** (drops a finished or
   blocked agent out of the queue until its state changes again).
-- **Jump numbers** on every agent; `prefix+#` jumps to any number, not just 1–9.
+- **Keep active** (right-click an agent): pins it to the active view (⚑) until
+  you unpin it, for the thing you're still working on.
+- **Jump numbers only when you want them**: `prefix+#` shows a number on every
+  row; type it and sheprd jumps as soon as the number is unambiguous.
+
+### New workspaces on any machine
+- `prefix+alt+c` (or clicking **new** in the footer) asks which machine, then a
+  name. The workspace joins the project you're in and starts in that project's
+  folder on the chosen machine.
+- Right-click a project → **New agent here** does the same and starts `cc` in it.
+
+### Small fixes
+- Workspaces are tracked by id, so two with the same name are independent and a
+  rename keeps a workspace in its project.
+- **Go To** (`prefix+g`) opens ready to type; arrows and Enter still pick, Left/
+  Right still jump between workspaces while the search is empty.
 
 ### Keys (defaults; no config needed)
 | Key | Action |
 |---|---|
 | `prefix+u` | next agent that needs you |
-| `prefix+#` | jump to agent by number |
+| `prefix+#` | show jump numbers, type one to jump |
+| `prefix+alt+c` | new workspace on a machine you pick |
 | `prefix+.` | project menu for the focused workspace |
 | `prefix+alt+h` | show / conceal hidden workspaces |
 
@@ -79,6 +97,7 @@ it, and hand edits reload within a second:
 ```toml
 compact = false                        # view: one row per agent / per workspace
 active_only = false                    # filter: all agents / active ones
+recent_hours = 24                      # idle agents stay "active" this long
 hidden = ["gpu-box/scratch"]           # machine/workspace
 
 [[group]]
@@ -110,7 +129,13 @@ The server keeps running stock herdr; use the matching herdr version on each mac
   `src/client/shell/sheprd_sidebar.rs` (the combined sidebar) and
   `src/client/shell/project_actions.rs` (menus, clicks, drag, keys). Small hooks in
   upstream files are tagged: `grep -rn "andreconde fork" src`.
-- Rebase on a new herdr release: `git fetch origin --tags && git rebase --onto v<new> v<old> main`.
+- **Following herdr is automatic**: *sheprd rebase* runs daily. When herdr ships
+  a new stable release it rebases sheprd onto it; if that's clean and the tests
+  pass it pushes `rebase/<tag>` and opens a "ready to ship" issue, and on a
+  conflict it opens an issue with the files and upstream commits involved,
+  changing nothing. *sheprd promote* (Actions → Run workflow) ships a ready
+  rebase. Conflict resolutions are remembered via `git rerere` (`.github/rr-cache`).
+- Manual rebase: `git fetch origin --tags && git rebase --onto v<new> v<old> main`.
 - Release: `git tag sheprd-v<ver>-<n> && git push fork sheprd-v<ver>-<n>` → the
   "sheprd release" workflow builds and publishes. Upstream workflows are disabled here.
 - Local build needs Zig 0.16.0 (`cargo build --release`).

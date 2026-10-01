@@ -54,6 +54,14 @@ impl ClientShellState {
                 && self.endpoint_status(&self.active_endpoint_id)
                     == Some(ClientEndpointStatus::Online)
         });
+        // andreconde fork (sheprd): rows show jump numbers while the jump prompt is open.
+        super::projects::set_hinting(matches!(
+            &self.overlay,
+            Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+                target: ClientRenameTarget::JumpAgent,
+                ..
+            }))
+        ));
         let mut render_state = render::ShellRenderState {
             machine_diagnostics: &self.machine_diagnostics,
             endpoints: &self.endpoints,
@@ -204,6 +212,13 @@ impl ClientShellState {
             ),
             _ => (None, None),
         };
+        super::projects::set_hinting(matches!(
+            &self.overlay,
+            Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+                target: ClientRenameTarget::JumpAgent,
+                ..
+            }))
+        ));
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
         self.hits = render::render_shell(
             &mut buffer,

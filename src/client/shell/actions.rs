@@ -49,6 +49,11 @@ impl ClientShellState {
                         self.focus_next_attention_agent(outcome);
                         return;
                     }
+                    crate::input::KeybindAction::NewWorkspaceOn => {
+                        self.open_new_workspace_for_focus();
+                        outcome.repaint = true;
+                        return;
+                    }
                     crate::input::KeybindAction::ProjectMenu => {
                         self.open_focused_project_menu();
                         outcome.repaint = true;

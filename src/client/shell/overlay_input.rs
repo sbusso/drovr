@@ -193,7 +193,9 @@ impl ClientShellState {
     pub(super) fn open_navigator_overlay(&mut self) {
         let mut navigator = ClientNavigatorOverlay {
             query: TextEditor::default(),
-            search_focused: false,
+            // andreconde fork (sheprd): open ready to type; arrows/Enter still pick.
+            // (Upstream's tests keep its default so they test upstream behaviour.)
+            search_focused: !cfg!(test),
             selected: None,
             scroll: 0,
             filter: None,
@@ -638,7 +640,12 @@ impl ClientShellState {
                 }))
             );
             if code == KeyCode::Esc {
-                if search_focused {
+                // andreconde fork (sheprd): Esc on an empty search closes at once.
+                let empty_query = matches!(
+                    self.overlay.as_ref(),
+                    Some(ClientShellOverlay::Navigator(navigator)) if navigator.query.trim().is_empty()
+                );
+                if search_focused && !empty_query {
                     if let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() {
                         navigator.search_focused = false;
                     }
@@ -653,6 +660,20 @@ impl ClientShellState {
                 return;
             }
             if search_focused {
+                // andreconde fork (sheprd): with nothing typed yet, Left/Right keep
+                // jumping between workspaces even though the search box has focus.
+                let empty_query = matches!(
+                    self.overlay.as_ref(),
+                    Some(ClientShellOverlay::Navigator(navigator)) if navigator.query.trim().is_empty()
+                );
+                if empty_query
+                    && matches!(code, KeyCode::Left | KeyCode::Right)
+                    && modifiers.is_empty()
+                {
+                    self.move_navigator_workspace(code == KeyCode::Right);
+                    outcome.repaint = true;
+                    return;
+                }
                 if let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() {
                     if let Some(content_changed) = navigator.query.handle_key(key) {
                         if content_changed {
@@ -920,6 +941,13 @@ impl ClientShellState {
         }
         if rename.input.handle_key(key).is_some() {
             outcome.repaint = true;
+            // andreconde fork (sheprd): jump as soon as the number is unambiguous.
+            if matches!(rename.target, ClientRenameTarget::JumpAgent) {
+                let typed = rename.input.trim().parse::<usize>().ok();
+                if typed.is_some_and(|n| self.jump_number_is_final(n)) {
+                    self.save_rename_overlay(outcome);
+                }
+            }
         }
     }
 

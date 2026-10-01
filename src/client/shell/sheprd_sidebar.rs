@@ -41,6 +41,9 @@ enum Row {
         workspace: Option<String>,
         machine: Option<String>,
         number: Option<usize>,
+        kept: bool,
+        age: Option<String>,
+        faded: bool,
     },
     Workspace {
         endpoint: usize,
@@ -52,6 +55,8 @@ enum Row {
         hidden: bool,
         machine: Option<String>,
         number: Option<usize>,
+        age: Option<String>,
+        faded: bool,
     },
 }
 
@@ -73,6 +78,11 @@ struct AgentInfo {
     stale: bool,
     title: String,
     number: Option<usize>,
+    kept: bool,
+    /// Idle age text ("2h"), only for idle agents with a known timestamp.
+    age: Option<String>,
+    /// Shown in the "active" filter: working, needs you, kept or recently idle.
+    current: bool,
 }
 
 fn agent_title(agent: &crate::protocol::ClientShellAgent) -> String {
@@ -160,16 +170,22 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
             next_number += 1;
             next_number
         });
+        let key = projects::agent_key(endpoint, &row.agent.pane_id);
+        let presence = layout.presence(&key, row.agent.state_change_seq, row.agent.agent_status);
+        let kept = layout.is_kept(&key);
+        let idle = (presence == Presence::Idle)
+            .then(|| projects::idle_secs(&key))
+            .flatten();
+        let recent = idle.is_some_and(|secs| secs < layout.recent_secs());
         agents
             .entry((row.endpoint.endpoint_index, row.agent.workspace_id.clone()))
             .or_default()
             .push(AgentInfo {
                 pane_id: row.agent.pane_id.clone(),
-                presence: layout.presence(
-                    &projects::agent_key(endpoint, &row.agent.pane_id),
-                    row.agent.state_change_seq,
-                    row.agent.agent_status,
-                ),
+                presence,
+                kept,
+                age: idle.map(projects::format_age),
+                current: presence.is_active() || kept || recent,
                 focused: row.agent.focused && &endpoint.endpoint_id == state.active_endpoint_id,
                 stale,
                 title: agent_title(row.agent),
@@ -203,7 +219,7 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
         };
         for (index, workspace) in snapshot.workspaces.iter().enumerate() {
             if !claimed.contains(&(endpoint_index, index)) {
-                let hidden = layout.is_hidden(&projects::workspace_key(endpoint, &workspace.label));
+                let hidden = layout.is_hidden(&projects::workspace_key(endpoint, workspace));
                 other.push((endpoint_index, index, hidden));
             }
         }
@@ -238,7 +254,9 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
                 .remove(&(endpoint_index, workspace.workspace_id.clone()))
                 .unwrap_or_default();
             let presence = workspace_presence(layout, endpoint, snapshot, &workspace.workspace_id);
-            if layout.active_only && !presence.is_active() {
+            let current =
+                presence.is_active() || workspace_agents.iter().any(|agent| agent.current);
+            if layout.active_only && !current {
                 continue;
             }
             presences.push(presence);
@@ -255,12 +273,18 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
                     hidden,
                     machine,
                     number: workspace_agents.first().and_then(|agent| agent.number),
+                    age: workspace_agents
+                        .iter()
+                        .all(|agent| agent.age.is_some())
+                        .then(|| workspace_agents.first().and_then(|agent| agent.age.clone()))
+                        .flatten(),
+                    faded: !current,
                 });
                 continue;
             }
             let show_workspace = !workspace.label.eq_ignore_ascii_case(&label);
             for agent in workspace_agents {
-                if layout.active_only && !agent.presence.is_active() {
+                if layout.active_only && !agent.current {
                     continue;
                 }
                 body.push(Row::Agent {
@@ -274,6 +298,9 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
                     workspace: show_workspace.then(|| workspace.label.clone()),
                     machine: machine.clone(),
                     number: agent.number,
+                    kept: agent.kept,
+                    age: agent.age,
+                    faded: !agent.current,
                 });
             }
         }
@@ -505,15 +532,25 @@ fn render_row(
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
-    let gutter = |buffer: &mut Buffer, number: Option<usize>, y: u16| {
-        if let Some(number) = number {
-            put_right_text(
-                buffer,
-                rect,
-                y,
-                &format!("{number} "),
+    let hinting = projects::hinting();
+    // Right-hand slot: the jump number while hinting, otherwise the idle age.
+    let right_slot = |number: Option<usize>, age: &Option<String>| -> (String, Style) {
+        if hinting {
+            (
+                number
+                    .map(|number| format!("{number} "))
+                    .unwrap_or_default(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                age.as_ref()
+                    .map(|age| format!("{age} "))
+                    .unwrap_or_default(),
                 Style::default().fg(palette.overlay0),
-            );
+            )
         }
     };
     match row {
@@ -568,13 +605,22 @@ fn render_row(
             workspace,
             machine,
             number,
+            kept,
+            age,
+            faded,
         } => {
             let endpoint = &state.endpoints[*endpoint];
             if *focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
             let (icon, color) = presence_icon(*presence, config);
-            let number_width = number.map_or(0, |number| display_width(&format!("{number} ")) + 1);
+            let (slot, slot_style) = right_slot(*number, age);
+            let number_width = display_width(&slot) + u16::from(!slot.is_empty());
+            let title = if *kept {
+                format!("⚑ {title}")
+            } else {
+                title.clone()
+            };
             put_text(
                 buffer,
                 rect.x + 1,
@@ -588,7 +634,7 @@ fn render_row(
                 rect.x + 3,
                 rect.y,
                 rect.width.saturating_sub(3 + number_width),
-                title,
+                &title,
                 Style::default()
                     .fg(if *focused {
                         palette.text
@@ -597,7 +643,7 @@ fn render_row(
                     })
                     .add_modifier(Modifier::BOLD),
             );
-            gutter(buffer, *number, rect.y);
+            put_right_text(buffer, rect, rect.y, &slot, slot_style);
             if rect.height > 1 {
                 let mut x = rect.x + 3;
                 let right = rect.right();
@@ -636,7 +682,7 @@ fn render_row(
                     );
                 }
             }
-            if *stale {
+            if *stale || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
             }
             hits.endpoint_agents
@@ -658,6 +704,8 @@ fn render_row(
             hidden,
             machine,
             number,
+            age,
+            faded,
         } => {
             let endpoint = &state.endpoints[*endpoint];
             if *focused {
@@ -672,17 +720,17 @@ fn render_row(
                 if *hidden { "⊘" } else { icon },
                 Style::default().fg(color),
             );
-            let tag = match (machine, number) {
-                (Some(machine), Some(number)) => format!("{machine} {number} "),
-                (Some(machine), None) => format!("{machine} "),
-                (None, Some(number)) => format!("{number} "),
-                (None, None) => String::new(),
+            let (slot, slot_style) = right_slot(*number, age);
+            let tag = match machine {
+                Some(machine) => format!("{machine} "),
+                None => String::new(),
             };
             put_text(
                 buffer,
                 rect.x + 3,
                 rect.y,
-                rect.width.saturating_sub(4 + display_width(&tag)),
+                rect.width
+                    .saturating_sub(4 + display_width(&tag) + display_width(&slot)),
                 label,
                 Style::default().fg(if *focused {
                     palette.text
@@ -692,14 +740,21 @@ fn render_row(
                     palette.overlay0
                 }),
             );
+            put_right_text(buffer, rect, rect.y, &slot, slot_style);
+            let tag_rect = Rect::new(
+                rect.x,
+                rect.y,
+                rect.width.saturating_sub(display_width(&slot)),
+                1,
+            );
             put_right_text(
                 buffer,
-                rect,
+                tag_rect,
                 rect.y,
                 &tag,
                 Style::default().fg(palette.overlay0),
             );
-            if *stale || *hidden {
+            if *stale || *hidden || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
             }
             hits.sheprd_rows.push(RowHit {

@@ -1,0 +1,111 @@
+# sheprd: follow herdr. Daily, check whether herdrdev published a newer stable
+# release than the one sheprd is based on. If so, rebase sheprd onto it:
+#   clean (or replayed by rerere) + tests pass -> push branch rebase/<tag> and
+#                                                 open an issue "ready to ship"
+#   conflict -> open an issue listing the conflicting files and the upstream
+#               commits that touched them; nothing changes
+# main is never touched here; "sheprd promote" ships a ready rebase.
+# Resolutions recorded with `git rerere` live in .github/rr-cache, so a conflict
+# resolved once is replayed automatically next time.
+name: sheprd rebase
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: 'true'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Find upstream release
+        id: find
+        run: |
+          git remote add upstream https://github.com/herdrdev/herdr.git
+          git fetch --quiet upstream --tags
+          stable() { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1; }
+          latest=$(git tag -l 'v*' | stable)
+          base=$(git tag --merged HEAD -l 'v*' | stable)
+          echo "latest=$latest base=$base"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$base" ] || git ls-remote --exit-code origin "refs/heads/rebase/$latest" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase
+        id: rebase
+        if: steps.find.outputs.skip != 'true'
+        run: |
+          latest=${{ steps.find.outputs.latest }}; base=${{ steps.find.outputs.base }}
+          git config user.name "sheprd bot"
+          git config user.email "sheprd-bot@users.noreply.github.com"
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+          mkdir -p .git/rr-cache && cp -r .github/rr-cache/. .git/rr-cache/ 2>/dev/null || true
+          git checkout -b "rebase/$latest"
+          git rebase --onto "$latest" "$base" || true
+          # rerere stages known resolutions; keep continuing while that is enough.
+          while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              files=$(git diff --name-only --diff-filter=U)
+              {
+                echo "## Conflicts rebasing sheprd onto herdr $latest"
+                echo
+                echo "Files:"
+                echo "$files" | sed 's/^/- `/;s/$/`/'
+                echo
+                echo "Upstream commits touching them ($base..$latest):"
+                echo '```'
+                git log --oneline "$base..$latest" -- $files
+                echo '```'
+                echo
+                echo "Nothing was changed. Resolve locally with \`git rebase --onto $latest $base main\`,"
+                echo "then copy .git/rr-cache into .github/rr-cache so it replays next time."
+              } > conflict.md
+              git rebase --abort
+              gh issue create --title "Rebase onto herdr $latest needs a hand" --body-file conflict.md
+              exit 0
+            fi
+            GIT_EDITOR=true git rebase --continue || true
+          done
+          echo "clean=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: steps.rebase.outputs.clean == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: 1.96.1
+
+      - name: Install Zig
+        if: steps.rebase.outputs.clean == 'true'
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Build and test
+        if: steps.rebase.outputs.clean == 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build
+          cargo test --release --bin herdr -- client::shell
+
+      - name: Publish rebase branch
+        if: steps.rebase.outputs.clean == 'true'
+        run: |
+          latest=${{ steps.find.outputs.latest }}
+          git push origin "rebase/$latest"
+          gh issue create --title "herdr $latest: sheprd rebased cleanly, ready to ship" --body \
+            "Branch \`rebase/$latest\` builds and the client tests pass. Ship it from Actions → **sheprd promote** with \`$latest\` (or ask Claude). Upstream notes: https://github.com/herdrdev/herdr/releases/tag/$latest"

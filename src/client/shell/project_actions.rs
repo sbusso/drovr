@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use super::projects::{self, ProjectLayout};
+use super::projects;
 use super::*;
 
 type Action = ClientContextMenuAction;
@@ -61,9 +61,15 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
                 Action::ProjectToggleCollapse,
             );
             if name == projects::OTHER {
-                return vec![collapse];
+                return vec![
+                    item("New agent…", Action::ProjectNewAgent),
+                    item("New workspace…", Action::ProjectNewWorkspace),
+                    collapse,
+                ];
             }
             vec![
+                item("New agent here…", Action::ProjectNewAgent),
+                item("New workspace here…", Action::ProjectNewWorkspace),
                 collapse,
                 item(
                     if *pinned { "Unpin" } else { "Pin to top" },
@@ -76,6 +82,11 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
                 item("Delete project", Action::ProjectDelete),
             ]
         }
+        ClientContextMenuTarget::NewWorkspacePicker { machines, .. } => machines
+            .iter()
+            .enumerate()
+            .map(|(index, (_, label))| item(format!("on {label}"), Action::NewOnMachine(index)))
+            .collect(),
         ClientContextMenuTarget::Agent {
             unread_key,
             seq,
@@ -94,6 +105,14 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             } else {
                 item("Mark unread", Action::AgentMarkUnread)
             });
+            items.push(item(
+                if projects::layout().is_kept(unread_key) {
+                    "Stop keeping active"
+                } else {
+                    "Keep active"
+                },
+                Action::AgentToggleKeep,
+            ));
             if *active {
                 items.push(item("Rename pane…", Action::AgentRename));
             }
@@ -152,7 +171,7 @@ impl ClientShellState {
             .iter()
             .find(|workspace| workspace.workspace_id == workspace_id)?;
         Some((
-            projects::workspace_key(endpoint, &workspace.label),
+            projects::workspace_key(endpoint, workspace),
             workspace.label.clone(),
             projects::workspace_paths(snapshot, workspace),
         ))
@@ -414,6 +433,13 @@ impl ClientShellState {
         point: (u16, u16),
         outcome: &mut ClientShellInput,
     ) -> bool {
+        let sheprd_sidebar = self.hits.sheprd_view_toggle.width > 0;
+        if sheprd_sidebar && super::contains(self.hits.new_workspace, point) {
+            let project = self.focused_project();
+            self.open_new_workspace_picker(project, false);
+            outcome.repaint = true;
+            return true;
+        }
         if super::contains(self.hits.sheprd_view_toggle, point) {
             projects::update(|layout| layout.compact = !layout.compact);
         } else if super::contains(self.hits.sheprd_filter_toggle, point) {
@@ -510,7 +536,7 @@ impl ClientShellState {
                 ),
                 Action::ProjectRemove => projects::update(|layout| layout.assign(&key, "")),
                 Action::ProjectToggleHidden => {
-                    projects::update(|layout| ProjectLayout::toggle(&mut layout.hidden, &key))
+                    projects::update(|layout| layout.toggle_hidden(&key))
                 }
                 Action::ProjectMoveUp | Action::ProjectMoveDown => {
                     let layout = projects::layout();
@@ -524,7 +550,23 @@ impl ClientShellState {
                 }
                 _ => {}
             },
+            ClientContextMenuTarget::NewWorkspacePicker {
+                machines,
+                project,
+                run_agent,
+            } => {
+                if let Action::NewOnMachine(index) = action {
+                    if let Some((endpoint_id, _)) = machines.get(index) {
+                        self.prompt_new_workspace(endpoint_id.clone(), project, run_agent);
+                    }
+                }
+            }
             ClientContextMenuTarget::Project { name, .. } => match action {
+                Action::ProjectNewAgent | Action::ProjectNewWorkspace => self
+                    .open_new_workspace_picker(
+                        (name != projects::OTHER).then_some(name),
+                        action == Action::ProjectNewAgent,
+                    ),
                 Action::ProjectToggleCollapse => projects::update(|layout| {
                     if name == projects::OTHER {
                         layout.other_collapsed = !layout.other_collapsed;
@@ -584,6 +626,9 @@ impl ClientShellState {
                 Action::AgentMarkUnread => {
                     projects::update(|layout| layout.mark(&unread_key, seq, true))
                 }
+                Action::AgentToggleKeep => {
+                    projects::update(|layout| layout.toggle_kept(&unread_key))
+                }
                 Action::AgentMarkInactive => {
                     projects::update(|layout| layout.mark(&unread_key, seq, false))
                 }
@@ -619,7 +664,7 @@ impl ClientShellState {
                 }
                 Action::ProjectToggleHidden => {
                     if let Some(key) = workspace_key {
-                        projects::update(|layout| ProjectLayout::toggle(&mut layout.hidden, &key))
+                        projects::update(|layout| layout.toggle_hidden(&key))
                     }
                 }
                 _ => {}
@@ -671,12 +716,29 @@ impl ClientShellState {
                     .ok()
                     .filter(|n| *n > 0)
                 {
-                    self.handle_endpoint_navigation(
-                        crate::input::KeybindAction::FocusAgent(number - 1),
-                        outcome,
-                    );
+                    // Same order as the numbers drawn in the sidebar.
+                    let target = super::aggregate_navigation::online_agent_targets(
+                        &self.endpoints,
+                        &self.active_endpoint_id,
+                        crate::config::AgentPanelSortConfig::Spaces,
+                    )
+                    .into_iter()
+                    .nth(number - 1);
+                    if let Some(target) = target {
+                        self.focus_or_activate(
+                            target.endpoint_id,
+                            ClientEndpointFocusTarget::Pane(target.pane_id),
+                            outcome,
+                        );
+                    }
                 }
             }
+            ClientRenameTarget::NewWorkspaceOn {
+                endpoint_id,
+                project,
+                run_agent,
+                cwd,
+            } => self.create_workspace_on(endpoint_id, project, run_agent, cwd, text, outcome),
             other => return Some(other),
         }
         outcome.repaint = true;
@@ -705,11 +767,246 @@ impl ClientShellState {
         }
     }
 
+    /// True when no longer jump number could start with `n` (e.g. 4 of 25).
+    pub(super) fn jump_number_is_final(&self, n: usize) -> bool {
+        let total = super::aggregate_navigation::online_agent_targets(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            crate::config::AgentPanelSortConfig::Spaces,
+        )
+        .len();
+        n > 0 && n.saturating_mul(10) > total
+    }
+
     pub(super) fn open_jump_agent_prompt(&mut self) {
         self.prompt("jump to agent #", "", ClientRenameTarget::JumpAgent);
     }
 
     pub(super) fn toggle_show_hidden_workspaces(&mut self) {
         projects::update(|layout| layout.show_hidden = !layout.show_hidden);
+    }
+
+    /// Machines you can create a workspace on, active one first.
+    fn online_machines(&self) -> Vec<(ClientEndpointId, String)> {
+        let mut machines = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.endpoint_id.is_local() || endpoint.status == ClientEndpointStatus::Online
+            })
+            .map(|endpoint| (endpoint.endpoint_id.clone(), endpoint.label.clone()))
+            .collect::<Vec<_>>();
+        machines.sort_by_key(|(endpoint_id, _)| endpoint_id != &self.active_endpoint_id);
+        machines
+    }
+
+    /// Project of the focused workspace on the active machine.
+    fn focused_project(&self) -> Option<String> {
+        let workspace_id = self.snapshot.as_deref()?.focused_workspace_id.clone()?;
+        self.workspace_group(&self.active_endpoint_id, &workspace_id)
+    }
+
+    /// prefix+alt+c, the footer "new" button and the project menu land here.
+    pub(super) fn open_new_workspace_picker(&mut self, project: Option<String>, run_agent: bool) {
+        let machines = self.online_machines();
+        if machines.len() <= 1 {
+            if let Some((endpoint_id, _)) = machines.into_iter().next() {
+                self.prompt_new_workspace(endpoint_id, project, run_agent);
+            }
+            return;
+        }
+        let (x, y) = if self.hits.new_workspace.height > 0 {
+            (
+                self.hits.new_workspace.x + 1,
+                self.hits
+                    .new_workspace
+                    .y
+                    .saturating_sub(machines.len() as u16 + 2),
+            )
+        } else {
+            (2, 2)
+        };
+        self.open_menu(
+            ClientContextMenuTarget::NewWorkspacePicker {
+                machines,
+                project,
+                run_agent,
+            },
+            x,
+            y,
+        );
+    }
+
+    pub(super) fn open_new_workspace_for_focus(&mut self) {
+        let project = self.focused_project();
+        self.open_new_workspace_picker(project, false);
+    }
+
+    fn prompt_new_workspace(
+        &mut self,
+        endpoint_id: ClientEndpointId,
+        project: Option<String>,
+        run_agent: bool,
+    ) {
+        // Start in the project's folder on that machine when it has one there.
+        let cwd = project.as_deref().and_then(|project| {
+            let layout = projects::layout();
+            let (sections, _) = projects::sections(&layout, &self.endpoints);
+            sections
+                .into_iter()
+                .filter(|section| layout.groups[section.group].name == project)
+                .flat_map(|section| section.members)
+                .find_map(|member| {
+                    let endpoint = &self.endpoints[member.endpoint];
+                    (endpoint.endpoint_id == endpoint_id).then_some(())?;
+                    let workspace = endpoint.snapshot.as_deref()?.workspaces.get(member.index)?;
+                    (!workspace.new_workspace_cwd.is_empty())
+                        .then(|| workspace.new_workspace_cwd.clone())
+                })
+        });
+        let initial = project.clone().unwrap_or_default();
+        self.prompt(
+            if run_agent {
+                "new agent: workspace name"
+            } else {
+                "new workspace name"
+            },
+            &initial,
+            ClientRenameTarget::NewWorkspaceOn {
+                endpoint_id,
+                project,
+                run_agent,
+                cwd,
+            },
+        );
+    }
+
+    /// Send one API request to a specific machine (not just the active one).
+    fn endpoint_request(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        method: crate::api::schema::Method,
+    ) -> Option<ClientShellAction> {
+        let boot_id = self
+            .endpoint_by_id(endpoint_id)?
+            .snapshot
+            .as_deref()?
+            .boot_id
+            .clone();
+        let id = format!("sheprd:{}", self.next_request_id);
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        Some(ClientShellAction::Endpoint {
+            endpoint_id: endpoint_id.clone(),
+            boot_id,
+            request: Box::new(crate::api::schema::Request { id, method }),
+        })
+    }
+
+    fn create_workspace_on(
+        &mut self,
+        endpoint_id: ClientEndpointId,
+        project: Option<String>,
+        run_agent: bool,
+        cwd: Option<String>,
+        text: &str,
+        outcome: &mut ClientShellInput,
+    ) {
+        let label = Some(text.trim())
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .or_else(|| project.clone())
+            .unwrap_or_else(|| "workspace".to_owned());
+        let Some(endpoint) = self.endpoint_by_id(&endpoint_id) else {
+            return;
+        };
+        let machine = projects::machine_key(endpoint);
+        let known = endpoint
+            .snapshot
+            .as_deref()
+            .map(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.workspace_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let method = crate::api::schema::Method::WorkspaceCreate(
+            crate::api::schema::WorkspaceCreateParams {
+                source_workspace_id: None,
+                cwd,
+                focus: true,
+                label: Some(label.clone()),
+                env: Default::default(),
+            },
+        );
+        let Some(action) = self.endpoint_request(&endpoint_id, method) else {
+            return;
+        };
+        outcome.actions.push(action);
+        if let Some(project) = project.as_deref() {
+            let key = format!("{machine}/{label}");
+            projects::update(|layout| layout.assign(&key, project));
+        }
+        projects::set_launch(Some(projects::PendingLaunch {
+            endpoint_id: endpoint_id.clone(),
+            label,
+            known,
+            command: run_agent.then(|| "cc".to_owned()),
+            since: std::time::Instant::now(),
+        }));
+        if endpoint_id != self.active_endpoint_id {
+            outcome.actions.push(ClientShellAction::ActivateEndpoint {
+                endpoint_id,
+                target: None,
+            });
+        }
+    }
+
+    /// Once the workspace created above shows up, type the agent command into
+    /// its first pane (and stop waiting after a minute).
+    pub(crate) fn tick_sheprd_launch(&mut self) -> Vec<ClientShellAction> {
+        let Some(launch) = projects::launch() else {
+            return Vec::new();
+        };
+        if launch.since.elapsed().as_secs() > 60 {
+            projects::set_launch(None);
+            return Vec::new();
+        }
+        let pane_id = self
+            .endpoint_by_id(&launch.endpoint_id)
+            .and_then(|endpoint| {
+                let snapshot = endpoint.snapshot.as_deref()?;
+                let workspace = snapshot.workspaces.iter().find(|workspace| {
+                    workspace.label == launch.label
+                        && !launch.known.contains(&workspace.workspace_id)
+                })?;
+                snapshot
+                    .panes
+                    .iter()
+                    .find(|pane| pane.workspace_id == workspace.workspace_id)
+                    .map(|pane| pane.pane_id.clone())
+            });
+        let Some(pane_id) = pane_id else {
+            return Vec::new();
+        };
+        projects::set_launch(None);
+        let Some(command) = launch.command else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        let text =
+            crate::api::schema::Method::PaneSendText(crate::api::schema::PaneSendTextParams {
+                pane_id: pane_id.clone(),
+                text: command,
+            });
+        let enter =
+            crate::api::schema::Method::PaneSendKeys(crate::api::schema::PaneSendKeysParams {
+                pane_id,
+                keys: vec!["Enter".to_owned()],
+            });
+        actions.extend(self.endpoint_request(&launch.endpoint_id, text));
+        actions.extend(self.endpoint_request(&launch.endpoint_id, enter));
+        actions
     }
 }
