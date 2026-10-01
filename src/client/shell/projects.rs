@@ -575,6 +575,8 @@ struct Activity {
     dirty: bool,
     #[serde(skip)]
     saved: Option<Instant>,
+    #[serde(skip)]
+    primed: HashSet<String>,
 }
 
 fn activity_path() -> PathBuf {
@@ -629,6 +631,19 @@ pub(super) fn observe_activity(endpoint: &ClientShellEndpoint) {
             }
         }
     }
+    // Workspaces: remember when each first appeared. On the first snapshot of a
+    // machine in this process, unknown ones are old (unknown age); after that,
+    // a new id is a workspace that was just created.
+    let machine = machine_key(endpoint);
+    let primed = store.primed.contains(&machine);
+    for workspace in &snapshot.workspaces {
+        let key = format!("{machine}/ws:{}", workspace.workspace_id);
+        if !store.agents.contains_key(&key) {
+            store.agents.insert(key, (0, if primed { now } else { 0 }));
+            store.dirty = true;
+        }
+    }
+    store.primed.insert(machine);
     let due = store
         .saved
         .is_none_or(|saved| saved.elapsed().as_secs() >= 10);
@@ -658,6 +673,14 @@ pub(super) fn idle_secs(key: &str) -> Option<u64> {
         .agents
         .get(key)
         .and_then(|(_, at)| (*at > 0).then(|| unix_now().saturating_sub(*at)))
+}
+
+/// Seconds since a workspace first appeared, if this client saw it appear.
+pub(super) fn workspace_age_secs(
+    endpoint: &ClientShellEndpoint,
+    workspace_id: &str,
+) -> Option<u64> {
+    idle_secs(&format!("{}/ws:{}", machine_key(endpoint), workspace_id))
 }
 
 pub(super) fn format_age(secs: u64) -> String {

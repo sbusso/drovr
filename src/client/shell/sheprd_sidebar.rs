@@ -154,14 +154,17 @@ fn workspace_presence(
     )
 }
 
-fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> {
-    let endpoints = state.endpoints;
+fn build_rows(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    layout: &ProjectLayout,
+) -> Vec<Row> {
     // Agents in navigation order (the same list prefix+alt+N / prefix+# use).
     let mut agents: HashMap<(usize, String), Vec<AgentInfo>> = HashMap::new();
     let mut next_number = 0usize;
     for row in super::aggregate_navigation::aggregate_agent_rows(
         endpoints,
-        state.active_endpoint_id,
+        active_endpoint_id,
         crate::config::AgentPanelSortConfig::Spaces,
     ) {
         let endpoint = &endpoints[row.endpoint.endpoint_index];
@@ -186,7 +189,7 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
                 kept,
                 age: idle.map(projects::format_age),
                 current: presence.is_active() || kept || recent,
-                focused: row.agent.focused && &endpoint.endpoint_id == state.active_endpoint_id,
+                focused: row.agent.focused && &endpoint.endpoint_id == active_endpoint_id,
                 stale,
                 title: agent_title(row.agent),
                 number,
@@ -254,14 +257,21 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
                 .remove(&(endpoint_index, workspace.workspace_id.clone()))
                 .unwrap_or_default();
             let presence = workspace_presence(layout, endpoint, snapshot, &workspace.workspace_id);
-            let current =
-                presence.is_active() || workspace_agents.iter().any(|agent| agent.current);
+            // A brand-new workspace (no agent yet) and the one you're in count as
+            // current, so the active view doesn't swallow them.
+            let focused_here = workspace.focused && &endpoint.endpoint_id == active_endpoint_id;
+            let new_workspace = projects::workspace_age_secs(endpoint, &workspace.workspace_id)
+                .is_some_and(|secs| secs < layout.recent_secs());
+            let current = presence.is_active()
+                || focused_here
+                || new_workspace
+                || workspace_agents.iter().any(|agent| agent.current);
             if layout.active_only && !current {
                 continue;
             }
             presences.push(presence);
             count += 1;
-            let focused = workspace.focused && &endpoint.endpoint_id == state.active_endpoint_id;
+            let focused = workspace.focused && &endpoint.endpoint_id == active_endpoint_id;
             if layout.compact || workspace_agents.is_empty() {
                 body.push(Row::Workspace {
                     endpoint: endpoint_index,
@@ -320,6 +330,33 @@ fn build_rows(state: &ShellRenderState<'_>, layout: &ProjectLayout) -> Vec<Row> 
         }
     }
     rows
+}
+
+/// Workspaces in sidebar order, as alt+up/down should walk them: projects then
+/// Other, skipping hidden ones and (in the active view) inactive ones.
+/// Collapsed projects still count; collapsing is about space, not relevance.
+pub(super) fn ordered_workspaces(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+) -> Vec<(ClientEndpointId, String)> {
+    let mut layout = projects::layout();
+    layout.compact = true;
+    layout.other_collapsed = false;
+    for group in &mut layout.groups {
+        group.collapsed = false;
+    }
+    build_rows(endpoints, active_endpoint_id, &layout)
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Workspace {
+                endpoint,
+                workspace_id,
+                stale: false,
+                ..
+            } => Some((endpoints[endpoint].endpoint_id.clone(), workspace_id)),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(super) fn render(
@@ -386,7 +423,7 @@ pub(super) fn render(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = build_rows(state, &layout);
+    let rows = build_rows(state.endpoints, state.active_endpoint_id, &layout);
     let body = Rect::new(
         inner.x,
         inner.y + 1,

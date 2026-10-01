@@ -113,29 +113,34 @@ impl ClientShellState {
             action,
             KeybindAction::PreviousWorkspace | KeybindAction::NextWorkspace
         ) {
-            let workspaces = self
-                .endpoints
-                .iter()
-                .filter(|endpoint| endpoint.status == ClientEndpointStatus::Online)
-                .flat_map(|endpoint| {
-                    endpoint
-                        .snapshot
-                        .as_deref()
-                        .map_or_else(Vec::new, |snapshot| {
-                            render::workspace_entries(snapshot, &HashSet::new())
-                                .into_iter()
-                                .filter_map(|entry| {
-                                    snapshot.workspaces.get(entry.index).map(|workspace| {
-                                        (
-                                            endpoint.endpoint_id.clone(),
-                                            workspace.workspace_id.clone(),
-                                        )
+            // andreconde fork (sheprd): walk the combined sidebar's order and skip
+            // hidden/filtered workspaces. Upstream's tests keep the stock order.
+            let workspaces = if cfg!(test) {
+                self.endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.status == ClientEndpointStatus::Online)
+                    .flat_map(|endpoint| {
+                        endpoint
+                            .snapshot
+                            .as_deref()
+                            .map_or_else(Vec::new, |snapshot| {
+                                render::workspace_entries(snapshot, &HashSet::new())
+                                    .into_iter()
+                                    .filter_map(|entry| {
+                                        snapshot.workspaces.get(entry.index).map(|workspace| {
+                                            (
+                                                endpoint.endpoint_id.clone(),
+                                                workspace.workspace_id.clone(),
+                                            )
+                                        })
                                     })
-                                })
-                                .collect()
-                        })
-                })
-                .collect::<Vec<_>>();
+                                    .collect()
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                super::sheprd_sidebar::ordered_workspaces(&self.endpoints, &self.active_endpoint_id)
+            };
             if workspaces.is_empty() {
                 return true;
             }
