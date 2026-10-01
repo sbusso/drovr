@@ -90,6 +90,7 @@ pub(super) struct ShellHitMap {
     pub(super) sheprd_rows: Vec<super::sheprd_sidebar::RowHit>,
     pub(super) sheprd_view_toggle: Rect,
     pub(super) sheprd_filter_toggle: Rect,
+    pub(super) sheprd_attention: Rect,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -798,6 +799,9 @@ pub(crate) enum ClientShellNotificationEffect {
         body: Option<String>,
         #[cfg(windows)]
         target: Option<ClientSystemNotificationTarget>,
+        /// andreconde fork (sheprd): the agent to jump to when it is clicked.
+        #[cfg(not(windows))]
+        click: Option<(ClientEndpointId, String)>,
     },
 }
 

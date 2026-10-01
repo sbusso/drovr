@@ -208,6 +208,12 @@ impl ClientShellState {
                 }
             }
 
+            #[cfg(not(windows))]
+            let click = pending
+                .event
+                .pane_id
+                .clone()
+                .map(|pane_id| (pending.endpoint_id.clone(), pane_id));
             match self.config.toast_delivery {
                 crate::config::ToastDelivery::Off => {}
                 crate::config::ToastDelivery::Herdr if !target_active => {
@@ -244,6 +250,8 @@ impl ClientShellState {
                         body: pending.event.body,
                         #[cfg(windows)]
                         target,
+                        #[cfg(not(windows))]
+                        click,
                     });
                 }
                 crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System => {}

@@ -71,8 +71,18 @@ pub(super) fn handle_shell_notification_effects(
             shell::ClientShellNotificationEffect::System {
                 title,
                 body,
+                #[cfg(not(windows))]
+                click: Some((endpoint_id, pane_id)),
+                ..
+            } if sheprd_has_display() => {
+                sheprd_clickable_notification(title, body, endpoint_id, pane_id)
+            }
+            shell::ClientShellNotificationEffect::System {
+                title,
+                body,
                 #[cfg(windows)]
                 target,
+                ..
             } => {
                 #[cfg(windows)]
                 let result = show_system_notification(&title, body.as_deref(), target, event_tx);
@@ -190,6 +200,92 @@ pub(super) fn sound_from_notify_message(message: &str) -> Option<crate::sound::S
         "agent done" => Some(crate::sound::Sound::Done),
         "agent attention" => Some(crate::sound::Sound::Request),
         _ => None,
+    }
+}
+
+/// andreconde fork (sheprd): clickable notifications need an X11/Wayland display;
+/// without one the effect falls back to a plain notification.
+#[cfg(not(windows))]
+fn sheprd_has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// andreconde fork (sheprd): a desktop notification you can click. notify-send
+/// waits (on its own thread) for the click; clicking raises the terminal running
+/// sheprd and focuses the agent. Falls back to a plain notification.
+#[cfg(not(windows))]
+fn sheprd_clickable_notification(
+    title: String,
+    body: Option<String>,
+    endpoint_id: super::endpoint::ClientEndpointId,
+    pane_id: String,
+) {
+    std::thread::spawn(move || {
+        let mut command = std::process::Command::new("notify-send");
+        command
+            .arg("--app-name")
+            .arg("sheprd")
+            .arg("--action=default=Open")
+            .arg("--wait")
+            .arg("--")
+            .arg(&title);
+        if let Some(body) = body.as_deref().filter(|body| !body.is_empty()) {
+            command.arg(body);
+        }
+        let Ok(output) = command
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return;
+        };
+        if String::from_utf8_lossy(&output.stdout).trim() == "default" {
+            raise_own_terminal();
+            super::shell::request_agent_focus(endpoint_id, pane_id);
+        }
+    });
+}
+
+#[cfg(not(windows))]
+/// Focus the terminal window this client runs in (Hyprland): walk up our
+/// process tree until a pid matches a Hyprland client window.
+fn raise_own_terminal() {
+    let Ok(output) = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+    else {
+        return;
+    };
+    let Ok(clients) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) else {
+        return;
+    };
+    let window_pids = clients
+        .iter()
+        .filter_map(|client| client.get("pid").and_then(serde_json::Value::as_u64))
+        .collect::<std::collections::HashSet<_>>();
+    let mut pid = u64::from(std::process::id());
+    for _ in 0..32 {
+        if window_pids.contains(&pid) {
+            let _ = std::process::Command::new("hyprctl")
+                .args(["dispatch", "focuswindow", &format!("pid:{pid}")])
+                .output();
+            return;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return;
+        };
+        // ppid is the 2nd field after the parenthesised command name.
+        let Some(ppid) = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|ppid| ppid.parse::<u64>().ok())
+        else {
+            return;
+        };
+        if ppid <= 1 {
+            return;
+        }
+        pid = ppid;
     }
 }
 

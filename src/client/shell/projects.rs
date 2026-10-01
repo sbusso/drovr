@@ -719,6 +719,59 @@ pub(super) fn launch() -> Option<PendingLaunch> {
         .clone()
 }
 
+/// Peek (prefix+space): reveal idle age, context, numbers and latency for a
+/// few seconds instead of showing them all the time.
+const PEEK_SECS: u64 = 10;
+
+fn peek_store() -> &'static std::sync::Mutex<Option<Instant>> {
+    static PEEK: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
+    PEEK.get_or_init(Default::default)
+}
+
+pub(super) fn toggle_peek() {
+    let mut peek = peek_store().lock().unwrap_or_else(|e| e.into_inner());
+    *peek = if peek.is_some() {
+        None
+    } else {
+        Some(Instant::now())
+    };
+}
+
+pub(super) fn peeking() -> bool {
+    peek_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|since| since.elapsed().as_secs() < PEEK_SECS)
+}
+
+/// Ends an expired peek; true when the sidebar needs a repaint.
+pub(super) fn expire_peek() -> bool {
+    let mut peek = peek_store().lock().unwrap_or_else(|e| e.into_inner());
+    if peek.is_some_and(|since| since.elapsed().as_secs() >= PEEK_SECS) {
+        *peek = None;
+        return true;
+    }
+    false
+}
+
+/// Agents whose desktop notification was clicked, waiting to be focused.
+fn focus_queue() -> &'static std::sync::Mutex<Vec<(super::ClientEndpointId, String)>> {
+    static QUEUE: OnceLock<std::sync::Mutex<Vec<(super::ClientEndpointId, String)>>> =
+        OnceLock::new();
+    QUEUE.get_or_init(Default::default)
+}
+
+pub(crate) fn request_focus(endpoint_id: super::ClientEndpointId, pane_id: String) {
+    focus_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((endpoint_id, pane_id));
+}
+
+pub(super) fn take_focus_requests() -> Vec<(super::ClientEndpointId, String)> {
+    std::mem::take(&mut *focus_queue().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 static HINTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(super) fn set_hinting(on: bool) {

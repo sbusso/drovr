@@ -54,6 +54,11 @@ impl ClientShellState {
                         outcome.repaint = true;
                         return;
                     }
+                    crate::input::KeybindAction::PeekDetails => {
+                        self.toggle_peek();
+                        outcome.repaint = true;
+                        return;
+                    }
                     crate::input::KeybindAction::ProjectMenu => {
                         self.open_focused_project_menu();
                         outcome.repaint = true;

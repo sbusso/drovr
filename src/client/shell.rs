@@ -284,3 +284,8 @@ fn blit_pane_surface(target: &mut FrameData, source: &FrameData, area: Rect) {
 
 #[cfg(test)]
 mod tests;
+
+/// andreconde fork (sheprd): queue an agent to focus (from a notification click).
+pub(crate) fn request_agent_focus(endpoint_id: ClientEndpointId, pane_id: String) {
+    projects::request_focus(endpoint_id, pane_id);
+}

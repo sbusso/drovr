@@ -124,6 +124,10 @@ pub(crate) fn keybind_help_groups(
                     "new workspace on a machine",
                 ),
                 entry(
+                    binding_label(&keybinds.peek_details),
+                    "peek: idle age, context, numbers, latency",
+                ),
+                entry(
                     binding_label(&keybinds.project_menu),
                     "sidebar project menu",
                 ),

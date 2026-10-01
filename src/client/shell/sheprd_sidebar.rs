@@ -401,6 +401,28 @@ pub(super) fn render(
             })
             .add_modifier(Modifier::BOLD),
     );
+    // Attention counter: how many agents need you; click = next one (prefix+u).
+    let (needing, blocked) = attention_count(state.endpoints, &layout);
+    hits.sheprd_attention = Rect::default();
+    if needing > 0 {
+        let counter = format!(" ● {needing}");
+        let x = inner.x + display_width(filter);
+        hits.sheprd_attention = Rect::new(x, inner.y, display_width(&counter), 1);
+        put_text(
+            buffer,
+            x,
+            inner.y,
+            inner.width.saturating_sub(display_width(filter)),
+            &counter,
+            Style::default()
+                .fg(if blocked {
+                    status_color(crate::api::schema::AgentStatus::Blocked, palette)
+                } else {
+                    Color::Yellow
+                })
+                .add_modifier(Modifier::BOLD),
+        );
+    }
     let view = if layout.compact {
         "compact "
     } else {
@@ -516,12 +538,14 @@ pub(super) fn render(
             "menu",
             Style::default().fg(palette.overlay0),
         );
-        // Remote machines: live latency, or their state when not online.
+        // Remote machines: latency while peeking; a problem state always.
+        let peeking = projects::peeking();
         let machines = state
             .endpoints
             .iter()
             .filter(|endpoint| !endpoint.endpoint_id.is_local())
             .map(|endpoint| match endpoint.status {
+                ClientEndpointStatus::Online if !peeking => String::new(),
                 ClientEndpointStatus::Online => {
                     match crate::client::endpoint::endpoint_rtt_ms(&endpoint.endpoint_id) {
                         Some(rtt) => format!("{} {rtt}ms", endpoint.label),
@@ -533,6 +557,7 @@ pub(super) fn render(
                     format!("{} {glyph} {text}", endpoint.label)
                 }
             })
+            .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
         let used = display_width(&label) + 7;
@@ -570,7 +595,9 @@ fn render_row(
 ) {
     let palette = &config.palette;
     let hinting = projects::hinting();
-    // Right-hand slot: the jump number while hinting, otherwise the idle age.
+    let peeking = projects::peeking();
+    // Right-hand slot: empty normally; the jump number while the jump prompt
+    // is open; idle age + number while peeking (prefix+space).
     let right_slot = |number: Option<usize>, age: &Option<String>| -> (String, Style) {
         if hinting {
             (
@@ -581,13 +608,21 @@ fn render_row(
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD),
             )
-        } else {
+        } else if peeking {
+            let parts = [age.clone(), number.map(|number| format!("#{number}"))]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             (
-                age.as_ref()
-                    .map(|age| format!("{age} "))
-                    .unwrap_or_default(),
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", parts.join(" "))
+                },
                 Style::default().fg(palette.overlay0),
             )
+        } else {
+            (String::new(), Style::default())
         }
     };
     match row {
@@ -802,4 +837,41 @@ fn render_row(
             });
         }
     }
+}
+
+/// Agents that need you (blocked, finished-unseen, marked unread) on online
+/// machines, skipping hidden workspaces; and whether any is blocked.
+fn attention_count(endpoints: &[ClientShellEndpoint], layout: &ProjectLayout) -> (usize, bool) {
+    let mut count = 0;
+    let mut blocked = false;
+    for endpoint in endpoints
+        .iter()
+        .filter(|endpoint| endpoint.status == ClientEndpointStatus::Online)
+    {
+        let Some(snapshot) = endpoint.snapshot.as_deref() else {
+            continue;
+        };
+        for agent in &snapshot.agents {
+            let hidden = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == agent.workspace_id)
+                .is_some_and(|workspace| {
+                    layout.is_hidden(&projects::workspace_key(endpoint, workspace))
+                });
+            if hidden {
+                continue;
+            }
+            let presence = layout.presence(
+                &projects::agent_key(endpoint, &agent.pane_id),
+                agent.state_change_seq,
+                agent.agent_status,
+            );
+            if presence.needs_attention() {
+                count += 1;
+                blocked |= presence == Presence::Blocked;
+            }
+        }
+    }
+    (count, blocked)
 }

@@ -22,12 +22,12 @@ orders. sheprd replaces both with **one list**: your projects, each showing its
 agents from **every** machine, then **Other** for everything not in a project.
 
 ```
- ○ all agents       detailed      ← filter toggle · view toggle (click)
+ ○ all agents ● 2   detailed      ← filter · needs-you counter · view (click)
  ▾ ★ storefront
  ● Fix checkout rounding          ← agent topic
    gpu-box                        ← workspace (if ≠ project) · machine
  ▾ ★ billing
- ○ ⚑ Invoice PDF layout      2h   ← ⚑ kept active · idle for 2h
+ ○ ⚑ Invoice PDF layout          ← ⚑ kept active
    billing-web
  ● Retry failed webhooks
    billing-web · gpu-box
@@ -35,8 +35,12 @@ agents from **every** machine, then **Other** for everything not in a project.
  ▾ Other
  ○ Weekly notes               4
    notes
- new · Local   gpu-box 38ms menu  ← live latency per remote machine
+ new · Local              menu
 ```
+
+The sidebar stays quiet: status and topic only. **Peek** (`prefix+space`)
+reveals idle age, jump numbers and each machine's latency for ten seconds
+(press again to hide).
 
 - **Two views** (click the right header label): *detailed*, one row per agent
   with its topic, and *compact*, one line per workspace.
@@ -60,7 +64,9 @@ agents from **every** machine, then **Other** for everything not in a project.
 
 ### Attention you control
 - `prefix+u` jumps to the **next agent that needs you**: blocked, finished and
-  not looked at yet, or marked unread, in sidebar order.
+  not looked at yet, or marked unread, in sidebar order. The `● 2` counter in
+  the header shows how many there are; clicking it does the same.
+- **Click a desktop notification** to raise the terminal and land on that agent.
 - Right-click an agent → **Mark unread** (a yellow `●` status that counts as
   needing you until you visit it) or **Mark inactive** (drops a finished or
   blocked agent out of the queue until its state changes again).
@@ -84,6 +90,7 @@ agents from **every** machine, then **Other** for everything not in a project.
 ### Keys (defaults; no config needed)
 | Key | Action |
 |---|---|
+| `prefix+space` | peek: idle age, numbers, latency |
 | `prefix+u` | next agent that needs you |
 | `prefix+#` | show jump numbers, type one to jump |
 | `prefix+alt+c` | new workspace on a machine you pick |
@@ -119,6 +126,7 @@ sheprd            # instead of `herdr`
 ```
 
 It installs to `~/.local/share/sheprd/sheprd` and leaves your `herdr` install alone.
+Update later with `sheprd update`.
 The server keeps running stock herdr; use the matching herdr version on each machine.
 
 ## Versioning

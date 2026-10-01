@@ -2268,8 +2268,8 @@ async fn run_client_loop(
                     let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
                         let mut outcome = shell.tick_selection_autoscroll(now);
-                        // andreconde fork (sheprd): start the agent in a just-created workspace.
-                        outcome.actions.extend(shell.tick_sheprd_launch());
+                        // andreconde fork (sheprd): agent launch, notification clicks, peek expiry.
+                        shell.tick_sheprd(&mut outcome);
                         for expired in expired_endpoints {
                             if !shell.endpoint_is_active(&expired.endpoint_id) {
                                 continue;

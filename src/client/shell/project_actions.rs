@@ -440,6 +440,10 @@ impl ClientShellState {
             outcome.repaint = true;
             return true;
         }
+        if super::contains(self.hits.sheprd_attention, point) {
+            self.focus_next_attention_agent(outcome);
+            return true;
+        }
         if super::contains(self.hits.sheprd_view_toggle, point) {
             projects::update(|layout| layout.compact = !layout.compact);
         } else if super::contains(self.hits.sheprd_filter_toggle, point) {
@@ -782,6 +786,10 @@ impl ClientShellState {
         self.prompt("jump to agent #", "", ClientRenameTarget::JumpAgent);
     }
 
+    pub(super) fn toggle_peek(&mut self) {
+        projects::toggle_peek();
+    }
+
     pub(super) fn toggle_show_hidden_workspaces(&mut self) {
         projects::update(|layout| layout.show_hidden = !layout.show_hidden);
     }
@@ -963,9 +971,23 @@ impl ClientShellState {
         }
     }
 
+    /// Periodic sheprd work, from the client loop's 100 ms timer.
+    pub(crate) fn tick_sheprd(&mut self, outcome: &mut ClientShellInput) {
+        outcome.actions.extend(self.tick_sheprd_launch());
+        for (endpoint_id, pane_id) in projects::take_focus_requests() {
+            self.focus_or_activate(
+                endpoint_id,
+                ClientEndpointFocusTarget::Pane(pane_id),
+                outcome,
+            );
+            outcome.repaint = true;
+        }
+        outcome.repaint |= projects::expire_peek();
+    }
+
     /// Once the workspace created above shows up, type the agent command into
     /// its first pane (and stop waiting after a minute).
-    pub(crate) fn tick_sheprd_launch(&mut self) -> Vec<ClientShellAction> {
+    fn tick_sheprd_launch(&mut self) -> Vec<ClientShellAction> {
         let Some(launch) = projects::launch() else {
             return Vec::new();
         };
