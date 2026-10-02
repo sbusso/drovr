@@ -43,8 +43,9 @@ Clicking the view label cycles *detailed*, *compact* (one line per workspace)
 and *structured*: workspace headers (remote machine on the right) with one line
 per agent, a vendor mark and a title coloured by state (working in the vendor's
 colour, done green, blocked red, idle fading over 15 minutes and 2 hours). The
-marks use the [herdr-radar](https://github.com/hhdebb/herdr-radar) icon font;
-without it set `agent_icons = "letter"` (or `"none"`) under `[ui.sidebar]` in
+mark is the vendor's first letter; with the
+[herdr-radar](https://github.com/hhdebb/herdr-radar) icon font installed, set
+`agent_icons = "radar"` (or `"none"` for no mark) under `[ui.sidebar]` in
 herdr's `config.toml`.
 
 The sidebar stays quiet: status and topic only. **Peek** (`prefix+space`)

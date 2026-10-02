@@ -248,6 +248,8 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) reveal_navigation_workspace: &'a mut bool,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
+    /// drovr fork: host light/dark, for the structured sidebar's ink.
+    pub(super) host_appearance: Option<crate::terminal_theme::HostAppearance>,
 }
 
 pub(super) fn render_shell(

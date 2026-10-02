@@ -434,6 +434,7 @@ pub(super) fn render(
         state.active_endpoint_id,
         state.workspace_scroll,
         reveal_focused,
+        state.host_appearance,
         hits,
     );
 }
@@ -448,9 +449,11 @@ pub(super) fn render_panel(
     active_endpoint_id: &ClientEndpointId,
     workspace_scroll: &mut usize,
     reveal_focused: bool,
+    host_appearance: Option<crate::terminal_theme::HostAppearance>,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
+    let ground = radar::ground(palette, host_appearance);
     super::render::render_sidebar_background(buffer, area, palette);
     hits.sidebar_divider = if area.is_empty() {
         Rect::default()
@@ -586,7 +589,7 @@ pub(super) fn render_panel(
         }
         let rect = Rect::new(body.x, y, width, height);
         render_row(
-            buffer, rect, row, &layout, endpoints, config, drag_point, hits,
+            buffer, rect, row, &layout, endpoints, config, ground, drag_point, hits,
         );
         y = y.saturating_add(height).saturating_add(gaps[index]);
     }
@@ -673,6 +676,7 @@ fn render_row(
     layout: &ProjectLayout,
     endpoints: &[ClientShellEndpoint],
     config: &ClientShellConfig,
+    ground: radar::Ground,
     drag_point: Option<(u16, u16)>,
     hits: &mut ShellHitMap,
 ) {
@@ -714,7 +718,16 @@ fn render_row(
             }
         };
     if layout.structured && !layout.compact && !matches!(row, Row::Header { .. }) {
-        render_structured_row(buffer, rect, row, endpoints, config, &right_slot, hits);
+        render_structured_row(
+            buffer,
+            rect,
+            row,
+            endpoints,
+            config,
+            ground,
+            &right_slot,
+            hits,
+        );
         return;
     }
     match row {
@@ -952,17 +965,18 @@ type RightSlot<'a> =
 
 /// Structured view rows: a workspace header (label, remote machine on the
 /// right) or one agent line (vendor mark, state mark, state-coloured title).
+#[allow(clippy::too_many_arguments)] // one render pass; splitting only shuffles args
 fn render_structured_row(
     buffer: &mut Buffer,
     rect: Rect,
     row: &Row,
     endpoints: &[ClientShellEndpoint],
     config: &ClientShellConfig,
+    ground: radar::Ground,
     right_slot: &RightSlot<'_>,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
-    let light = radar::is_light(palette);
     match row {
         Row::Header { .. } => {}
         Row::Agent {
@@ -991,16 +1005,13 @@ fn render_structured_row(
                 .right()
                 .saturating_sub(display_width(&slot) + u16::from(!slot.is_empty()));
             let mut x = rect.x + STRUCTURED_INDENT;
-            if let Some((mark, color)) = radar::logo(
-                vendor.as_deref(),
-                config.agent_icons,
-                light,
-                palette.overlay0,
-            ) {
+            if let Some((mark, color)) =
+                radar::logo(vendor.as_deref(), config.agent_icons, ground, palette)
+            {
                 put_text(buffer, x, rect.y, 1, &mark, Style::default().fg(color));
                 x = x.saturating_add(2);
             }
-            let (color, bold) = radar::title_style(*tone, vendor.as_deref(), light);
+            let (color, bold) = radar::title_style(*tone, vendor.as_deref(), ground, palette);
             let mut style = Style::default().fg(color);
             if bold {
                 style = style.add_modifier(Modifier::BOLD);
@@ -1047,16 +1058,19 @@ fn render_structured_row(
             }
             let (slot, slot_style) = right_slot(*number, age, &None);
             put_right_text(buffer, rect, rect.y, &slot, slot_style);
-            let tag = machine
-                .as_ref()
-                .map(|machine| format!("{machine} "))
-                .unwrap_or_default();
             let tag_rect = Rect::new(
                 rect.x,
                 rect.y,
                 rect.width.saturating_sub(display_width(&slot)),
                 1,
             );
+            // The label names the agents below; the machine tag gets at most a
+            // third of the row so it cannot crowd the label out.
+            let tag = machine
+                .as_ref()
+                .map(|machine| format!("{} ", radar::fit(machine, tag_rect.width / 3)))
+                .filter(|tag| tag.len() > 1)
+                .unwrap_or_default();
             put_right_text(
                 buffer,
                 tag_rect,
@@ -1084,7 +1098,7 @@ fn render_structured_row(
                     .fg(if *focused {
                         palette.text
                     } else {
-                        radar::subtle(light)
+                        radar::subtle(ground, palette)
                     })
                     .add_modifier(Modifier::BOLD),
             );
@@ -1579,6 +1593,7 @@ mod tests {
                 &layout,
                 &endpoints,
                 &config,
+                radar::Ground::Dark,
                 None,
                 &mut hits,
             );
@@ -1620,5 +1635,43 @@ mod tests {
         }
         assert_eq!(hits.drovr_rows.len(), 8);
         assert_eq!(hits.endpoint_agents.len(), 4);
+    }
+    #[test]
+    fn structured_header_caps_the_machine_tag_on_narrow_sidebars() {
+        let mut endpoints = fixture();
+        endpoints[1].label = "gpu-box-staging-eu".into();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let layout = structured_layout();
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let header = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row,
+                    Row::Workspace {
+                        machine: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("remote workspace header");
+        let area = Rect::new(0, 0, 22, 1);
+        let mut buffer = Buffer::empty(area);
+        render_row(
+            &mut buffer,
+            area,
+            header,
+            &layout,
+            &endpoints,
+            &config,
+            radar::Ground::Dark,
+            None,
+            &mut ShellHitMap::default(),
+        );
+        let line = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_owned())
+            .collect::<String>();
+        assert!(line.contains("turfobet.fr"), "{line:?}");
+        assert!(line.contains("gpu-bo…"), "{line:?}");
     }
 }

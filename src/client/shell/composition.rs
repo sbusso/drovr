@@ -85,6 +85,7 @@ impl ClientShellState {
             reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
+            host_appearance: self.host_appearance, // drovr fork
         };
         if let Some(snapshot) = local_snapshot {
             render::render_sidebar(
@@ -248,6 +249,7 @@ impl ClientShellState {
                 reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
+                host_appearance: self.host_appearance, // drovr fork
             },
         );
         self.hits.panes = surface
@@ -385,6 +387,7 @@ impl ClientShellState {
                 &self.active_endpoint_id,
                 &mut scroll,
                 true,
+                self.host_appearance, // drovr fork
                 &mut scratch,
             );
             let panel = FrameData::from_ratatui_buffer_with_hyperlinks(&panel, None, &[]);

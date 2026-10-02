@@ -4,13 +4,15 @@
 //! Copyright (c) 2026 herdr-kit contributors): icon font codepoints from
 //! `lib/logos.js`, brand and state colours from `lib/palette.js`, state marks
 //! and idle thresholds from `lib/config.js`. The icon font itself is not
-//! bundled; `[ui.sidebar] agent_icons = "letter"` or `"none"` avoids it.
+//! bundled, so the default mark is the vendor's letter; `[ui.sidebar]
+//! agent_icons = "radar"` needs the font installed.
 
 use ratatui::style::Color;
 
 use super::projects::Presence;
 use crate::app::state::Palette;
 use crate::config::AgentIconsConfig;
+use crate::terminal_theme::HostAppearance;
 
 /// An idle agent reads as recently active for this long (radar's
 /// `activity_fresh_minutes` default).
@@ -33,8 +35,8 @@ pub(super) enum Tone {
 }
 
 /// Radar's state scale from drovr's presence. `idle_secs` is the time since
-/// the agent's last state change; unknown age counts as stale, as everywhere
-/// else in the drovr sidebar.
+/// the agent's last state change. Unknown age is plain idle, as in radar's
+/// `freshness()`: an agent never seen working is a restart, not neglect.
 pub(super) fn tone(presence: Presence, unknown: bool, idle_secs: Option<u64>) -> Tone {
     match presence {
         Presence::Working => Tone::Working,
@@ -43,9 +45,10 @@ pub(super) fn tone(presence: Presence, unknown: bool, idle_secs: Option<u64>) ->
         Presence::Unread => Tone::Unread,
         Presence::Idle if unknown => Tone::Unknown,
         Presence::Idle => match idle_secs {
-            Some(secs) if secs < FRESH_SECS => Tone::IdleFresh,
+            None => Tone::Idle,
+            Some(secs) if secs <= FRESH_SECS => Tone::IdleFresh,
             Some(secs) if secs < STALE_SECS => Tone::Idle,
-            _ => Tone::IdleStale,
+            Some(_) => Tone::IdleStale,
         },
     }
 }
@@ -68,13 +71,40 @@ const fn hex(rgb: u32) -> Color {
     Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// Light or dark ink, judged from the active palette's main text colour.
-pub(super) fn is_light(palette: &Palette) -> bool {
-    match palette.text {
-        Color::Rgb(r, g, b) => {
-            u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 < 128_000
+/// Which ink set the view draws neutral text in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ground {
+    /// Radar's dark-background values.
+    Dark,
+    /// Radar's light-background values.
+    Light,
+    /// Background unknown (16-colour theme, no host report): palette colours.
+    Palette,
+}
+
+/// The background the view draws on: judged from an RGB palette's text
+/// colour, else from the host terminal's reported appearance.
+pub(super) fn ground(palette: &Palette, host: Option<HostAppearance>) -> Ground {
+    match (palette.text, host) {
+        (Color::Rgb(r, g, b), _) => {
+            if u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 < 128_000 {
+                Ground::Light
+            } else {
+                Ground::Dark
+            }
         }
-        _ => false,
+        (_, Some(HostAppearance::Light)) => Ground::Light,
+        (_, Some(HostAppearance::Dark)) => Ground::Dark,
+        (_, None) => Ground::Palette,
+    }
+}
+
+/// `dark` or `light` for a known background, else the palette's `fallback`.
+fn pick(ground: Ground, dark: u32, light: u32, fallback: Color) -> Color {
+    match ground {
+        Ground::Dark => hex(dark),
+        Ground::Light => hex(light),
+        Ground::Palette => fallback,
     }
 }
 
@@ -97,26 +127,31 @@ fn brand(vendor: &str) -> Option<Color> {
 const BRAND_OTHER: Color = hex(0xc78a1f);
 
 /// The ink a hueless brand signs in.
-fn ink(light: bool) -> Color {
-    hex(if light { 0x16161c } else { 0xe9e9f0 })
+fn ink(ground: Ground, palette: &Palette) -> Color {
+    pick(ground, 0xe9e9f0, 0x16161c, palette.text)
 }
 
 /// Workspace header colour (radar `subtle`).
-pub(super) fn subtle(light: bool) -> Color {
-    hex(if light { 0x7c7f93 } else { 0xa8abbd })
+pub(super) fn subtle(ground: Ground, palette: &Palette) -> Color {
+    pick(ground, 0xa8abbd, 0x7c7f93, palette.subtext0)
 }
 
 /// Title colour and boldness for a state; working wears the vendor's colour.
-pub(super) fn title_style(tone: Tone, vendor: Option<&str>, light: bool) -> (Color, bool) {
+pub(super) fn title_style(
+    tone: Tone,
+    vendor: Option<&str>,
+    ground: Ground,
+    palette: &Palette,
+) -> (Color, bool) {
     match tone {
         Tone::Working => (vendor.and_then(brand).unwrap_or(BRAND_OTHER), true),
         Tone::Done => (hex(0x4c9a5a), false),
         Tone::Blocked => (hex(0xc04a4a), false),
         Tone::Unknown => (hex(0x907aa9), false),
         Tone::Unread => (Color::Yellow, false),
-        Tone::IdleFresh => (hex(if light { 0x416c4f } else { 0x95bba2 }), false),
-        Tone::Idle => (hex(if light { 0x6b6259 } else { 0xa99e92 }), false),
-        Tone::IdleStale => (hex(if light { 0x69696d } else { 0x8b8e9c }), false),
+        Tone::IdleFresh => (pick(ground, 0x95bba2, 0x416c4f, palette.green), false),
+        Tone::Idle => (pick(ground, 0xa99e92, 0x6b6259, palette.subtext0), false),
+        Tone::IdleStale => (pick(ground, 0x8b8e9c, 0x69696d, palette.overlay0), false),
     }
 }
 
@@ -151,27 +186,32 @@ fn font_glyph(vendor: &str) -> Option<char> {
     })
 }
 
-/// The vendor mark and its colour; `None` when marks are off. Vendors without
-/// a mark get a neutral dot in `neutral`.
+/// The vendor mark and its colour; `None` when marks are off. Vendors radar
+/// does not know get a neutral dot in `palette.overlay0`, in both mark modes.
 pub(super) fn logo(
     vendor: Option<&str>,
     icons: AgentIconsConfig,
-    light: bool,
-    neutral: Color,
+    ground: Ground,
+    palette: &Palette,
 ) -> Option<(String, Color)> {
-    let mark = match (icons, vendor) {
+    let known = vendor.filter(|vendor| font_glyph(vendor).is_some());
+    let mark = match (icons, known) {
         (AgentIconsConfig::None, _) => return None,
         (AgentIconsConfig::Radar, Some(vendor)) => font_glyph(vendor).map(String::from),
         (AgentIconsConfig::Letter, Some(vendor)) => vendor
             .chars()
             .next()
-            .filter(char::is_ascii_alphanumeric)
             .map(|letter| letter.to_ascii_uppercase().to_string()),
         (_, None) => None,
     };
     Some(match mark {
-        Some(mark) => (mark, vendor.and_then(brand).unwrap_or_else(|| ink(light))),
-        None => ("•".to_owned(), neutral),
+        Some(mark) => (
+            mark,
+            known
+                .and_then(brand)
+                .unwrap_or_else(|| ink(ground, palette)),
+        ),
+        None => ("•".to_owned(), palette.overlay0),
     })
 }
 
@@ -188,10 +228,11 @@ mod tests {
     fn idle_tiers_follow_radar_thresholds() {
         let idle = |secs| tone(Presence::Idle, false, secs);
         assert_eq!(idle(Some(60)), Tone::IdleFresh);
-        assert_eq!(idle(Some(FRESH_SECS)), Tone::Idle);
+        assert_eq!(idle(Some(FRESH_SECS)), Tone::IdleFresh);
+        assert_eq!(idle(Some(FRESH_SECS + 1)), Tone::Idle);
         assert_eq!(idle(Some(STALE_SECS - 1)), Tone::Idle);
         assert_eq!(idle(Some(STALE_SECS)), Tone::IdleStale);
-        assert_eq!(idle(None), Tone::IdleStale);
+        assert_eq!(idle(None), Tone::Idle);
         assert_eq!(tone(Presence::Idle, true, Some(1)), Tone::Unknown);
         assert_eq!(tone(Presence::Working, true, None), Tone::Working);
         assert_eq!(tone(Presence::Blocked, false, None), Tone::Blocked);
@@ -199,64 +240,82 @@ mod tests {
 
     #[test]
     fn state_colours_match_radar() {
+        let palette = Palette::catppuccin();
         assert_eq!(
-            title_style(Tone::Working, Some("claude"), false),
+            title_style(Tone::Working, Some("claude"), Ground::Dark, &palette),
             (Color::Rgb(0xd9, 0x77, 0x57), true)
         );
         assert_eq!(
-            title_style(Tone::Working, Some("codex"), false),
+            title_style(Tone::Working, Some("codex"), Ground::Dark, &palette),
             (BRAND_OTHER, true)
         );
         assert_eq!(
-            title_style(Tone::Done, None, true),
+            title_style(Tone::Done, None, Ground::Light, &palette),
             (Color::Rgb(0x4c, 0x9a, 0x5a), false)
         );
         assert_eq!(
-            title_style(Tone::Blocked, None, false).0,
+            title_style(Tone::Blocked, None, Ground::Dark, &palette).0,
             Color::Rgb(0xc0, 0x4a, 0x4a)
         );
         assert_eq!(
-            title_style(Tone::Unknown, None, false).0,
+            title_style(Tone::Unknown, None, Ground::Dark, &palette).0,
             Color::Rgb(0x90, 0x7a, 0xa9)
         );
         assert_eq!(
-            title_style(Tone::IdleFresh, None, false).0,
+            title_style(Tone::IdleFresh, None, Ground::Dark, &palette).0,
             Color::Rgb(0x95, 0xbb, 0xa2)
         );
         assert_eq!(
-            title_style(Tone::IdleFresh, None, true).0,
+            title_style(Tone::IdleFresh, None, Ground::Light, &palette).0,
             Color::Rgb(0x41, 0x6c, 0x4f)
         );
         assert_eq!(
-            title_style(Tone::IdleStale, None, false).0,
+            title_style(Tone::IdleStale, None, Ground::Dark, &palette).0,
             Color::Rgb(0x8b, 0x8e, 0x9c)
         );
+        let terminal = Palette::terminal();
+        assert_eq!(
+            title_style(Tone::Idle, None, Ground::Palette, &terminal).0,
+            terminal.subtext0
+        );
+        assert_eq!(subtle(Ground::Palette, &terminal), terminal.subtext0);
         assert_eq!(lead(Tone::Idle), None);
         assert_eq!(lead(Tone::Done), Some("✓"));
     }
 
     #[test]
     fn logos_by_icon_setting() {
-        let neutral = Color::Gray;
+        let palette = Palette::catppuccin();
+        let neutral = ("•".to_owned(), palette.overlay0);
+        let logo = |vendor, icons| logo(vendor, icons, Ground::Dark, &palette);
         assert_eq!(
-            logo(Some("claude"), AgentIconsConfig::Radar, false, neutral),
+            logo(Some("claude"), AgentIconsConfig::Radar),
             Some(("\u{e1a0}".to_owned(), Color::Rgb(0xd9, 0x77, 0x57)))
         );
         assert_eq!(
-            logo(Some("codex"), AgentIconsConfig::Letter, false, neutral),
-            Some(("C".to_owned(), ink(false)))
+            logo(Some("codex"), AgentIconsConfig::Letter),
+            Some(("C".to_owned(), hex(0xe9e9f0)))
         );
         assert_eq!(
-            logo(Some("droid"), AgentIconsConfig::Radar, false, neutral),
-            Some(("•".to_owned(), neutral))
+            logo(Some("droid"), AgentIconsConfig::Radar),
+            Some(neutral.clone())
         );
         assert_eq!(
-            logo(None, AgentIconsConfig::Letter, false, neutral),
-            Some(("•".to_owned(), neutral))
+            logo(Some("droid"), AgentIconsConfig::Letter),
+            Some(neutral.clone())
         );
+        assert_eq!(logo(None, AgentIconsConfig::Letter), Some(neutral));
+        assert_eq!(logo(Some("claude"), AgentIconsConfig::None), None);
+        // Unknown background: hueless brands sign in the palette's text colour.
+        let terminal = Palette::terminal();
         assert_eq!(
-            logo(Some("claude"), AgentIconsConfig::None, false, neutral),
-            None
+            super::logo(
+                Some("codex"),
+                AgentIconsConfig::Letter,
+                Ground::Palette,
+                &terminal
+            ),
+            Some(("C".to_owned(), terminal.text))
         );
     }
 
@@ -270,11 +329,18 @@ mod tests {
     }
 
     #[test]
-    fn light_detection_uses_text_luminance() {
+    fn ground_from_palette_then_host_appearance() {
         let mut palette = Palette::catppuccin();
-        assert!(!is_light(&palette));
+        assert_eq!(ground(&palette, Some(HostAppearance::Light)), Ground::Dark);
         palette.text = Color::Rgb(0x34, 0x3b, 0x58);
-        assert!(is_light(&palette));
+        assert_eq!(ground(&palette, None), Ground::Light);
+        let terminal = Palette::terminal();
+        assert_eq!(
+            ground(&terminal, Some(HostAppearance::Light)),
+            Ground::Light
+        );
+        assert_eq!(ground(&terminal, Some(HostAppearance::Dark)), Ground::Dark);
+        assert_eq!(ground(&terminal, None), Ground::Palette);
     }
 
     #[test]
@@ -284,7 +350,7 @@ mod tests {
         assert_eq!(config.ui.sidebar.agent_icons, AgentIconsConfig::Letter);
         assert_eq!(
             crate::config::Config::default().ui.sidebar.agent_icons,
-            AgentIconsConfig::Radar
+            AgentIconsConfig::Letter
         );
     }
 }
