@@ -507,7 +507,7 @@ async fn run_client_loop(
     // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
     if let Some(shell) = state.shell.as_mut() {
-        shell.remote_doc_failures = Some(event_tx.clone());
+        shell.drovr_events = Some(event_tx.clone());
     }
     let (supervisor_tx, mut supervisor_rx) =
         tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
@@ -803,6 +803,17 @@ async fn run_client_loop(
 
         match event {
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
+            ClientLoopEvent::InboxReply { reply, result } => {
+                if let Some(shell) = state.shell.as_mut() {
+                    if shell.receive_inbox_reply(reply, result) {
+                        if let Some(frame) =
+                            shell.compose(state.reported_size.0, state.reported_size.1)
+                        {
+                            state.present_frame(frame);
+                        }
+                    }
+                }
+            }
             ClientLoopEvent::RemoteDocOpenFailed(message) => {
                 if let Some(shell) = state.shell.as_mut() {
                     if shell.push_remote_doc_failure(message) {

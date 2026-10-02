@@ -43,8 +43,29 @@ impl ClientShellState {
                     self.begin_worktree_action(action, outcome);
                     return;
                 }
+                // drovr fork: the inbox keeps focus only for its own keys and
+                // views that leave the panes alone.
+                if !matches!(
+                    action,
+                    crate::input::KeybindAction::ToggleInbox
+                        | crate::input::KeybindAction::InboxOldestWaiting
+                        | crate::input::KeybindAction::PeekDetails
+                        | crate::input::KeybindAction::Help
+                        | crate::input::KeybindAction::ToggleHiddenWorkspaces
+                ) && self.blur_inbox()
+                {
+                    outcome.repaint = true;
+                }
                 // drovr fork: sidebar project keys.
                 match action {
+                    crate::input::KeybindAction::ToggleInbox => {
+                        self.toggle_inbox(outcome);
+                        return;
+                    }
+                    crate::input::KeybindAction::InboxOldestWaiting => {
+                        self.inbox_oldest_waiting(outcome);
+                        return;
+                    }
                     crate::input::KeybindAction::NextAttentionAgent => {
                         self.focus_next_attention_agent(outcome);
                         return;

@@ -168,6 +168,42 @@ project to choose your own.
 - **Jump numbers only when you want them**: `prefix+#` shows a number on every
   row; type it and drovr jumps as soon as the number is unambiguous.
 
+### Inbox
+`prefix+i` opens the **inbox** on the right of the screen: one line per agent
+that needs you, on every machine, waiting ones first (permission, question,
+plan, dialog), then stuck, near the context limit, ended, denied and finished,
+oldest first within each kind. Each line shows the workspace, what the agent
+asks or said last, the project and machine, and the age. The panes get
+narrower while it is open; on a narrow screen it opens over them and Esc
+closes it.
+
+```
+ Inbox  2 waiting · 1 done     [Waiting] Done  All   ≡ group
+ ╭ ! fix-ctrl-click  git push origin fix/ctrl-click  drovr·local  4m
+ ╰   enter jump  space more  ↗
+   ◆ api-tests codex  dialog · Review PR 42              gtm·mato  2m
+```
+
+- `prefix+i` again focuses it, or closes it when it has focus. `prefix+a`
+  opens it on the oldest waiting item. Clicking a glyph or a section count in
+  the sidebar opens it filtered to that workspace or project; click the chip
+  to remove the filter.
+- Keys while it has focus: `j`/`k` move, `enter` jumps to the agent, `space`
+  shows the detail (and the agent's screen for a waiting item), `tab` cycles
+  Waiting, Done and All, `g` groups by project, `d` dismisses a done item,
+  `D` every done item in view, `z` snoozes 1 h (press again: 4 h, until
+  09:00 tomorrow), `m` mutes the workspace. Keys pressed within 250 ms of
+  the inbox taking focus are dropped, so a key meant for an agent cannot act
+  on an item.
+- Mouse: click selects, a second click shows the detail, the workspace name
+  or `↗` jumps, the `✕` on a hovered done line dismisses it, right-click
+  opens a menu, drag the left border to resize.
+- Dismiss and snooze are saved on the agent's machine (pane tokens), so every
+  drovr client shows the same inbox. A muted workspace hides its finished,
+  stuck and near-limit items and raises no finished toast; waiting items still
+  show.
+- Answering from the inbox comes next; for now, jump to the agent to answer.
+
 ### New workspaces on any machine
 - `prefix+alt+c` (or clicking **new** in the footer) asks which machine, then a
   name. The workspace joins the project you're in and starts in that project's
@@ -240,6 +276,8 @@ open the plans and reports they write for you with `drovr doc open`.
 |---|---|
 | `prefix+space` | peek: idle age, context, numbers, usage, latency |
 | `prefix+u` | next agent that needs you |
+| `prefix+i` | open, focus or close the inbox |
+| `prefix+a` | inbox on the oldest waiting item |
 | `prefix+#` | show jump numbers, type one to jump |
 | `prefix+alt+c` | new workspace on a machine you pick |
 | `prefix+.` | project menu for the focused workspace |
@@ -265,6 +303,14 @@ name = "storefront"
 pinned = true
 match = ["storefront"]                 # name or folder substring
 members = ["local/notes"]              # explicit members, in display order
+
+[inbox]
+width = 0.4                            # share of the screen, at least 48 columns
+stuck_minutes = 10                     # no hook event this long: stuck
+muted = ["gpu-box/scratch"]            # machine/workspace
+
+[inbox.stuck_minutes_by_workspace]
+"gpu-box/migrate-db" = 45
 ```
 
 The combined sidebar appears when the client is connected to 2+ machines. With

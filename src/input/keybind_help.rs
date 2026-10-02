@@ -120,6 +120,14 @@ pub(crate) fn keybind_help_groups(
                     "next agent that needs you",
                 ),
                 entry(
+                    binding_label(&keybinds.toggle_inbox),
+                    "inbox: open, focus, close",
+                ),
+                entry(
+                    binding_label(&keybinds.inbox_oldest_waiting),
+                    "inbox: oldest waiting item",
+                ),
+                entry(
                     binding_label(&keybinds.new_workspace_on),
                     "new workspace on a machine",
                 ),

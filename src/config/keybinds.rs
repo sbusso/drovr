@@ -365,6 +365,8 @@ pub struct Keybinds {
     pub peek_details: ActionKeybinds,
     pub new_workspace_on: ActionKeybinds,
     pub next_attention_agent: ActionKeybinds,
+    pub toggle_inbox: ActionKeybinds,
+    pub inbox_oldest_waiting: ActionKeybinds,
     pub jump_agent: ActionKeybinds,
     pub toggle_hidden_workspaces: ActionKeybinds,
     pub detach: ActionKeybinds,
@@ -554,6 +556,8 @@ impl Config {
             peek_details: empty_action!(),
             new_workspace_on: empty_action!(),
             next_attention_agent: empty_action!(),
+            toggle_inbox: empty_action!(),
+            inbox_oldest_waiting: empty_action!(),
             jump_agent: empty_action!(),
             toggle_hidden_workspaces: empty_action!(),
             detach: empty_action!(),
@@ -689,6 +693,8 @@ impl Config {
             apply_action!(keybinds.peek_details, peek_details, source);
             apply_action!(keybinds.new_workspace_on, new_workspace_on, source);
             apply_action!(keybinds.next_attention_agent, next_attention_agent, source);
+            apply_action!(keybinds.toggle_inbox, toggle_inbox, source);
+            apply_action!(keybinds.inbox_oldest_waiting, inbox_oldest_waiting, source);
             apply_action!(keybinds.jump_agent, jump_agent, source);
             apply_action!(
                 keybinds.toggle_hidden_workspaces,

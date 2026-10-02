@@ -21,6 +21,8 @@ pub(super) use endpoints::*;
 mod drovr_sidebar;
 mod global_menu;
 mod graphics;
+mod inbox;
+pub(super) use inbox::{run_request as run_inbox_request, InboxReply};
 mod input;
 mod input_source;
 mod link_hover;

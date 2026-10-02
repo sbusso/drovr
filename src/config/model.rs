@@ -365,6 +365,10 @@ pub struct KeysConfig {
     pub new_workspace_on: BindingConfig,
     /// next agent that needs you (drovr). Default: "prefix+u"
     pub next_attention_agent: BindingConfig,
+    /// open, focus or close the inbox panel (drovr). Default: "prefix+i"
+    pub toggle_inbox: BindingConfig,
+    /// inbox on the oldest waiting item (drovr). Default: "prefix+a"
+    pub inbox_oldest_waiting: BindingConfig,
     /// jump to agent by number (drovr fork). Default: "prefix+#"
     pub jump_agent: BindingConfig,
     /// show/conceal hidden workspaces (drovr fork). Default: "prefix+alt+h"
@@ -514,6 +518,10 @@ pub(crate) struct KeysConfigOverlay {
     new_workspace_on: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_attention_agent: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toggle_inbox: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inbox_oldest_waiting: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jump_agent: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -682,6 +690,8 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(peek_details);
         apply_field!(new_workspace_on);
         apply_field!(next_attention_agent);
+        apply_field!(toggle_inbox);
+        apply_field!(inbox_oldest_waiting);
         apply_field!(jump_agent);
         apply_field!(toggle_hidden_workspaces);
         apply_field!(navigate_workspace_up);
@@ -793,6 +803,8 @@ impl KeysConfig {
         copy_effective_action_field!(peek_details, keybinds.peek_details);
         copy_effective_action_field!(new_workspace_on, keybinds.new_workspace_on);
         copy_effective_action_field!(next_attention_agent, keybinds.next_attention_agent);
+        copy_effective_action_field!(toggle_inbox, keybinds.toggle_inbox);
+        copy_effective_action_field!(inbox_oldest_waiting, keybinds.inbox_oldest_waiting);
         copy_effective_action_field!(jump_agent, keybinds.jump_agent);
         copy_effective_action_field!(toggle_hidden_workspaces, keybinds.toggle_hidden_workspaces);
         copy_effective_action_field!(navigate_workspace_up, keybinds.navigate.workspace_up);
@@ -1171,6 +1183,8 @@ impl Default for KeysConfig {
             peek_details: BindingConfig::one("prefix+space"),
             new_workspace_on: BindingConfig::one("prefix+alt+c"),
             next_attention_agent: BindingConfig::one("prefix+u"),
+            toggle_inbox: BindingConfig::one("prefix+i"),
+            inbox_oldest_waiting: BindingConfig::one("prefix+a"),
             jump_agent: BindingConfig::one("prefix+#"),
             toggle_hidden_workspaces: BindingConfig::one("prefix+alt+h"),
             navigate_workspace_up: BindingConfig::one("up"),

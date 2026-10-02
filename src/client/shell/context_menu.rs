@@ -19,6 +19,7 @@ pub(super) fn items_for(target: &ClientContextMenuTarget) -> Vec<ClientContextMe
             | ClientContextMenuTarget::Project { .. }
             | ClientContextMenuTarget::NewWorkspacePicker { .. }
             | ClientContextMenuTarget::Documents { .. }
+            | ClientContextMenuTarget::InboxItem { .. }
             | ClientContextMenuTarget::Agent { .. } => {
                 super::project_actions::project_menu_items(target)
             }

@@ -117,9 +117,10 @@ a sidebar click shows as a removable chip.
 
 ## 5. Focus, keys and mouse
 
-- Focus is herdr's normal pane focus. `prefix i` and clicks move it in and out
-  of the inbox pane like any other pane; herdr's focus border shows which pane
-  has it.
+- The inbox has its own focus, apart from herdr's pane focus, which does not
+  move. `prefix i`, `prefix a` and a click in the panel give it focus, and its
+  left border turns the accent colour. A click in a pane, a jump, or Esc
+  (beside the panes) gives it back.
 - Keys go to the focused pane only. The inbox drops keys that arrive within
   250 ms of gaining focus (terminal focus-in event), so a digit aimed at an
   agent pane cannot answer an item.
@@ -167,7 +168,9 @@ The sidebar shows activity; the inbox shows waiting and done detail.
   raise no toast. Waiting items still show.
 - Dismiss and snooze marks live on the server as pane tokens from source
   `drovr-inbox`: `drovr_dis` = the `state_change_seq` dismissed (while Done it
-  equals the completion seq), `drovr_snz` = snooze end. Every client sees the
+  equals the completion seq), `drovr_snz` = `<end>|<seq>|<req8>`: the
+  snooze end, with the `state_change_seq` and request id it applies to, so
+  the item returns early on a new state or prompt. Every client sees the
   same inbox. Mutes are a client preference.
 - The stuck threshold is set per workspace in drovr's `sidebar.toml`, with a
   global default of 10 minutes. Keys are `<machine>/<workspace>`, as in
@@ -407,10 +410,36 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
    (transcripts name the model without the `[1m]` suffix). The `drovr_state`
    time is the agent machine's clock, compared with the client's, so clock
    skew between machines shifts elapsed time and stuck.
-4. **Inbox pane, read and jump**: `drovr inbox` process, `drovr_inbox` token,
-   toggle and reuse, flat order, filters, server marks, per-workspace stuck
-   threshold, focus-drop window. Tests: ordering, focus-drop window, narrow
-   layout.
+4. **Inbox pane, read and jump**: the client panel (section 3), toggle and
+   focus, flat order, filters, server marks, per-workspace stuck threshold,
+   focus-drop window. Tests: ordering, focus-drop window, narrow layout.
+
+   Built in `src/client/shell/inbox.rs`. The step's first wording (a
+   `drovr inbox` process and a `drovr_inbox` token to find and reuse its
+   pane) belonged to the herdr-pane placement and was dropped with it.
+   `inbox::agent_item` decides the item of an agent for both the sidebar
+   glyphs and the inbox: the workspace's stuck threshold, the sidebar's
+   "mark inactive", server marks and mutes. Items skip offline machines and
+   hidden workspaces, as the section count does. Marks and screen reads go to
+   the agent's machine through its herdr API (the local socket, or the SSH
+   API bridge from step 1), on a background thread; the client connection
+   only carries requests to the active machine. A mark hides its item at
+   once and for at most 15 s until the snapshot carries it; a failed mark
+   shows a notice and the item returns.
+
+   Choices the design left open: the age of a waiting item is the time the
+   client saw the agent's state change (`drovr-activity.json`), and of other
+   hook items the `drovr_state` time; an unknown age sorts as the oldest.
+   `j`/`k` or the arrows move, `g` toggles grouping, `?` lists the keys, and
+   Esc closes an overlaid panel, else removes the filter chip, else returns
+   focus. A snoozed item stays listed, dimmed, while it is selected, so `z`
+   can cycle it. A mute also stops finished-turn toasts for the workspace.
+   The expanded detail shows the token facts (diffstat, running tool, last
+   message) and, for waiting and dialog items, the last 30 lines of the
+   visible screen from `pane.read`; it does not cut the Bash command or the
+   diff out of the screen. Answer keys and the return of focus after an
+   answer (`prefix a`) land in step 5; a selected question lists its options
+   read-only. Ceiling: "tomorrow 09:00" ignores a DST change that night.
 5. **Answers**: hook decisions, label mapping, checks in section 9, editor,
    plan fetch. Tests: a fake endpoint where each check fails and nothing is
    sent; a stale decision file for a finished request is ignored.

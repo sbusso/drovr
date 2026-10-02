@@ -102,6 +102,15 @@ impl ClientShellState {
         event: SemanticNotification,
         now: std::time::Instant,
     ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        // drovr fork: a muted workspace raises no toast for a finished turn.
+        if event.kind == SemanticNotificationKind::Finished
+            && event.pane_id.as_deref().is_some_and(|pane_id| {
+                self.endpoint_by_id(endpoint_id)
+                    .is_some_and(|endpoint| super::inbox::toast_muted(endpoint, pane_id))
+            })
+        {
+            return (Vec::new(), false);
+        }
         let delay = if event.kind == SemanticNotificationKind::Custom {
             0
         } else {

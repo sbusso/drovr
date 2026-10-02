@@ -1021,6 +1021,10 @@ impl ClientShellState {
             self.focus_visible_notification(outcome);
             return;
         }
+        // drovr fork: the inbox panel, unless a menu or dialog is open.
+        if self.handle_inbox_mouse(mouse, outcome) {
+            return;
+        }
         if self.handle_mobile_mouse(mouse, outcome) {
             return;
         }

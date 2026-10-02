@@ -67,6 +67,10 @@ pub(super) struct ClientShellLayout {
     pub tab_bar: Rect,
     pub mobile_header: Rect,
     pub pane_surface: Rect,
+    /// drovr fork: the inbox panel (empty while closed).
+    pub inbox: Rect,
+    /// The inbox is drawn over the panes (narrow screen).
+    pub inbox_overlay: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +294,13 @@ pub(crate) enum ClientShellAction {
     },
     ReplayMouse(Vec<crossterm::event::MouseEvent>),
     Keybind(crate::input::KeybindAction),
+    /// drovr fork: an inbox request (a mark, a screen read) to a machine's
+    /// herdr API, run on a background thread.
+    InboxRequest {
+        route: super::inbox::ApiRoute,
+        request: Box<crate::api::schema::Request>,
+        reply: super::inbox::InboxReply,
+    },
 }
 
 #[derive(Default)]
@@ -604,6 +615,11 @@ pub(super) enum ClientContextMenuAction {
     Documents,
     /// Open recent document N of a `Documents` menu.
     OpenDocument(usize),
+    /// drovr fork: inbox row menu.
+    InboxDismiss,
+    InboxDismissDoneInProject,
+    InboxSnooze,
+    InboxMute,
 }
 
 #[derive(Debug)]
@@ -666,6 +682,12 @@ pub(super) enum ClientContextMenuTarget {
         workspace_id: String,
         pane_id: Option<String>,
         docs: Vec<crate::doc_view::open::RecentDoc>,
+    },
+    /// drovr: an inbox row.
+    InboxItem {
+        key: super::inbox::ItemKey,
+        waiting: bool,
+        muted: bool,
     },
 }
 
@@ -1062,10 +1084,13 @@ pub(crate) struct ClientShellState {
     pub(super) queued_notifications: VecDeque<ClientVisibleNotification>,
     pub(super) endpoint_notice_seen: HashSet<ClientEndpointNoticeKey>,
     pub(super) visible_endpoint_notice: Option<ClientVisibleEndpointNotice>,
-    /// drovr fork: where a remote doc open's thread reports a failure, so the
-    /// client loop shows it as a notice. `None` in tests and drops failures.
-    pub(in crate::client) remote_doc_failures:
+    /// drovr fork: where background threads (remote doc opens, inbox
+    /// requests) post their results to the client loop. `None` in tests,
+    /// which drops them.
+    pub(in crate::client) drovr_events:
         Option<tokio::sync::mpsc::Sender<crate::client::events::ClientLoopEvent>>,
+    /// drovr fork: the inbox panel.
+    pub(super) inbox: super::inbox::InboxState,
     pub(super) outer_focused: Option<bool>,
     pub(super) ascii_input_source_active: bool,
     pub(super) pending_input_source_changes: Vec<bool>,
@@ -1231,7 +1256,8 @@ impl ClientShellState {
             queued_notifications: VecDeque::new(),
             endpoint_notice_seen: HashSet::new(),
             visible_endpoint_notice: None,
-            remote_doc_failures: None,
+            drovr_events: None,
+            inbox: Default::default(),
             outer_focused: None,
             ascii_input_source_active: false,
             pending_input_source_changes: Vec::new(),
@@ -1341,6 +1367,7 @@ impl ClientShellState {
             self.sidebar_collapsed,
             self.focused_tab_count(),
             self.sidebar_width,
+            self.inbox.share(&super::projects::layout()),
         )
     }
 

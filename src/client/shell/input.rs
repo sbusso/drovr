@@ -584,6 +584,11 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return None;
                 }
+                // drovr fork: keys go to the inbox while it has focus.
+                if self.inbox.open && self.inbox.focused {
+                    self.handle_inbox_key(key, outcome);
+                    return None;
+                }
                 self.focused_pane_id().map(ClientInputTarget::Pane)
             }
             ClientShellMode::Prefix => {
@@ -1032,6 +1037,10 @@ impl ClientShellState {
     }
 
     fn push_focused_pane_event(&self, event: ClientPaneInputEvent, outcome: &mut ClientShellInput) {
+        // drovr fork: text and pastes never reach a pane behind the inbox.
+        if self.inbox.open && self.inbox.focused {
+            return;
+        }
         if let Some(pane_id) = self.focused_pane_id() {
             super::push_target_event(ClientInputTarget::Pane(pane_id), event, outcome);
         }

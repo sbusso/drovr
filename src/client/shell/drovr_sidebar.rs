@@ -258,7 +258,7 @@ fn location_only(title: &str, cwd: &str) -> bool {
 ///    ("Claude Code") or only the pane's folder;
 /// 3. the pane's label, its tab's custom name, or its folder's name;
 /// 4. the generic title (terminal title, else the agent's name or id).
-fn agent_title(
+pub(super) fn agent_title(
     agent: &crate::protocol::ClientShellAgent,
     pane: Option<&crate::protocol::ClientShellPane>,
     tab: Option<&crate::protocol::ClientShellTab>,
@@ -411,12 +411,8 @@ fn build_rows(
         let recent = idle.is_some_and(|secs| secs < layout.recent_secs());
         let unknown = row.agent.agent_status == crate::api::schema::AgentStatus::Unknown;
         let signal = AgentSignal::parse(row.agent);
-        let item = signal.item(
-            row.agent.agent_status,
-            now,
-            agent_signal::DEFAULT_STUCK_SECS,
-            layout.is_dismissed(&key, row.agent.state_change_seq),
-        );
+        // The same rules as the inbox: stuck threshold, marks, mutes.
+        let item = super::inbox::agent_item(layout, endpoint, row.agent, now);
         // Elapsed time and the stuck check move with the clock alone.
         if !stale && signal.ticking(row.agent.agent_status) {
             CLOCK.store(true, Ordering::Relaxed);

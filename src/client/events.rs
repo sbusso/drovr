@@ -35,4 +35,9 @@ pub(super) enum ClientLoopEvent {
     Timer,
     /// drovr fork: a remote Ctrl+click doc open failed; shown as a notice.
     RemoteDocOpenFailed(String),
+    /// drovr fork: an inbox request (mark, screen read) answered.
+    InboxReply {
+        reply: shell::InboxReply,
+        result: Result<serde_json::Value, String>,
+    },
 }

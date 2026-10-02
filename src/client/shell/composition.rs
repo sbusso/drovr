@@ -144,6 +144,25 @@ impl ClientShellState {
             &self.config.keybinds,
             &self.config.palette,
         );
+        // drovr fork: the inbox works while the active machine is down.
+        if layout.inbox.is_empty() {
+            self.inbox.clear_hits();
+        } else {
+            let main = (
+                layout.sidebar.right(),
+                cols.saturating_sub(layout.sidebar.right()),
+            );
+            super::inbox::render(
+                &mut self.inbox,
+                &self.endpoints,
+                &self.config.palette,
+                &mut buffer,
+                layout.inbox,
+                layout.inbox_overlay,
+                cols,
+                main,
+            );
+        }
         if let Some(notice) = &self.visible_endpoint_notice {
             self.hits.notification_toast = endpoint_notices::render_notice(
                 &mut buffer,
@@ -506,6 +525,43 @@ impl ClientShellState {
             }
         }
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
+        // drovr fork: the inbox panel, beside or over the panes.
+        if layout.inbox.is_empty() {
+            self.inbox.clear_hits();
+        } else {
+            let area = layout.inbox;
+            let main = (
+                layout.sidebar.right(),
+                cols.saturating_sub(layout.sidebar.right()),
+            );
+            let mut panel = Buffer::empty(Rect::new(0, 0, cols, rows));
+            super::inbox::render(
+                &mut self.inbox,
+                &self.endpoints,
+                &self.config.palette,
+                &mut panel,
+                area,
+                layout.inbox_overlay,
+                cols,
+                main,
+            );
+            let panel = FrameData::from_ratatui_buffer_with_hyperlinks(&panel, None, &[]);
+            for y in area.y..area.bottom() {
+                let start = usize::from(y) * usize::from(frame.width) + usize::from(area.x);
+                let end = start + usize::from(area.width);
+                if end <= frame.cells.len() && end <= panel.cells.len() {
+                    frame.cells[start..end].clone_from_slice(&panel.cells[start..end]);
+                }
+            }
+            occlusion.cover(area);
+            let cursor_under = frame
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| super::contains(area, (cursor.x, cursor.y)));
+            if self.inbox.focused || cursor_under {
+                frame.cursor = None;
+            }
+        }
         self.hits.notification_toast = Rect::default();
         let has_config_diagnostic = self.config_diagnostic.is_some();
         let active_lifecycle = self

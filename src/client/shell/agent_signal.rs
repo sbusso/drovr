@@ -7,8 +7,9 @@
 use crate::api::schema::AgentStatus;
 use crate::protocol::ClientShellAgent;
 
-/// Default for the stuck threshold. Build step 4 adds the per-workspace
-/// setting (`[inbox] stuck_minutes` in `sidebar.toml`).
+/// Default for the stuck threshold; `[inbox] stuck_minutes` in
+/// `sidebar.toml` and its per-workspace table override it (see `inbox.rs`).
+#[cfg(test)]
 pub(super) const DEFAULT_STUCK_SECS: u64 = 10 * 60;
 
 /// Share of the model's context window at which an agent shows as `limit`.
@@ -191,6 +192,14 @@ impl AgentSignal {
     /// with the clock alone.
     pub(super) fn ticking(&self, status: AgentStatus) -> bool {
         status == AgentStatus::Working && matches!(self.state, Some((StateKind::Working, _)))
+    }
+
+    /// Unix time the current `drovr_state` began, or of the last hook event
+    /// when that is later: the start of a stuck, asks, finished, limit,
+    /// denied or exited item.
+    pub(super) fn since(&self) -> Option<u64> {
+        let (_, at) = self.state?;
+        Some(at.max(self.beat.unwrap_or(0)))
     }
 
     /// Seconds since the running tool started, while the hook says working.

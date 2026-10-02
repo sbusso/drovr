@@ -236,6 +236,26 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             }
             items
         }
+        ClientContextMenuTarget::InboxItem { waiting, muted, .. } => {
+            let mut items = vec![item("Jump", Action::AgentFocus)];
+            if !waiting {
+                items.push(item("Dismiss", Action::InboxDismiss));
+            }
+            items.push(item(
+                "Dismiss all done in project",
+                Action::InboxDismissDoneInProject,
+            ));
+            items.push(item("Snooze 1 h", Action::InboxSnooze));
+            items.push(item(
+                if *muted {
+                    "Unmute workspace"
+                } else {
+                    "Mute workspace"
+                },
+                Action::InboxMute,
+            ));
+            items
+        }
         _ => Vec::new(),
     }
 }
@@ -261,7 +281,10 @@ pub(super) fn split_project_menu(
 }
 
 impl ClientShellState {
-    fn endpoint_by_id(&self, endpoint_id: &ClientEndpointId) -> Option<&ClientShellEndpoint> {
+    pub(super) fn endpoint_by_id(
+        &self,
+        endpoint_id: &ClientEndpointId,
+    ) -> Option<&ClientShellEndpoint> {
         self.endpoints
             .iter()
             .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
@@ -602,18 +625,15 @@ impl ClientShellState {
         true
     }
 
-    /// Opens the inbox pane filtered to `filter` (a sidebar glyph or section
-    /// count was clicked); false leaves the click to the row or header
-    /// below. Stub: the inbox pane lands in build step 4 of
-    /// docs/design/inbox-pane.md; until then the click keeps its old effect
-    /// (focus the row, toggle the header).
+    /// Opens the inbox panel filtered to `filter` (a sidebar glyph or
+    /// section count was clicked).
     pub(super) fn open_inbox(
         &mut self,
         filter: super::agent_signal::InboxFilter,
-        _outcome: &mut ClientShellInput,
+        outcome: &mut ClientShellInput,
     ) -> bool {
-        tracing::debug!(?filter, "inbox pane not built yet");
-        false
+        self.open_inbox_filtered(filter, outcome);
+        true
     }
 
     /// prefix+u: focus the next agent (in sidebar order) that is blocked,
@@ -848,6 +868,9 @@ impl ClientShellState {
                 }
                 _ => {}
             },
+            ClientContextMenuTarget::InboxItem { key, .. } => {
+                self.activate_inbox_menu(key, action, outcome);
+            }
             _ => {}
         }
         outcome.repaint = true;

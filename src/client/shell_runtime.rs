@@ -55,7 +55,7 @@ pub(super) fn dispatch_client_shell_actions(
             shell::ClientShellAction::OpenRemoteDocument { bridge, doc } => {
                 let failures = shell
                     .as_deref()
-                    .and_then(|shell| shell.remote_doc_failures.clone());
+                    .and_then(|shell| shell.drovr_events.clone());
                 std::thread::spawn(move || {
                     if let Err(err) = bridge.open_document(&doc) {
                         warn!(err = %err, path = %doc.path, "remote doc open failed");
@@ -66,6 +66,16 @@ pub(super) fn dispatch_client_shell_actions(
                         }
                     }
                 });
+            }
+            shell::ClientShellAction::InboxRequest {
+                route,
+                request,
+                reply,
+            } => {
+                let events = shell
+                    .as_deref()
+                    .and_then(|shell| shell.drovr_events.clone());
+                shell::run_inbox_request(route, request, reply, events);
             }
             shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
             shell::ClientShellAction::Keybind(action) => {

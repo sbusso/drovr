@@ -15,6 +15,12 @@
 //! pinned = true
 //! members = ["gpu-box/Storefront", "local/Storefront"]   # machine/workspace label
 //! match = ["storefront"]                                 # auto-assign by label substring
+//!
+//! [inbox]                      # the inbox panel (inbox.rs)
+//! width = 0.4                  # share of the screen
+//! stuck_minutes = 10
+//! [inbox.stuck_minutes_by_workspace]
+//! "mato/migrate-db" = 45
 //! ```
 //!
 //! Kept in its own module behind a process-wide lock so the upstream render and
@@ -117,6 +123,12 @@ pub(super) struct ProjectLayout {
     /// Workspaces dragged to "Other": never auto-matched into a project.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) ungrouped: Vec<String>,
+    /// The inbox panel: width, stuck threshold, mutes (`inbox.rs`).
+    #[serde(
+        default,
+        skip_serializing_if = "super::inbox::InboxSettings::is_default"
+    )]
+    pub(super) inbox: super::inbox::InboxSettings,
     #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
     pub(super) groups: Vec<ProjectGroup>,
 }
