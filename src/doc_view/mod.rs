@@ -3,6 +3,7 @@
 
 pub mod open;
 mod render;
+pub(crate) use render::percent_decode;
 
 use std::io;
 use std::path::{Path, PathBuf};

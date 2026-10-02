@@ -267,6 +267,13 @@ pub(crate) enum ClientShellAction {
     },
     ClipboardWrite(Vec<u8>),
     OpenSafeWebUrl(String),
+    /// drovr fork: run `drovr doc open --focus <path>` against the local
+    /// server for a pane of `workspace_id`.
+    OpenLocalDocument {
+        workspace_id: String,
+        pane_id: String,
+        path: String,
+    },
     ActivateEndpoint {
         endpoint_id: ClientEndpointId,
         target: Option<ClientEndpointFocusTarget>,

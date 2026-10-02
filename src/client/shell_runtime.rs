@@ -47,6 +47,11 @@ pub(super) fn dispatch_client_shell_actions(
                     }
                 }
             }
+            shell::ClientShellAction::OpenLocalDocument {
+                workspace_id,
+                pane_id,
+                path,
+            } => shell::open_local_document(workspace_id, Some(pane_id), path.into()),
             shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
             shell::ClientShellAction::Keybind(action) => {
                 debug!(

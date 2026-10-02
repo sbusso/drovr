@@ -60,7 +60,11 @@ fn documents_target(
 
 /// Runs `drovr doc open` against this machine's server for a workspace (and
 /// the agent pane the menu was opened on), in the background.
-fn open_local_document(workspace_id: String, pane_id: Option<String>, path: std::path::PathBuf) {
+pub(crate) fn open_local_document(
+    workspace_id: String,
+    pane_id: Option<String>,
+    path: std::path::PathBuf,
+) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };

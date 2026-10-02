@@ -961,6 +961,12 @@ impl ClientShellState {
             {
                 let viewport_row = mouse.row.saturating_sub(hit.inner_rect.y);
                 let col = mouse.column.saturating_sub(hit.inner_rect.x);
+                // drovr fork: a plain-text Markdown path opens in the doc pane.
+                if self.open_md_path_click(&hit.pane_id, viewport_row, col, outcome) {
+                    self.last_pane_click = None;
+                    self.url_click_consumes_until_up = true;
+                    return;
+                }
                 let content_revision = self
                     .pane_surface
                     .as_ref()

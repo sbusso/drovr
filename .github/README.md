@@ -162,10 +162,16 @@ Three ways to open a document:
   The first call splits a pane to the right of the caller (45% of its width)
   without taking focus; later calls switch that pane. Add `--focus` to move
   to it. `drovr doc open --recent` reopens the workspace's newest document.
-- **Ctrl+click a Markdown link** in a pane, with the `drovr-docs` plugin
-  installed (see below). Plain text is clickable only for `http(s)` URLs, so
-  bare paths and `file://` links work when the program prints them as
-  hyperlinks.
+- **Ctrl+click a Markdown path** in any pane: `docs/plan.md`,
+  `./notes/x.md`, `~/Code/drovr/README.md`, `/abs/report.markdown` or
+  `file:///abs/x.md`, as plain text or as a hyperlink. Holding Ctrl over one
+  underlines it. Quotes, backticks, brackets, trailing punctuation, a `:line`
+  suffix and a `#anchor` are ignored; relative paths are taken from the
+  pane's current directory. The doc pane opens next to the clicked pane and
+  takes focus. On this machine drovr runs `drovr doc open` itself; on a
+  remote machine it runs the `drovr-docs` plugin's action there, so the
+  plugin must be installed on that machine (see below). A path that wraps
+  onto the next row is not detected.
 - **Right-click a workspace or an agent** in the sidebar → **Documents…**
   lists the workspace's last 10 documents. The item shows for workspaces on
   this machine that have opened documents.
@@ -181,8 +187,10 @@ herdr plugin install sbusso/drovr/plugins/drovr-docs --ref drovr-main
 mkdir -p ~/.claude/skills && cp -R skills/drovr-docs ~/.claude/skills/   # from a drovr checkout
 ```
 
-The plugin adds the Ctrl+click handler and an **Open document…** workspace
-action (the newest recent document). The skill tells agents to open the plans
+The plugin opens Markdown paths Ctrl+clicked in panes on its machine
+(plain-text paths on remote machines, and `file://` or path hyperlinks
+everywhere) and adds an **Open document…** workspace action (the newest
+recent document). The skill tells agents to open the plans
 and reports they write for you with `drovr doc open`.
 
 ### Small fixes

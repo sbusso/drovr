@@ -54,6 +54,9 @@ def main():
         if not os.path.isfile(path):
             sys.exit(f"drovr-docs: not a file: {path}")
         args = [path]
+        # The drovr client's Ctrl+click on a plain-text path moves to the doc.
+        if context.get("invocation_source") == "drovr_click":
+            args.append("--focus")
     sys.exit(subprocess.call([drovr, "doc", "open", *args]))
 
 

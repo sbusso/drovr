@@ -128,7 +128,17 @@ impl ClientShellState {
             return;
         }
         outcome.repaint |= self.clear_link_hover();
-        let explicit = self.explicit_link_regions(&target);
+        let explicit = self.explicit_link_regions(&target).or_else(|| {
+            // drovr fork: plain-text Markdown paths are links for Ctrl+click.
+            self.md_path_in_pane(target.source_rect, target.row, target.col)
+                .map(|hit| {
+                    vec![PaneLinkRegion {
+                        row: target.row,
+                        start_col: hit.start_col,
+                        end_col: hit.end_col,
+                    }]
+                })
+        });
         let resolved = explicit.is_some();
         let regions = explicit.unwrap_or_default();
         outcome.repaint |= !regions.is_empty();
