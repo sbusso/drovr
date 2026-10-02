@@ -10,6 +10,7 @@
 mod radar;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::projects::{self, Presence, ProjectLayout, OTHER};
 use super::render::{display_width, put_right_text, put_text, ShellRenderState};
@@ -957,6 +958,16 @@ fn render_row(
     }
 }
 
+/// Set when a structured render draws a working agent (its spinner).
+static SPINNING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last render drew a spinner, clearing the mark. The client's
+/// 100 ms timer repaints while this holds; the repaint sets it again for as
+/// long as an agent works, so nothing repaints once none does.
+pub(super) fn take_spinning() -> bool {
+    SPINNING.swap(false, Ordering::Relaxed)
+}
+
 /// Structured rows start one column right of the project header's "▾".
 const STRUCTURED_INDENT: u16 = 2;
 
@@ -1016,8 +1027,14 @@ fn render_structured_row(
             if bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
+            if *tone == radar::Tone::Working {
+                SPINNING.store(true, Ordering::Relaxed);
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis());
             let text = [
-                radar::lead(*tone),
+                radar::lead(*tone, now_ms),
                 kept.then_some("⚑"),
                 Some(title.as_str()),
             ]
@@ -1636,6 +1653,40 @@ mod tests {
         assert_eq!(hits.drovr_rows.len(), 8);
         assert_eq!(hits.endpoint_agents.len(), 4);
     }
+    #[test]
+    fn redraw_is_requested_only_while_an_agent_works() {
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let layout = structured_layout();
+        let draw = |endpoints: &[ClientShellEndpoint]| {
+            let area = Rect::new(0, 0, 34, 1);
+            for row in build_rows(endpoints, &ClientEndpointId::Local, &layout)
+                .iter()
+                .filter(|row| matches!(row, Row::Agent { .. }))
+            {
+                render_row(
+                    &mut Buffer::empty(area),
+                    area,
+                    row,
+                    &layout,
+                    endpoints,
+                    &config,
+                    radar::Ground::Dark,
+                    None,
+                    &mut ShellHitMap::default(),
+                );
+            }
+            take_spinning()
+        };
+        let mut endpoints = fixture();
+        assert!(!draw(&endpoints));
+        if let Some(snapshot) = endpoints[0].snapshot.as_deref_mut() {
+            snapshot.agents[1].agent_status = AgentStatus::Working;
+        }
+        assert!(draw(&endpoints));
+        // Taken once per tick: no new render, no new request.
+        assert!(!take_spinning());
+    }
+
     #[test]
     fn structured_header_caps_the_machine_tag_on_narrow_sidebars() {
         let mut endpoints = fixture();

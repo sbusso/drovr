@@ -486,13 +486,13 @@ pub struct SidebarConfig {
 
 /// drovr fork: how the structured sidebar view marks an agent's vendor.
 /// `letter` uses the vendor's first letter, `radar` the herdr-radar icon font
-/// codepoints (the font must be installed), `none` no mark. Default: letter,
-/// since drovr does not ship the font.
+/// codepoints (the font must be installed), `none` no mark. Default: radar;
+/// drovr does not ship the font, so without it set `letter`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentIconsConfig {
-    Radar,
     #[default]
+    Radar,
     Letter,
     None,
 }

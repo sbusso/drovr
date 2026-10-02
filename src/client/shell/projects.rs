@@ -689,8 +689,8 @@ pub(super) fn observe_activity(endpoint: &ClientShellEndpoint) {
     let primed = store.primed.contains(&machine);
     for workspace in &snapshot.workspaces {
         let key = format!("{machine}/ws:{}", workspace.workspace_id);
-        if !store.agents.contains_key(&key) {
-            store.agents.insert(key, (0, if primed { now } else { 0 }));
+        if let std::collections::hash_map::Entry::Vacant(entry) = store.agents.entry(key) {
+            entry.insert((0, if primed { now } else { 0 }));
             store.dirty = true;
         }
     }

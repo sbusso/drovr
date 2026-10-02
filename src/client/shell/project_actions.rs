@@ -163,6 +163,7 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
 
 /// A merged workspace menu whose picked index falls inside the stock part:
 /// hand back the stock menu so the upstream activation code runs unchanged.
+#[allow(clippy::result_large_err)] // both arms are the same menu, moved not copied
 pub(super) fn split_project_menu(
     menu: ClientContextMenuOverlay,
     index: usize,
@@ -1028,6 +1029,8 @@ impl ClientShellState {
             outcome.repaint = true;
         }
         outcome.repaint |= projects::expire_peek();
+        // Advance the structured view's spinner while an agent works.
+        outcome.repaint |= super::drovr_sidebar::take_spinning();
     }
 
     /// Once the workspace created above shows up, type the agent command into

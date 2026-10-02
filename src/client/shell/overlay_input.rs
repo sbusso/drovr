@@ -956,7 +956,7 @@ impl ClientShellState {
             return;
         };
         let trimmed = rename.input.trim();
-        let Some(target) = self.save_project_prompt(rename.target, &trimmed, outcome) else {
+        let Some(target) = self.save_project_prompt(rename.target, trimmed, outcome) else {
             return;
         };
         let method = match target {

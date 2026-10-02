@@ -2,10 +2,11 @@
 //!
 //! Values come from the herdr-radar plugin (MIT, Copyright (c) 2025 qintmb,
 //! Copyright (c) 2026 herdr-kit contributors): icon font codepoints from
-//! `lib/logos.js`, brand and state colours from `lib/palette.js`, state marks
-//! and idle thresholds from `lib/config.js`. The icon font itself is not
-//! bundled, so the default mark is the vendor's letter; `[ui.sidebar]
-//! agent_icons = "radar"` needs the font installed.
+//! `lib/logos.js`, brand and state colours from `lib/palette.js`, state marks,
+//! spinner frames and idle thresholds from `lib/config.js`, spinner cadence
+//! from `lib/frame.js`. The icon font itself is not bundled: the default
+//! `[ui.sidebar] agent_icons = "radar"` needs it installed, `"letter"` draws
+//! the vendor's initial instead.
 
 use ratatui::style::Color;
 
@@ -53,12 +54,22 @@ pub(super) fn tone(presence: Presence, unknown: bool, idle_secs: Option<u64>) ->
     }
 }
 
+/// Radar's spinner frames (`lib/config.js` `FRAMES`).
+const FRAMES: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
+/// How long each spinner frame shows (radar's `SPIN_MS`, `lib/frame.js`).
+const SPIN_MS: u128 = 150;
+
+/// The spinner frame for wall-clock time `now_ms` (ms since the Unix epoch),
+/// so every redraw within the same 150 ms step draws the same frame.
+pub(super) fn spin_frame(now_ms: u128) -> &'static str {
+    FRAMES[(now_ms / SPIN_MS % FRAMES.len() as u128) as usize]
+}
+
 /// The mark in front of the title. Idle tiers have none: their colour says it.
-/// Working uses radar's static mark because the client only redraws on
-/// change; the spinner frames would freeze mid-turn.
-pub(super) fn lead(tone: Tone) -> Option<&'static str> {
+/// Working spins; `now_ms` picks the frame (see `spin_frame`).
+pub(super) fn lead(tone: Tone, now_ms: u128) -> Option<&'static str> {
     match tone {
-        Tone::Working => Some("○"),
+        Tone::Working => Some(spin_frame(now_ms)),
         Tone::Done => Some("✓"),
         Tone::Blocked => Some("?"),
         Tone::Unknown => Some("◌"),
@@ -279,8 +290,18 @@ mod tests {
             terminal.subtext0
         );
         assert_eq!(subtle(Ground::Palette, &terminal), terminal.subtext0);
-        assert_eq!(lead(Tone::Idle), None);
-        assert_eq!(lead(Tone::Done), Some("✓"));
+        assert_eq!(lead(Tone::Idle, 0), None);
+        assert_eq!(lead(Tone::Done, 0), Some("✓"));
+    }
+
+    #[test]
+    fn spinner_frame_follows_wall_clock_at_radar_cadence() {
+        assert_eq!(spin_frame(0), "⣷");
+        assert_eq!(spin_frame(149), "⣷");
+        assert_eq!(spin_frame(150), "⣯");
+        assert_eq!(spin_frame(7 * 150), "⣾");
+        assert_eq!(spin_frame(8 * 150), "⣷");
+        assert_eq!(lead(Tone::Working, 300), Some("⣟"));
     }
 
     #[test]
@@ -350,7 +371,7 @@ mod tests {
         assert_eq!(config.ui.sidebar.agent_icons, AgentIconsConfig::Letter);
         assert_eq!(
             crate::config::Config::default().ui.sidebar.agent_icons,
-            AgentIconsConfig::Letter
+            AgentIconsConfig::Radar
         );
     }
 }

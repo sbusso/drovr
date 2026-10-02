@@ -42,10 +42,11 @@ agents from **every** machine, then **Other** for everything not in a project.
 Clicking the view label cycles *detailed*, *compact* (one line per workspace)
 and *structured*: workspace headers (remote machine on the right) with one line
 per agent, a vendor mark and a title coloured by state (working in the vendor's
-colour, done green, blocked red, idle fading over 15 minutes and 2 hours). The
-mark is the vendor's first letter; with the
-[herdr-radar](https://github.com/hhdebb/herdr-radar) icon font installed, set
-`agent_icons = "radar"` (or `"none"` for no mark) under `[ui.sidebar]` in
+colour behind radar's spinner, done green, blocked red, idle fading over 15
+minutes and 2 hours). The mark is the vendor's logo from the
+[herdr-radar](https://github.com/hhdebb/herdr-radar) icon font, in its brand
+colour; the font must be installed. Without it, set `agent_icons = "letter"`
+(the vendor's first letter) or `"none"` (no mark) under `[ui.sidebar]` in
 herdr's `config.toml`.
 
 The sidebar stays quiet: status and topic only. **Peek** (`prefix+space`)
