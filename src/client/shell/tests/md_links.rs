@@ -73,7 +73,7 @@ fn ctrl_click_beside_a_markdown_path_goes_to_the_server_unchanged() {
 }
 
 #[test]
-fn ctrl_click_on_a_remote_pane_invokes_the_docs_plugin_there() {
+fn ctrl_click_on_a_remote_pane_opens_the_doc_through_the_endpoint_bridge() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     let profile = SavedSshEndpoint {
         id: crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef")
@@ -84,7 +84,7 @@ fn ctrl_click_on_a_remote_pane_invokes_the_docs_plugin_there() {
         enabled: true,
     };
     let remote = ClientEndpointId::Ssh(profile.id.clone());
-    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_catalog(std::slice::from_ref(&profile));
     state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
     state.set_endpoint_snapshot(&remote, Box::new(snapshot()));
     assert!(state.activate_endpoint_projection(&remote));
@@ -92,28 +92,40 @@ fn ctrl_click_on_a_remote_pane_invokes_the_docs_plugin_there() {
     state.compose(106, 20).expect("pane frame");
     let down = mouse(&state, MouseEventKind::Down(MouseButton::Left), "docs");
     let click = state.handle_raw_events(vec![RawInputEvent::Mouse(down)]);
-    let [ClientShellAction::Endpoint {
-        endpoint_id,
-        request,
-        ..
-    }] = &click.actions[..]
-    else {
-        panic!(
-            "expected a plugin action request, got {:?}",
-            click.actions.len()
-        );
+    let [ClientShellAction::OpenRemoteDocument { bridge, doc }] = &click.actions[..] else {
+        panic!("expected a bridged doc open, got {:?}", click.actions);
     };
-    assert_eq!(endpoint_id, &remote);
-    let Method::PluginActionInvoke(params) = &request.method else {
-        panic!("expected plugin.action.invoke");
+    assert_eq!(bridge.profile(), &profile);
+    assert_eq!(
+        doc,
+        &crate::remote::RemoteDocOpen {
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            pane_id: "pane_1".into(),
+            cwd: Some("/repo".into()),
+            path: "/repo/docs/a.md".into(),
+        }
+    );
+    assert!(click.requests.is_empty() && state.pending_requests.is_empty());
+
+    // A catalog refresh keeps the bridge while the target and session stay.
+    let kept = bridge.clone();
+    state.set_endpoint_catalog(std::slice::from_ref(&profile));
+    let current = |state: &ClientShellState| {
+        state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == remote)
+            .and_then(|endpoint| endpoint.bridge.clone())
+            .expect("bridge")
     };
-    assert_eq!(params.plugin_id.as_deref(), Some("drovr.docs"));
-    assert_eq!(params.action_id, "open-link");
-    let context = params.context.as_ref().expect("context");
-    assert_eq!(context.clicked_url.as_deref(), Some("/repo/docs/a.md"));
-    assert_eq!(context.focused_pane_id.as_deref(), Some("pane_1"));
-    assert_eq!(context.workspace_id.as_deref(), Some("ws_1"));
-    assert_eq!(context.invocation_source.as_deref(), Some("drovr_click"));
+    assert!(std::sync::Arc::ptr_eq(&kept, &current(&state)));
+    let moved = SavedSshEndpoint {
+        target: "dev@other.example".into(),
+        ..profile
+    };
+    state.set_endpoint_catalog(&[moved]);
+    assert!(!std::sync::Arc::ptr_eq(&kept, &current(&state)));
 }
 
 #[test]

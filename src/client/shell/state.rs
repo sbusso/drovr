@@ -274,6 +274,12 @@ pub(crate) enum ClientShellAction {
         pane_id: String,
         path: String,
     },
+    /// drovr fork: open a Markdown path in the doc pane of a remote
+    /// endpoint's workspace through that endpoint's bridge.
+    OpenRemoteDocument {
+        bridge: std::sync::Arc<crate::remote::EndpointBridge>,
+        doc: crate::remote::RemoteDocOpen,
+    },
     ActivateEndpoint {
         endpoint_id: ClientEndpointId,
         target: Option<ClientEndpointFocusTarget>,

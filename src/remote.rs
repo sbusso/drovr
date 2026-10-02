@@ -1,5 +1,6 @@
 mod args;
 mod attach;
+mod endpoint_bridge;
 mod host;
 mod process;
 mod restart_policy;
@@ -9,6 +10,7 @@ mod ssh_agent;
 
 pub(crate) use args::*;
 pub(crate) use attach::*;
+pub(crate) use endpoint_bridge::{EndpointBridge, RemoteDocOpen};
 pub(crate) use host::run_remote_client_bridge;
 pub(crate) use saved::*;
 

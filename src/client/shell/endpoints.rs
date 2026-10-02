@@ -22,6 +22,9 @@ pub(crate) struct ClientShellEndpoint {
     pending_agent_view_projection: Option<ClientEndpointAgentViewProjection>,
     pub(crate) agent_view_projection_supported: bool,
     pub(crate) methods: Option<HashSet<String>>,
+    /// drovr fork: SSH bridge to a remote endpoint's machine; kept across
+    /// catalog updates while the profile's target and session stay the same.
+    pub(crate) bridge: Option<std::sync::Arc<crate::remote::EndpointBridge>>,
 }
 
 pub(super) struct MachineHit {
@@ -62,6 +65,18 @@ impl ClientShellState {
                 .filter(|endpoint| {
                     profile.enabled && endpoint.status != ClientEndpointStatus::Disabled
                 });
+            let bridge = self
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.endpoint_id == endpoint_id)
+                .filter_map(|endpoint| endpoint.bridge.clone())
+                .find(|bridge| {
+                    let old = bridge.profile();
+                    old.target == profile.target && old.session == profile.session
+                })
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(crate::remote::EndpointBridge::new(profile))
+                });
             next.push(ClientShellEndpoint {
                 endpoint_id,
                 label: profile.label.clone(),
@@ -88,6 +103,7 @@ impl ClientShellState {
                 agent_view_projection_supported: previous
                     .is_some_and(|endpoint| endpoint.agent_view_projection_supported),
                 methods: previous.and_then(|endpoint| endpoint.methods.clone()),
+                bridge: Some(bridge),
             });
         }
 
@@ -744,5 +760,6 @@ pub(super) fn local_endpoint() -> ClientShellEndpoint {
         pending_agent_view_projection: None,
         agent_view_projection_supported: false,
         methods: None,
+        bridge: None,
     }
 }

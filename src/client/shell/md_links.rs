@@ -2,11 +2,10 @@
 //! the workspace's doc pane. Stock herdr detects only http(s) URLs in plain
 //! text, so the client finds the path in the cells it already draws and runs
 //! `drovr doc open` on the pane's machine: directly for the local server, and
-//! through the `drovr.docs` plugin's `open-link` action (stock
-//! `plugin.action.invoke`) for a remote one.
+//! through the endpoint's SSH bridge for a remote one (`crate::remote::
+//! EndpointBridge`, which falls back to the `drovr.docs` plugin there).
 
 use super::*;
-use crate::api::schema::{Method, PluginActionInvokeParams, PluginInvocationContext};
 use crate::protocol::SurfaceRect;
 
 /// A Markdown path under the pointer: the path as printed (`~`, relative or
@@ -195,12 +194,6 @@ pub(super) fn find_local_md_path(path: &str, dirs: &[&str], scan_dir: &str) -> L
     }
 }
 
-/// Plugin and action that run `drovr doc open` on a remote machine.
-const DOCS_PLUGIN_ID: &str = "drovr.docs";
-const DOCS_PLUGIN_ACTION: &str = "open-link";
-/// `invocation_source` that asks the plugin to focus the doc pane.
-pub(super) const DOCS_INVOCATION_SOURCE: &str = "drovr_click";
-
 impl ClientShellState {
     /// The Markdown path at (`col`, `row`) of a pane whose content sits at
     /// `rect` in the pane surface. Cells with an OSC 8 hyperlink are left to
@@ -299,30 +292,24 @@ impl ClientShellState {
             });
             return true;
         }
-        self.push_endpoint_method(
-            Method::PluginActionInvoke(PluginActionInvokeParams {
-                action_id: DOCS_PLUGIN_ACTION.into(),
-                plugin_id: Some(DOCS_PLUGIN_ID.into()),
-                context: Some(PluginInvocationContext {
-                    workspace_id: Some(workspace_id),
-                    workspace_label: None,
-                    workspace_cwd: None,
-                    worktree: None,
-                    tab_id: Some(pane.tab_id.clone()),
-                    tab_label: None,
-                    focused_pane_id: Some(pane_id.to_owned()),
-                    focused_pane_cwd: cwd,
-                    focused_pane_agent: None,
-                    focused_pane_status: None,
-                    selected_text: None,
-                    invocation_source: Some(DOCS_INVOCATION_SOURCE.into()),
-                    correlation_id: None,
-                    clicked_url: Some(path),
-                    link_handler_id: None,
-                }),
-            }),
-            outcome,
-        );
+        let Some(bridge) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == self.active_endpoint_id)
+            .and_then(|endpoint| endpoint.bridge.clone())
+        else {
+            return false;
+        };
+        outcome.actions.push(ClientShellAction::OpenRemoteDocument {
+            bridge,
+            doc: crate::remote::RemoteDocOpen {
+                workspace_id,
+                tab_id: pane.tab_id.clone(),
+                pane_id: pane_id.to_owned(),
+                cwd,
+                path,
+            },
+        });
         true
     }
 }

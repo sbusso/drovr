@@ -327,6 +327,19 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
 1. **SSH API bridge** per remote endpoint; route remote Ctrl+click doc opens
    and plan reads through it. Test: the remote Ctrl+click test fails today,
    then passes.
+
+   Built as `crate::remote::EndpointBridge`, one per saved SSH endpoint,
+   held by the client and started on first use. The herdr API has no file
+   access, so the bridge has two channels: herdr API calls through
+   `herdr remote-api-bridge`, and POSIX shell scripts over the endpoint's
+   managed SSH transport. Reading the plan file (`p`) and writing decision
+   files (section 9) use the shell channel; they land with their callers in
+   step 5. A remote Ctrl+click runs `drovr doc open` on the remote machine
+   through the shell channel. The doc pane there still needs the drovr
+   binary on that machine, because the viewer runs in a pane of that
+   server. When the SSH shell does not find drovr on its PATH or in
+   `~/.local/bin`, the bridge invokes the `drovr.docs` plugin through the API
+   channel; the plugin looks for drovr on the herdr server's PATH.
 2. **drovr-state-hook** for Claude and Codex, with PreToolUse matching,
    pending-request set, decision wait, redaction, install `--dry-run`. Tests:
    recorded payloads with a stub `herdr` (parallel tools, subagent, reject in

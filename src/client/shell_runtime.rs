@@ -52,6 +52,13 @@ pub(super) fn dispatch_client_shell_actions(
                 pane_id,
                 path,
             } => shell::open_local_document(workspace_id, Some(pane_id), path.into()),
+            shell::ClientShellAction::OpenRemoteDocument { bridge, doc } => {
+                std::thread::spawn(move || {
+                    if let Err(err) = bridge.open_document(&doc) {
+                        warn!(err = %err, path = %doc.path, "remote doc open failed");
+                    }
+                });
+            }
             shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
             shell::ClientShellAction::Keybind(action) => {
                 debug!(

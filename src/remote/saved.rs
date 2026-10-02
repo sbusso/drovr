@@ -152,7 +152,11 @@ fn saved_bridge_path(profile_id: &str) -> PathBuf {
     crate::platform::remote_bridge_endpoint_path(&readable, &short)
 }
 
-fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Result<RemoteSsh> {
+pub(super) fn validated_saved_ssh(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+) -> io::Result<RemoteSsh> {
     validate_profile_path_id(profile_id)?;
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;

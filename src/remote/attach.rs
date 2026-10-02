@@ -836,7 +836,7 @@ impl RemoteSsh {
         command
     }
 
-    fn sh_output(&self, script: &str) -> io::Result<Output> {
+    pub(super) fn sh_output(&self, script: &str) -> io::Result<Output> {
         let script = posix_remote_output_command(script);
         let mut child = self
             .command()

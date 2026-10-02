@@ -169,9 +169,12 @@ Three ways to open a document:
   suffix and a `#anchor` are ignored; relative paths are taken from the
   pane's current directory. The doc pane opens next to the clicked pane and
   takes focus. On this machine drovr runs `drovr doc open` itself; on a
-  remote machine it runs the `drovr-docs` plugin's action there, so the
-  plugin must be installed on that machine (see below). A path that wraps
-  onto the next row is not detected.
+  remote machine it runs `drovr doc open` there over the machine's SSH
+  connection, so drovr must be installed on that machine. When the SSH
+  shell finds drovr neither on its PATH nor in `~/.local/bin`, drovr runs
+  the `drovr-docs` plugin's action there instead (see below), which looks
+  for drovr on the herdr server's PATH. A path that wraps onto the next row
+  is not detected.
 - **Right-click a workspace or an agent** in the sidebar → **Documents…**
   lists the workspace's last 10 documents. The item shows for workspaces on
   this machine that have opened documents.
@@ -188,10 +191,10 @@ mkdir -p ~/.claude/skills && cp -R skills/drovr-docs ~/.claude/skills/   # from 
 ```
 
 The plugin opens Markdown paths Ctrl+clicked in panes on its machine
-(plain-text paths on remote machines, and `file://` or path hyperlinks
-everywhere) and adds an **Open document…** workspace action (the newest
-recent document). The skill tells agents to open the plans
-and reports they write for you with `drovr doc open`.
+(`file://` or path hyperlinks, and plain-text paths on remote machines
+when the SSH shell does not find drovr) and adds an **Open document…**
+workspace action (the newest recent document). The skill tells agents to
+open the plans and reports they write for you with `drovr doc open`.
 
 ### Small fixes
 - Workspaces are tracked by id, so two with the same name are independent and a
