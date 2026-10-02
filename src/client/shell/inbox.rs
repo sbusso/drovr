@@ -38,7 +38,7 @@ pub(super) const FOCUS_DROP: Duration = Duration::from_millis(250);
 const DEFAULT_STUCK_MINUTES: u64 = 10;
 /// Metadata source of the server marks.
 const MARK_SOURCE: &str = "drovr-inbox";
-/// `drovr_dis`: the `state_change_seq` dismissed.
+/// `drovr_dis`: `<state_change_seq>|<kind>`, the item dismissed.
 const DISMISS_TOKEN: &str = "drovr_dis";
 /// `drovr_snz`: `<end unix s>|<state_change_seq>|<request id>`.
 const SNOOZE_TOKEN: &str = "drovr_snz";
@@ -194,6 +194,22 @@ fn wait_id(agent: &ClientShellAgent) -> &str {
         .unwrap_or_default()
 }
 
+/// The kind name in a `drovr_dis` mark.
+fn kind_tag(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Permission => "permission",
+        ItemKind::Question => "question",
+        ItemKind::Plan => "plan",
+        ItemKind::Asks => "asks",
+        ItemKind::Dialog => "dialog",
+        ItemKind::Stuck => "stuck",
+        ItemKind::Limit => "limit",
+        ItemKind::Exited => "exited",
+        ItemKind::Denied => "denied",
+        ItemKind::Finished => "done",
+    }
+}
+
 /// Whether the server marks of `agent` hide an item of `kind` now.
 fn marked(
     dismissed: Option<&str>,
@@ -203,8 +219,17 @@ fn marked(
     wait: &str,
     now: u64,
 ) -> bool {
+    // A working agent keeps one seq for the whole turn and can show stuck,
+    // then limit: the kind keeps a dismissed one from hiding the other. A
+    // mark without a kind (older clients) hides any kind of that seq.
     let dismissed = !kind.waiting()
-        && dismissed.and_then(|value| value.trim().parse::<u64>().ok()) == Some(seq);
+        && dismissed.is_some_and(|value| {
+            let (at, tag) = value
+                .trim()
+                .split_once('|')
+                .map_or((value.trim(), None), |(at, tag)| (at, Some(tag)));
+            at.parse::<u64>().ok() == Some(seq) && tag.is_none_or(|tag| tag == kind_tag(kind))
+        });
     let snoozed = snoozed.is_some_and(|value| {
         let mut fields = value.split('|');
         let end = fields.next().and_then(|end| end.parse::<u64>().ok());
@@ -572,6 +597,7 @@ impl InboxTab {
 struct ScreenRead {
     key: ItemKey,
     seq: u64,
+    wait_id: String,
     lines: Result<Vec<String>, String>,
 }
 
@@ -603,6 +629,9 @@ pub(crate) struct InboxState {
     pub(super) selected: Option<ItemKey>,
     /// `space`: the selected item shows its detail.
     detail: bool,
+    /// The `(seq, wait id)` the detail was opened for; a new state or
+    /// prompt closes it.
+    detail_for: Option<(u64, String)>,
     scroll: usize,
     /// A just-snoozed item stays listed until the selection moves.
     sticky: Option<ItemKey>,
@@ -638,6 +667,19 @@ impl InboxState {
         }
     }
 
+    /// The terminal regained focus: keys right after it may be aimed at a
+    /// pane, so the drop window starts again.
+    pub(super) fn outer_focus_gained(&mut self, now: Instant) {
+        if self.focused {
+            self.focused_at = Some(now);
+        }
+    }
+
+    /// Whether `point` is on the open panel.
+    pub(super) fn contains(&self, point: (u16, u16)) -> bool {
+        self.open && super::contains(self.hits.area, point)
+    }
+
     /// Whether a key at `now` may act: not within [`FOCUS_DROP`] of gaining
     /// focus.
     pub(super) fn accepts_key(&self, now: Instant) -> bool {
@@ -666,6 +708,7 @@ impl InboxState {
         if self.selected != key {
             self.selected = key;
             self.detail = false;
+            self.detail_for = None;
             self.screen = None;
             self.sticky = None;
             self.snooze_step = 0;
@@ -683,20 +726,32 @@ pub(crate) enum ApiRoute {
 /// What to do with a request's answer.
 #[derive(Clone, Debug)]
 pub(crate) enum InboxReply {
-    Mark { machine: String, key: ItemKey },
-    Screen { key: ItemKey, seq: u64 },
+    Mark {
+        machine: String,
+        key: ItemKey,
+        token: &'static str,
+        value: String,
+    },
+    Screen {
+        key: ItemKey,
+        seq: u64,
+        wait_id: String,
+    },
 }
 
-/// Runs an inbox request on a background thread and posts the answer to the
-/// client loop. Without `events` (tests) the answer is dropped.
-pub(crate) fn run_request(
+type LoopEvents = tokio::sync::mpsc::Sender<crate::client::events::ClientLoopEvent>;
+
+/// One inbox request and where its answer goes.
+struct InboxJob {
     route: ApiRoute,
     request: Box<crate::api::schema::Request>,
     reply: InboxReply,
-    events: Option<tokio::sync::mpsc::Sender<crate::client::events::ClientLoopEvent>>,
-) {
-    std::thread::spawn(move || {
-        let client = match &route {
+    events: Option<LoopEvents>,
+}
+
+impl InboxJob {
+    fn run(self) {
+        let client = match &self.route {
             ApiRoute::Local => Ok(crate::api::client::ApiClient::local()),
             ApiRoute::Remote(bridge) => bridge.api_client(),
         };
@@ -704,7 +759,7 @@ pub(crate) fn run_request(
             .map_err(|error| error.to_string())
             .and_then(|client| {
                 client
-                    .request_value_with_timeout(&request, REQUEST_TIMEOUT)
+                    .request_value_with_timeout(&self.request, REQUEST_TIMEOUT)
                     .map_err(|error| error.to_string())
             })
             .and_then(|value| match value.get("error") {
@@ -715,15 +770,53 @@ pub(crate) fn run_request(
                 None => Ok(value),
             });
         if let Err(error) = &result {
-            tracing::warn!(%error, ?reply, "inbox request failed");
+            tracing::warn!(%error, reply = ?self.reply, "inbox request failed");
         }
-        if let Some(events) = events {
+        if let Some(events) = self.events {
             let _ = events.blocking_send(crate::client::events::ClientLoopEvent::InboxReply {
-                reply,
+                reply: self.reply,
                 result,
             });
         }
+    }
+}
+
+/// Runs an inbox request on a background thread and posts the answer to the
+/// client loop. Without `events` (tests) the answer is dropped.
+///
+/// Marks run one at a time, in the order sent, so a later mark for a token
+/// (a second `z`) is never overwritten by an earlier one. Ceiling: a slow
+/// machine delays marks for the others by up to [`REQUEST_TIMEOUT`]; the
+/// upgrade path is one queue per machine.
+pub(crate) fn run_request(
+    route: ApiRoute,
+    request: Box<crate::api::schema::Request>,
+    reply: InboxReply,
+    events: Option<LoopEvents>,
+) {
+    static MARKS: OnceLock<std::sync::mpsc::Sender<InboxJob>> = OnceLock::new();
+    let job = InboxJob {
+        route,
+        request,
+        reply,
+        events,
+    };
+    if !matches!(job.reply, InboxReply::Mark { .. }) {
+        std::thread::spawn(move || job.run());
+        return;
+    }
+    let queue = MARKS.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<InboxJob>();
+        std::thread::spawn(move || {
+            for job in receiver {
+                job.run();
+            }
+        });
+        sender
     });
+    if let Err(std::sync::mpsc::SendError(job)) = queue.send(job) {
+        std::thread::spawn(move || job.run());
+    }
 }
 
 /// Unix time of 09:00 tomorrow, local time, `secs_of_day` after local
@@ -793,16 +886,21 @@ impl ClientShellState {
     pub(super) fn close_inbox(&mut self, outcome: &mut ClientShellInput) {
         if self.inbox.open {
             self.inbox.open = false;
-            self.inbox.focused = false;
+            self.blur_inbox();
             self.inbox.dragging = false;
             self.inbox.select(None);
             self.relayout_inbox(outcome);
         }
     }
 
-    /// Focus goes back to the panes (the herdr pane focus never moved).
+    /// Focus goes back to the panes (the herdr pane focus never moved),
+    /// and to copy mode when the focused pane is in it.
     pub(super) fn blur_inbox(&mut self) -> bool {
-        std::mem::replace(&mut self.inbox.focused, false)
+        let was = std::mem::replace(&mut self.inbox.focused, false);
+        if was && self.mode == ClientShellMode::Terminal {
+            self.mode = self.copy_or_terminal_mode();
+        }
+        was
     }
 
     /// `prefix i`: open and focus; focus when open; close when focused.
@@ -927,7 +1025,7 @@ impl ClientShellState {
                     title: None,
                     display_agent: None,
                     state_labels: HashMap::new(),
-                    tokens: HashMap::from([(token.to_owned(), Some(value))]),
+                    tokens: HashMap::from([(token.to_owned(), Some(value.clone()))]),
                     clear_title: false,
                     clear_display_agent: false,
                     clear_state_labels: false,
@@ -943,6 +1041,8 @@ impl ClientShellState {
             reply: InboxReply::Mark {
                 machine: item.machine.clone(),
                 key: item.key.clone(),
+                token,
+                value: value.clone(),
             },
         });
         outcome.repaint = true;
@@ -952,8 +1052,21 @@ impl ClientShellState {
         if item.kind.waiting() {
             return false;
         }
-        self.send_inbox_mark(item, DISMISS_TOKEN, item.seq.to_string(), outcome);
+        let value = format!("{}|{}", item.seq, kind_tag(item.kind));
+        self.send_inbox_mark(item, DISMISS_TOKEN, value, outcome);
         true
+    }
+
+    /// Dismisses `item`; when it is selected, the cursor moves to the next
+    /// item, worked out before the pending mark hides it from the list.
+    fn dismiss_and_advance(&mut self, item: &Item, outcome: &mut ClientShellInput) {
+        let next = (self.inbox.selected.as_ref() == Some(&item.key))
+            .then(|| self.inbox_neighbour(&item.key));
+        if self.dismiss_inbox_item(item, outcome) {
+            if let Some(next) = next {
+                self.inbox.select(next);
+            }
+        }
     }
 
     /// `D`, and the menu's "dismiss all done in project": every done item
@@ -993,10 +1106,10 @@ impl ClientShellState {
             .find(|item| &item.key == selected)
     }
 
-    /// After a dismiss, the cursor moves to the next item.
-    fn select_after(&mut self, key: &ItemKey) {
+    /// The listed item after `key` (before it when `key` is last).
+    fn inbox_neighbour(&self, key: &ItemKey) -> Option<ItemKey> {
         let items = self.visible_inbox_items();
-        let next = items
+        items
             .iter()
             .position(|item| &item.key == key)
             .and_then(|index| {
@@ -1004,12 +1117,12 @@ impl ClientShellState {
                     .get(index + 1)
                     .or_else(|| index.checked_sub(1).and_then(|i| items.get(i)))
             })
-            .map(|item| item.key.clone());
-        self.inbox.select(next);
+            .map(|item| item.key.clone())
     }
 
     fn toggle_inbox_detail(&mut self, item: &Item, outcome: &mut ClientShellInput) {
         self.inbox.detail = !self.inbox.detail;
+        self.inbox.detail_for = self.inbox.detail.then(|| (item.seq, item.wait_id.clone()));
         outcome.repaint = true;
         if !self.inbox.detail
             || !matches!(
@@ -1041,6 +1154,7 @@ impl ClientShellState {
             reply: InboxReply::Screen {
                 key: item.key.clone(),
                 seq: item.seq,
+                wait_id: item.wait_id.clone(),
             },
         });
     }
@@ -1052,15 +1166,24 @@ impl ClientShellState {
         result: Result<serde_json::Value, String>,
     ) -> bool {
         match reply {
-            InboxReply::Mark { machine, key } => match result {
+            InboxReply::Mark {
+                machine,
+                key,
+                token,
+                value,
+            } => match result {
                 Ok(_) => false,
                 Err(error) => {
-                    // The local mark lapses; the item comes back.
+                    // The failed mark lapses and its item comes back; newer
+                    // marks for the pane stay.
                     pending_marks()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .retain(|mark| {
-                            mark.endpoint_id != key.endpoint_id || mark.pane_id != key.pane_id
+                            mark.endpoint_id != key.endpoint_id
+                                || mark.pane_id != key.pane_id
+                                || mark.token != token
+                                || mark.value != value
                         });
                     self.push_endpoint_notice(
                         ClientEndpointNoticeKind::Rejected,
@@ -1070,8 +1193,11 @@ impl ClientShellState {
                     )
                 }
             },
-            InboxReply::Screen { key, seq } => {
-                if self.inbox.selected.as_ref() != Some(&key) || !self.inbox.detail {
+            InboxReply::Screen { key, seq, wait_id } => {
+                if self.inbox.selected.as_ref() != Some(&key)
+                    || !self.inbox.detail
+                    || self.inbox.detail_for.as_ref() != Some(&(seq, wait_id.clone()))
+                {
                     return false;
                 }
                 let lines = result.map(|value| {
@@ -1087,7 +1213,12 @@ impl ClientShellState {
                         .map(|line| (*line).to_owned())
                         .collect()
                 });
-                self.inbox.screen = Some(ScreenRead { key, seq, lines });
+                self.inbox.screen = Some(ScreenRead {
+                    key,
+                    seq,
+                    wait_id,
+                    lines,
+                });
                 true
             }
         }
@@ -1160,11 +1291,7 @@ impl ClientShellState {
                 match code {
                     KeyCode::Enter => self.inbox_jump(&item.key, outcome),
                     KeyCode::Char(' ' | 'l') => self.toggle_inbox_detail(&item, outcome),
-                    KeyCode::Char('d') => {
-                        if self.dismiss_inbox_item(&item, outcome) {
-                            self.select_after(&item.key);
-                        }
-                    }
+                    KeyCode::Char('d') => self.dismiss_and_advance(&item, outcome),
                     KeyCode::Char('z') => self.snooze_inbox_item(&item, outcome),
                     KeyCode::Char('m') => self.toggle_inbox_mute(&item),
                     _ => {}
@@ -1261,7 +1388,7 @@ impl ClientShellState {
                 {
                     if let Some(item) = self.inbox_items().into_iter().find(|item| &item.key == key)
                     {
-                        self.dismiss_inbox_item(&item, outcome);
+                        self.dismiss_and_advance(&item, outcome);
                     }
                 } else if let Some((_, key)) = hits
                     .jumps
@@ -1317,11 +1444,7 @@ impl ClientShellState {
         };
         match action {
             ClientContextMenuAction::AgentFocus => self.inbox_jump(&key, outcome),
-            ClientContextMenuAction::InboxDismiss => {
-                if self.dismiss_inbox_item(&item, outcome) {
-                    self.select_after(&key);
-                }
-            }
+            ClientContextMenuAction::InboxDismiss => self.dismiss_and_advance(&item, outcome),
             ClientContextMenuAction::InboxDismissDoneInProject => {
                 let project = item.project.clone();
                 self.dismiss_done(
@@ -1368,6 +1491,18 @@ pub(super) fn render(
         .any(|item| Some(&item.key) == inbox.selected.as_ref())
     {
         inbox.select(visible.first().map(|item| item.key.clone()));
+    }
+    // A new state or prompt on the expanded item closes its detail, so it
+    // never shows another prompt's screen or waits on a read never sent.
+    if inbox.detail
+        && visible.iter().any(|item| {
+            Some(&item.key) == inbox.selected.as_ref()
+                && inbox.detail_for.as_ref() != Some(&(item.seq, item.wait_id.clone()))
+        })
+    {
+        inbox.detail = false;
+        inbox.detail_for = None;
+        inbox.screen = None;
     }
     let waiting = items
         .iter()
@@ -1459,7 +1594,11 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
                     lines.push(Line::Detail(index, fact.clone()));
                 }
                 match view.state.screen.as_ref() {
-                    Some(screen) if screen.key == item.key && screen.seq == item.seq => {
+                    Some(screen)
+                        if screen.key == item.key
+                            && screen.seq == item.seq
+                            && screen.wait_id == item.wait_id =>
+                    {
                         match &screen.lines {
                             Ok(screen) => {
                                 for line in screen {
@@ -1531,7 +1670,6 @@ fn draw(buffer: &mut Buffer, area: Rect, view: &View) -> (InboxHits, usize) {
     hits.border = Rect::new(area.x, area.y, 1, area.height);
     let left = area.x + 2;
     let right = area.right().saturating_sub(1);
-    let width = right.saturating_sub(left);
     let narrow = area.width < NARROW_WIDTH;
 
     // Header: title and counts, tabs, grouping.
@@ -1652,7 +1790,9 @@ fn draw(buffer: &mut Buffer, area: Rect, view: &View) -> (InboxHits, usize) {
     }
     for (offset, line) in lines.iter().skip(scroll).take(height).enumerate() {
         let y = list.y + offset as u16;
-        draw_line(buffer, view, line, &lines, left, right, width, y, &mut hits);
+        draw_line(
+            buffer, view, line, &lines, left, right, narrow, y, &mut hits,
+        );
     }
     (hits, scroll)
 }
@@ -1676,7 +1816,7 @@ fn draw_line(
     lines: &[Line],
     left: u16,
     right: u16,
-    width: u16,
+    narrow: bool,
     y: u16,
     hits: &mut InboxHits,
 ) {
@@ -1777,7 +1917,8 @@ fn draw_line(
                 x = put(buffer, x, y, right, &format!(" {vendor}"), dim);
             }
             let close = view.state.hover.as_ref() == Some(&item.key) && !item.kind.waiting();
-            let right_text = if width >= NARROW_WIDTH - 2 {
+            // Narrow rows carry the chip and age on their Meta line.
+            let right_text = if !narrow {
                 chip_and_age()
             } else {
                 String::new()
@@ -1998,6 +2139,11 @@ mod tests {
         state.focused = false;
         state.focus(start + Duration::from_secs(5));
         assert!(!state.accepts_key(start + Duration::from_secs(5) + Duration::from_millis(100)));
+        // The terminal regaining focus starts the window again.
+        let back = start + Duration::from_secs(9);
+        state.outer_focus_gained(back);
+        assert!(!state.accepts_key(back + Duration::from_millis(100)));
+        assert!(state.accepts_key(back + FOCUS_DROP));
     }
 
     #[test]
@@ -2067,6 +2213,9 @@ mod tests {
             "{:?}",
             wide[1]
         );
+        // 60 columns is not narrow: the chip stays on the main line.
+        let edge = render(60);
+        assert!(edge[1].ends_with("p0·local  2m"), "{:?}", edge[1]);
         let narrow = render(50);
         assert!(narrow[0].contains("[W] D  A"), "{:?}", narrow[0]);
         assert!(
@@ -2117,6 +2266,10 @@ mod tests {
             agent_item(&layout, &endpoint, &next, NOW),
             Some(ItemKind::Finished)
         );
+        // A dismissed kind hides only that kind at the seq.
+        assert!(marked(Some("7|limit"), None, ItemKind::Limit, 7, "", NOW));
+        assert!(!marked(Some("7|limit"), None, ItemKind::Stuck, 7, "", NOW));
+        assert!(marked(Some("7"), None, ItemKind::Stuck, 7, "", NOW));
         let waiting = agent("p4", AgentStatus::Blocked, &[("drovr_dis", "7".into())]);
         assert_eq!(
             agent_item(&layout, &endpoint, &waiting, NOW),
@@ -2181,6 +2334,43 @@ mod tests {
         state.handle_input_bytes(&[0x02]);
         state.handle_input_bytes(b"i");
         assert!(state.inbox.open && state.inbox.focused);
+    }
+
+    #[test]
+    fn the_focused_inbox_takes_keys_from_a_pane_in_copy_mode() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(super::super::tests::snapshot()));
+        let pane_id = state.focused_pane_id().expect("focused pane");
+        state.mode = ClientShellMode::Copy;
+        state.copy_mode = Some(ClientCopyModeState {
+            pane_id,
+            content_revision: 0,
+            geometry: (80, 24),
+            alternate_screen_active: false,
+            cursor: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 0,
+            entry_offset_from_bottom: 0,
+            selection: None,
+            search_prompt: None,
+            search_query: String::new(),
+            search_direction: None,
+            search_matches: Vec::new(),
+            search_total: 0,
+            search_current: None,
+            search_current_global: None,
+            search_generation: 0,
+            copy_after_search: false,
+        });
+        state.handle_input_bytes(&[0x02]);
+        state.handle_input_bytes(b"i");
+        assert!(state.inbox.open && state.inbox.focused);
+        state.inbox.focused_at = None;
+        // Esc acts on the inbox (blurs it), not on copy mode, which resumes.
+        state.handle_input_bytes(&[0x1b]);
+        assert!(!state.inbox.focused);
+        assert!(state.copy_mode.is_some());
+        assert_eq!(state.mode, ClientShellMode::Copy);
     }
 
     #[test]

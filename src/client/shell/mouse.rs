@@ -947,6 +947,7 @@ impl ClientShellState {
         if !self.replaying_url_click
             && self.overlay.is_none()
             && self.mode == ClientShellMode::Terminal
+            && !self.inbox.contains(point)
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && mouse
                 .modifiers

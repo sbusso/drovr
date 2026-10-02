@@ -167,8 +167,10 @@ The sidebar shows activity; the inbox shows waiting and done detail.
 - `m` mutes a workspace: its done, asks, stuck and limit items are hidden and
   raise no toast. Waiting items still show.
 - Dismiss and snooze marks live on the server as pane tokens from source
-  `drovr-inbox`: `drovr_dis` = the `state_change_seq` dismissed (while Done it
-  equals the completion seq), `drovr_snz` = `<end>|<seq>|<req8>`: the
+  `drovr-inbox`: `drovr_dis` = `<seq>|<kind>`: the `state_change_seq` and
+  item kind dismissed (while Done the seq equals the completion seq; the
+  kind keeps a dismissed stuck item from hiding a later limit item in the
+  same turn), `drovr_snz` = `<end>|<seq>|<req8>`: the
   snooze end, with the `state_change_seq` and request id it applies to, so
   the item returns early on a new state or prompt. Every client sees the
   same inbox. Mutes are a client preference.

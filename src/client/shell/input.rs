@@ -250,6 +250,8 @@ impl ClientShellState {
                 RawInputEvent::Mouse(mouse) => self.handle_mouse(mouse, &mut outcome),
                 RawInputEvent::OuterFocusGained => {
                     self.outer_focused = Some(true);
+                    // drovr fork: keys right after a focus-in may be aimed at a pane.
+                    self.inbox.outer_focus_gained(std::time::Instant::now());
                     outcome.query_host_appearance = true;
                     outcome.repaint |= self.config.redraw_on_focus_gained;
                     if let Some(surface) = self.pane_surface.clone() {
@@ -571,6 +573,11 @@ impl ClientShellState {
             outcome.repaint = true;
         }
 
+        // drovr fork: the focused inbox takes keys in copy mode too; the
+        // pane's copy mode resumes when the inbox loses focus.
+        if self.mode == ClientShellMode::Copy && self.inbox.open && self.inbox.focused {
+            self.mode = ClientShellMode::Terminal;
+        }
         match self.mode {
             ClientShellMode::Terminal => {
                 if let Some(binding) =

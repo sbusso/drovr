@@ -163,6 +163,14 @@ impl ClientShellState {
                 main,
             );
         }
+        // drovr fork: an inbox row's right-click menu needs no snapshot.
+        if let Some(ClientShellOverlay::ContextMenu(menu)) = &self.overlay {
+            if let Some(rendered) =
+                render::render_context_menu(&mut buffer, menu, &self.config.palette)
+            {
+                self.hits.context_menu_rows = rendered.menu_rows;
+            }
+        }
         if let Some(notice) = &self.visible_endpoint_notice {
             self.hits.notification_toast = endpoint_notices::render_notice(
                 &mut buffer,
