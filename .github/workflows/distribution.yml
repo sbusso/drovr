@@ -48,6 +48,7 @@ concurrency:
 
 jobs:
   validate:
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

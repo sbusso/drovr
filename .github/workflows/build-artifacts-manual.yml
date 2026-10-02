@@ -42,7 +42,7 @@ env:
 
 jobs:
   build-linux:
-    if: ${{ inputs.build_group == 'linux' || inputs.build_group == 'all' }}
+    if: github.repository == 'herdrdev/herdr' && (inputs.build_group == 'linux' || inputs.build_group == 'all')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -126,7 +126,7 @@ jobs:
           retention-days: 7
 
   build-macos:
-    if: ${{ inputs.build_group == 'macos' || inputs.build_group == 'all' }}
+    if: github.repository == 'herdrdev/herdr' && (inputs.build_group == 'macos' || inputs.build_group == 'all')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -189,7 +189,7 @@ jobs:
           retention-days: 7
 
   build-windows:
-    if: ${{ inputs.build_group == 'windows' || inputs.build_group == 'all' }}
+    if: github.repository == 'herdrdev/herdr' && (inputs.build_group == 'windows' || inputs.build_group == 'all')
     runs-on: windows-latest
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}

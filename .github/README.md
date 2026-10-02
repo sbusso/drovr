@@ -140,7 +140,7 @@ The combined sidebar appears when the client is connected to 2+ machines. With
 a single machine drovr looks like herdr. Stock herdr ignores this file.
 
 ## Install
-Linux x86_64, static binary:
+macOS and Linux, x86_64 and arm64 (Linux builds are static):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-install | bash
@@ -160,14 +160,24 @@ The server keeps running stock herdr; use the matching herdr version on each mac
   `src/client/shell/project_actions.rs` (menus, clicks, drag, keys). Small hooks in
   upstream files are tagged: `grep -rn "drovr fork" src`.
 - **Following herdr is automatic**: *drovr rebase* runs daily. When herdr ships
-  a new stable release it rebases drovr onto it; if that's clean and the tests
-  pass it pushes `rebase/<tag>` and opens a "ready to ship" issue, and on a
-  conflict it opens an issue with the files and upstream commits involved,
-  changing nothing. *drovr promote* (Actions → Run workflow) ships a ready
-  rebase. Conflict resolutions are remembered via `git rerere` (`.github/rr-cache`).
+  a new stable release it rebases drovr onto it and tracks the result in one
+  issue per herdr release: if the rebase is clean and the tests pass it pushes
+  `rebase/<tag>` and marks the issue ready to ship; on a conflict or a test
+  failure it pushes nothing and the issue lists the conflicting files or links
+  the failing run. *drovr promote* (Actions → Run workflow) ships a ready
+  rebase: it moves `main` with `--force-with-lease`, tags `drovr-<tag>-1` and
+  can be rerun after a partial failure. Conflict resolutions are remembered via
+  `git rerere` (`.github/rr-cache`).
+- Both workflows need the secret `DROVR_PUSH_TOKEN`: a fine-grained PAT for
+  this repository with *Contents* and *Workflows* read/write. `GITHUB_TOKEN`
+  cannot push commits that change `.github/workflows`.
 - Manual rebase: `git fetch origin --tags && git rebase --onto v<new> v<old> main`.
-- Release: `git tag drovr-v<ver>-<n> && git push fork drovr-v<ver>-<n>` → the
-  "drovr release" workflow builds and publishes. Upstream workflows are disabled here.
+- Release: `git tag drovr-v<ver>-<n> && git push origin drovr-v<ver>-<n>` → the
+  "drovr release" workflow builds `drovr-{macos,linux}-{arm64,x86_64}` with
+  SHA-256 checksums and publishes them. Run it by hand with a tag to rebuild.
+- *drovr CI* builds and tests pushes and pull requests to `main` on macOS and
+  Linux. Upstream workflows are kept but their jobs only run in
+  `herdrdev/herdr` (`if: github.repository == 'herdrdev/herdr'`).
 - Local build needs Zig 0.16.0 (`cargo build --release`).
 
 ## License

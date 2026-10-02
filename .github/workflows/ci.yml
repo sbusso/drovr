@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    if: github.event_name != 'push' || github.ref_name == 'master'
+    if: github.repository == 'herdrdev/herdr' && (github.event_name != 'push' || github.ref_name == 'master')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -49,6 +49,7 @@ jobs:
         run: python3 scripts/conventional_commits.py "$PR_TITLE"
 
   check:
+    if: github.repository == 'herdrdev/herdr'
     name: check (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -218,6 +219,7 @@ jobs:
           key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0-${{ github.run_id }}-${{ github.run_attempt }}
 
   windows-conpty-package:
+    if: github.repository == 'herdrdev/herdr'
     name: Windows ConPTY package
     runs-on: windows-2022
     timeout-minutes: 25

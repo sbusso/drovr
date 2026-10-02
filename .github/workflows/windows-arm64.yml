@@ -23,6 +23,7 @@ concurrency:
 
 jobs:
   installer:
+    if: github.repository == 'herdrdev/herdr'
     name: installer
     runs-on: windows-11-arm
     timeout-minutes: 10
