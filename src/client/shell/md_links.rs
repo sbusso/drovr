@@ -153,6 +153,48 @@ pub(super) fn resolve_md_path(path: &str, cwd: Option<&str>) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+/// Where a relative Markdown path was found on this machine.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LocalMdPath {
+    Found(String),
+    /// More than one immediate subdirectory holds the path.
+    Ambiguous(usize),
+    Missing,
+}
+
+/// Most directory entries read while looking through subdirectories.
+const SUBDIR_SCAN_LIMIT: usize = 200;
+
+/// Finds a relative `path` printed in a local pane: under each of `dirs`
+/// (foreground cwd, then cwd), else under exactly one immediate, non-hidden
+/// subdirectory of `scan_dir` (the first `SUBDIR_SCAN_LIMIT` entries).
+/// Agents often print paths relative to a repository inside the pane's cwd.
+pub(super) fn find_local_md_path(path: &str, dirs: &[&str], scan_dir: &str) -> LocalMdPath {
+    let exists = |dir: &str| {
+        resolve_md_path(path, Some(dir)).filter(|full| std::path::Path::new(full).is_file())
+    };
+    if let Some(found) = dirs.iter().find_map(|dir| exists(dir)) {
+        return LocalMdPath::Found(found);
+    }
+    let Ok(entries) = std::fs::read_dir(scan_dir) else {
+        return LocalMdPath::Missing;
+    };
+    let mut found = entries
+        .take(SUBDIR_SCAN_LIMIT)
+        .filter_map(Result::ok)
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| exists(entry.path().to_str()?))
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    match found.len() {
+        0 => LocalMdPath::Missing,
+        1 => LocalMdPath::Found(found.remove(0)),
+        count => LocalMdPath::Ambiguous(count),
+    }
+}
+
 /// Plugin and action that run `drovr doc open` on a remote machine.
 const DOCS_PLUGIN_ID: &str = "drovr.docs";
 const DOCS_PLUGIN_ACTION: &str = "open-link";
@@ -219,11 +261,37 @@ impl ClientShellState {
             return false;
         };
         let cwd = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone());
-        let Some(path) = resolve_md_path(&hit.path, cwd.as_deref()) else {
+        let Some(mut path) = resolve_md_path(&hit.path, cwd.as_deref()) else {
             return false;
         };
         let workspace_id = pane.workspace_id.clone();
         if self.active_endpoint_id.is_local() {
+            // Only a local pane's files can be checked from here; a missing
+            // relative path may live one directory down.
+            let relative = !hit.path.starts_with(['/', '~']);
+            if relative && !std::path::Path::new(&path).is_file() {
+                let dirs = [pane.foreground_cwd.as_deref(), pane.cwd.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let scan_dir = pane.cwd.as_deref().or(pane.foreground_cwd.as_deref());
+                match scan_dir.map(|scan_dir| find_local_md_path(&hit.path, &dirs, scan_dir)) {
+                    Some(LocalMdPath::Found(found)) => path = found,
+                    Some(LocalMdPath::Ambiguous(count)) => {
+                        outcome.repaint |= self.push_endpoint_notice(
+                            ClientEndpointNoticeKind::Rejected,
+                            "md_path_ambiguous",
+                            "Markdown path is ambiguous",
+                            format!(
+                                "{} is in {count} subdirectories; click a longer path.",
+                                hit.path
+                            ),
+                        );
+                        return true;
+                    }
+                    Some(LocalMdPath::Missing) | None => {}
+                }
+            }
             outcome.actions.push(ClientShellAction::OpenLocalDocument {
                 workspace_id,
                 pane_id: pane_id.to_owned(),
@@ -360,6 +428,46 @@ mod tests {
         assert_eq!(md_path_at(&row, 1), None);
         assert_eq!(md_path_at(&row, 16), None);
         assert_eq!(md_path_at(&row, 15), None);
+    }
+
+    #[test]
+    fn finds_relative_paths_in_cwds_then_one_subdirectory_down() {
+        let root = std::env::temp_dir().join(format!(
+            "drovr-md-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let file = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "# doc").expect("write");
+        };
+        file("work/README.md");
+        file("work/repo-a/docs/a.md");
+        file("work/repo-a/docs/both.md");
+        file("work/repo-b/docs/both.md");
+        file("work/.hidden/docs/hidden.md");
+        file("fg/docs/fg.md");
+        let dir = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        let (work, fg) = (dir("work"), dir("fg"));
+        let find = |path| find_local_md_path(path, &[&fg, &work], &work);
+        assert_eq!(find("README.md"), LocalMdPath::Found(dir("work/README.md")));
+        assert_eq!(find("docs/fg.md"), LocalMdPath::Found(dir("fg/docs/fg.md")));
+        assert_eq!(
+            find("./docs/a.md"),
+            LocalMdPath::Found(dir("work/repo-a/docs/a.md"))
+        );
+        assert_eq!(find("docs/both.md"), LocalMdPath::Ambiguous(2));
+        assert_eq!(find("docs/hidden.md"), LocalMdPath::Missing);
+        assert_eq!(find("docs/none.md"), LocalMdPath::Missing);
+        assert_eq!(
+            find_local_md_path("docs/a.md", &[], &dir("absent")),
+            LocalMdPath::Missing
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

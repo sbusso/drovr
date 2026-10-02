@@ -140,3 +140,49 @@ fn ctrl_hover_underlines_a_markdown_path_without_asking_the_server() {
     assert!((start..end).all(underlined));
     assert!(!underlined(start - 1) && !underlined(end));
 }
+
+#[test]
+fn ctrl_click_on_a_local_relative_path_looks_one_directory_down() {
+    let root = std::env::temp_dir().join(format!(
+        "drovr-md-click-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let write = |rel: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, "# doc").expect("write");
+    };
+    let click = |state: &mut ClientShellState| {
+        let down = mouse(state, MouseEventKind::Down(MouseButton::Left), "a.md");
+        state.handle_raw_events(vec![RawInputEvent::Mouse(down)])
+    };
+    let cwd = root.to_string_lossy().into_owned();
+    let mut fixture = snapshot();
+    fixture.panes[0].cwd = Some(cwd.clone());
+    fixture.panes[0].foreground_cwd = Some(cwd.clone());
+
+    write("repo-a/docs/a.md");
+    let mut state = md_state();
+    state.set_snapshot(Box::new(fixture.clone()));
+    let opened = click(&mut state);
+    assert!(matches!(
+        &opened.actions[..],
+        [ClientShellAction::OpenLocalDocument { path, .. }]
+            if *path == format!("{cwd}/repo-a/docs/a.md")
+    ));
+
+    write("repo-b/docs/a.md");
+    let mut state = md_state();
+    state.set_snapshot(Box::new(fixture));
+    let ambiguous = click(&mut state);
+    assert!(ambiguous.actions.is_empty());
+    let notice = state.visible_endpoint_notice.as_ref().expect("notice");
+    assert!(
+        notice.body.contains("in 2 subdirectories"),
+        "{}",
+        notice.body
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
