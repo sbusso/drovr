@@ -1,0 +1,28 @@
+id = "drovr.docs"
+name = "drovr docs"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Open Markdown documents in a drovr doc pane: Ctrl+click Markdown links, or open the workspace's most recent document."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open-link"
+title = "Open Markdown link in doc pane"
+contexts = ["pane"]
+command = ["python3", "open-doc.py"]
+
+[[actions]]
+id = "open-recent"
+title = "Open document…"
+contexts = ["workspace"]
+command = ["python3", "open-doc.py", "--recent"]
+
+# Ctrl+click on a file:// URL or a path ending in .md / .markdown (absolute,
+# or relative to the clicked pane's cwd). Stock herdr only detects http(s)
+# URLs in plain text; other schemes and bare paths are clickable when the
+# program emits them as OSC 8 hyperlinks.
+[[link_handlers]]
+id = "markdown"
+title = "Open Markdown in doc pane"
+pattern = "(?i)^(file://)?[^:?#]+\\.(md|markdown)([?#].*)?$"
+action = "open-link"

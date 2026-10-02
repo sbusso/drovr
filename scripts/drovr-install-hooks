@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Install drovr's Claude Code usage hook on this machine (run on every machine
-# where agents run). Copies the hook to ~/.local/bin and registers it for the
-# Stop, SessionStart and UserPromptSubmit events in ~/.claude/settings.json
-# (backup kept; existing hooks untouched).
-# The hook always comes from sbusso/drovr (main), never from the current
+# Install drovr's Claude Code integration on this machine (run on every machine
+# where agents run):
+# - the usage hook: copied to ~/.local/bin and registered for the Stop,
+#   SessionStart and UserPromptSubmit events in ~/.claude/settings.json
+#   (backup kept; existing hooks untouched);
+# - the drovr-docs skill: copied to ~/.claude/skills/drovr-docs/.
+# Files always come from sbusso/drovr (main), never from the current
 # directory: under `curl ... | bash` there is no script directory to resolve.
 set -euo pipefail
+raw=https://raw.githubusercontent.com/sbusso/drovr/main
 src="$(mktemp)"
-trap 'rm -f "$src"' EXIT
-curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-usage-hook -o "$src"
-mkdir -p "$HOME/.local/bin" "$HOME/.claude"
+skill="$(mktemp)"
+trap 'rm -f "$src" "$skill"' EXIT
+curl -fsSL "$raw/scripts/drovr-usage-hook" -o "$src"
+curl -fsSL "$raw/skills/drovr-docs/SKILL.md" -o "$skill"
+mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills/drovr-docs"
 install -m 0755 "$src" "$HOME/.local/bin/drovr-usage-hook"
+install -m 0644 "$skill" "$HOME/.claude/skills/drovr-docs/SKILL.md"
+echo "installed skill: $HOME/.claude/skills/drovr-docs/SKILL.md"
 settings="$HOME/.claude/settings.json"
 [ -f "$settings" ] || echo '{}' > "$settings"
 cp "$settings" "$settings.bak-pre-drovr-usage"
@@ -27,3 +34,16 @@ for event in ("Stop", "SessionStart", "UserPromptSubmit"):
 json.dump(settings, open(path, "w"), indent=2)
 EOF
 echo "drovr usage hook installed (backup: $settings.bak-pre-drovr-usage)"
+cat <<'EOF'
+
+To open Markdown links in a doc pane (Ctrl+click), install the herdr plugin
+on each machine that runs a herdr server:
+  herdr plugin install sbusso/drovr/plugins/drovr-docs
+Optional key for "Open document…" (most recent document of the workspace),
+in ~/.config/herdr/config.toml:
+  [[keys.command]]
+  key = "prefix+m"
+  type = "plugin_action"
+  command = "drovr.docs.open-recent"
+  description = "open document"
+EOF
