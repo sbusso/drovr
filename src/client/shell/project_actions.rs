@@ -133,7 +133,9 @@ pub(crate) fn open_local_editor(pane_id: String, path: std::path::PathBuf) {
             tracing::warn!("cannot open a pane for $EDITOR");
             return;
         };
-        let command = format!("${{EDITOR:-vi}} \"${PATH_ENV}\"; exit");
+        // `sh` splits `$EDITOR` into words (`code --wait`); zsh and fish
+        // would look for one command named after the whole value.
+        let command = format!("sh -c 'exec ${{EDITOR:-vi}} \"$1\"' sh \"${PATH_ENV}\"; exit");
         if let Err(err) = run(&["pane", "run", &new_pane, &command]) {
             tracing::warn!(err = %err, "cannot run $EDITOR");
         }

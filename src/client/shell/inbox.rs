@@ -748,6 +748,9 @@ pub(crate) struct InboxState {
     compose: Option<Compose>,
     /// Editor text kept per item after `esc` or a failed send.
     drafts: HashMap<ItemKey, String>,
+    /// The `$EDITOR` file of a closed editor: `$EDITOR` may still run, so
+    /// the file stays and the editor reloads it when it opens again.
+    externals: HashMap<ItemKey, (std::path::PathBuf, Option<std::time::SystemTime>)>,
 }
 
 impl InboxState {
@@ -852,11 +855,12 @@ impl InboxState {
         }
     }
 
-    /// Closes the editor, keeping its text as the item's draft.
+    /// Closes the editor, keeping its text as the item's draft and its
+    /// `$EDITOR` file for the next time it opens.
     fn close_compose(&mut self) {
         if let Some(compose) = self.compose.take() {
-            if let Some((path, _)) = &compose.external {
-                let _ = std::fs::remove_file(path);
+            if let Some(external) = compose.external {
+                self.externals.insert(compose.at.0.clone(), external);
             }
             let text = compose.editor.text();
             if text.trim().is_empty() {
@@ -868,14 +872,16 @@ impl InboxState {
     }
 }
 
-/// The text the screen must show before a key answers `item`: the question
-/// or plan title, or, for a permission, the command without the tool name.
+/// The text the prompt must show before a key answers `item`: the question,
+/// or, for a permission, the command without the tool name. A plan has none
+/// (see [`answer::confirm`]).
 fn screen_text(item: &Item) -> String {
     match item.kind {
         ItemKind::Permission => item
             .wait_text
             .split_once(' ')
             .map_or(String::new(), |(_, arg)| arg.to_owned()),
+        ItemKind::Plan => String::new(),
         _ => item.wait_text.clone(),
     }
 }
@@ -1529,10 +1535,11 @@ impl ClientShellState {
 
     /// Opens a plan read from `path` on the item's machine. A local agent's
     /// plan opens beside it. A remote agent's plan opens from a local copy in
-    /// the local workspace on screen; while a remote workspace is on screen,
-    /// it opens beside the agent on its machine instead (the Ctrl+click
+    /// the local workspace on screen; while the agent's own machine is on
+    /// screen, it opens beside the agent there instead (the Ctrl+click
     /// route, which needs drovr or the drovr.docs plugin there), since a
-    /// local doc pane would not be visible.
+    /// local doc pane would not be visible. With a third machine on screen,
+    /// neither would be: a notice asks to switch.
     fn open_plan(&mut self, item: &Item, path: &str, text: &str, outcome: &mut ClientShellInput) {
         if item.key.endpoint_id.is_local() {
             outcome.actions.push(ClientShellAction::OpenLocalDocument {
@@ -1566,6 +1573,18 @@ impl ClientShellState {
                 }
                 _ => {}
             }
+            return;
+        }
+        if self.active_endpoint_id != item.key.endpoint_id {
+            outcome.repaint |= self.push_endpoint_notice(
+                ClientEndpointNoticeKind::Rejected,
+                "drovr.inbox.plan",
+                "Plan not opened",
+                format!(
+                    "Switch to a workspace on this machine or on {} to read the plan.",
+                    item.machine
+                ),
+            );
             return;
         }
         let Some(bridge) = self
@@ -1685,12 +1704,15 @@ impl ClientShellState {
             KeyAct::Compose(purpose) => {
                 self.inbox.close_compose();
                 let text = self.inbox.drafts.remove(&at.0).unwrap_or_default();
+                let external = self.inbox.externals.remove(&at.0);
                 self.inbox.compose = Some(Compose {
                     at,
                     purpose,
                     editor: NoteEditor::new(&text),
-                    external: None,
+                    external,
                 });
+                // Text written in `$EDITOR` while the editor was closed.
+                self.reload_external_editor(outcome);
             }
             KeyAct::ReadPlan => self.read_plan(item, outcome),
         }
@@ -1887,6 +1909,17 @@ impl ClientShellState {
                     }
                     if error == answer::CHANGED {
                         self.inbox.stale.insert(key, (seq, wait_id));
+                        true
+                    } else if error == answer::UNKNOWN {
+                        // The hook may have answered: no keys for this
+                        // request again.
+                        self.inbox.stale.insert(key, (seq, wait_id));
+                        self.push_endpoint_notice(
+                            ClientEndpointNoticeKind::Rejected,
+                            "drovr.inbox.answer",
+                            "Answer unknown",
+                            error,
+                        );
                         true
                     } else {
                         self.push_endpoint_notice(
@@ -2294,7 +2327,9 @@ enum Line {
     Group(String),
     Main(usize),
     Meta(usize),
-    Options(usize),
+    /// A question's options: one row per confirmed option (the option's
+    /// place among them), or one note row (`None`) while none is confirmed.
+    Options(usize, Option<usize>),
     /// A row of the open editor.
     Editor(usize, usize),
     Detail(usize, String),
@@ -2329,7 +2364,16 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
         }
         if view.state.selected.as_ref() == Some(&item.key) {
             if item.kind == ItemKind::Question {
-                lines.push(Line::Options(index));
+                let options = answer_keys(item, view.state)
+                    .iter()
+                    .filter(|key| key.key.is_ascii_digit())
+                    .count();
+                if options == 0 || view.state.is_stale(item) {
+                    lines.push(Line::Options(index, None));
+                }
+                for option in 0..options {
+                    lines.push(Line::Options(index, Some(option)));
+                }
             }
             if let Some(compose) = view
                 .state
@@ -2589,7 +2633,7 @@ fn line_item(line: &Line) -> Option<usize> {
         Line::Group(_) => None,
         Line::Main(index)
         | Line::Meta(index)
-        | Line::Options(index)
+        | Line::Options(index, _)
         | Line::Editor(index, _)
         | Line::Actions(index)
         | Line::Detail(index, _) => Some(*index),
@@ -2744,26 +2788,26 @@ fn draw_line(
         Line::Meta(_) => {
             put(buffer, text + 2, y, right, &chip_and_age(), dim);
         }
-        Line::Options(_) => {
-            // Options appear only once the screen shows them (section 9).
+        Line::Options(_, slot) => {
+            // Options appear only once the screen shows them (section 9),
+            // one per row so long labels keep their key and click target.
             let keys = answer_keys(item, view.state);
-            let options: Vec<_> = keys.iter().filter(|key| key.key.is_ascii_digit()).collect();
-            let changed = Style::default().fg(palette.yellow).bg(row_bg);
-            if view.state.is_stale(item) {
+            let option =
+                slot.and_then(|slot| keys.iter().filter(|key| key.key.is_ascii_digit()).nth(slot));
+            if let Some(option) = option {
+                put_key(buffer, text + 2, y, right, option, view, item, row_bg, hits);
+            } else if view.state.is_stale(item) {
+                let changed = Style::default().fg(palette.yellow).bg(row_bg);
                 put(buffer, text + 2, y, right, answer::CHANGED, changed);
-            } else if options.is_empty() {
-                let (note, style) = match view.state.screen_of(item) {
-                    None => ("reading the screen…".to_owned(), dim),
-                    Some(Err(error)) => (format!("screen not read: {error}"), dim),
-                    Some(Ok(_)) => (answer::CHANGED.to_owned(), changed),
-                };
-                put(buffer, text + 2, y, right, &note, style);
             } else {
-                let mut x = text + 2;
-                for option in options {
-                    x = put_key(buffer, x, y, right, option, view, item, row_bg, hits);
-                    x = put(buffer, x, y, right, "   ", base);
-                }
+                // Unconfirmed is not changed: the dialog may not be drawn
+                // yet, or its labels differ from the hook's.
+                let note = match view.state.screen_of(item) {
+                    None => "reading the screen…".to_owned(),
+                    Some(Err(error)) => format!("screen not read: {error}"),
+                    Some(Ok(_)) => "options not confirmed on screen yet".to_owned(),
+                };
+                put(buffer, text + 2, y, right, &note, dim);
             }
         }
         Line::Editor(_, row) => {
@@ -2804,7 +2848,13 @@ fn draw_line(
                     .bg(row_bg)
                     .add_modifier(Modifier::BOLD);
                 let text = format!("press {} again: {}", key.key, key.label);
+                let start = x;
                 x = put(buffer, x, y, right, &text, style);
+                // A click on the prompt is the second press.
+                if x > start {
+                    hits.keys
+                        .push((Rect::new(start, y, x - start, 1), item.key.clone(), key.key));
+                }
                 x = put(buffer, x, y, right, "  ", dim);
             } else if view.state.compose.is_none() {
                 for key in keys.iter().filter(|key| !key.key.is_ascii_digit()) {
@@ -3038,6 +3088,70 @@ mod tests {
         assert_eq!(share_at(200, 30, 170, 120), 0.4);
         assert_eq!(share_at(200, 30, 170, 190), 0.24);
         assert_eq!(share_at(200, 30, 170, 40), 0.69);
+    }
+
+    #[test]
+    fn options_get_a_row_each_and_a_grant_prompt_is_clickable() {
+        let mut question = item(ItemKind::Question, Some(5), 0, "q");
+        question.wait_id = "cd34ef56".into();
+        question.wait_text = "Which layout?".into();
+        question.options = vec![
+            "Keep the current single-pane layout (Recommended)".into(),
+            "Two side-by-side panes".into(),
+            "Three panes".into(),
+        ];
+        let mut permission = item(ItemKind::Permission, Some(9), 0, "p");
+        permission.wait_id = "ab12cd34".into();
+        let screen = "Which layout?\n❯ 1. Keep the current single-pane layout (Recommended)\n  2. Two side-by-side panes\n  3. Three panes\n";
+        let palette = Palette::catppuccin();
+        let draw_with = |items: &[Item], state: &InboxState| {
+            let view = View {
+                items,
+                waiting: items.len(),
+                done: 0,
+                state,
+                palette: &palette,
+                snooze: None,
+                muted: &[],
+                grouped: false,
+            };
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 48, 20));
+            draw(&mut buffer, Rect::new(0, 0, 48, 20), &view).0
+        };
+
+        // Before a read confirms them, no option row: a neutral note.
+        let mut state = InboxState {
+            open: true,
+            selected: Some(question.key.clone()),
+            ..InboxState::default()
+        };
+        let items = [question.clone()];
+        let digit = |(_, _, ch): &&(Rect, ItemKey, char)| ch.is_ascii_digit();
+        assert!(!draw_with(&items, &state).keys.iter().any(|key| digit(&key)));
+        state.screen = Some(ScreenRead {
+            at: item_at(&question),
+            text: Ok(screen.into()),
+        });
+        let hits = draw_with(&items, &state);
+        let digits: Vec<_> = hits
+            .keys
+            .iter()
+            .filter(digit)
+            .map(|(rect, _, ch)| (rect.y, *ch))
+            .collect();
+        assert_eq!(digits.len(), 3, "{digits:?}");
+        assert!(digits.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+        // `a` pressed once on a permission: the prompt is the second click.
+        let items = [permission.clone()];
+        let state = InboxState {
+            open: true,
+            selected: Some(permission.key.clone()),
+            confirm: Some((item_at(&permission), 'a')),
+            ..InboxState::default()
+        };
+        let hits = draw_with(&items, &state);
+        assert!(hits.keys.iter().any(|(_, _, ch)| *ch == 'a'));
     }
 
     #[test]

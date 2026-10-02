@@ -318,6 +318,9 @@ can still answer in the terminal (section 11).
    (terminal answer, turn end) or after the wait limit (default 10 min,
    `DROVR_DECIDE_WAIT_S`). The dialog then stays, and the item falls back to
    jump-only.
+5. When the link to the machine fails after the script was sent (an SSH
+   timeout or exit 255), the file may be written: the inbox says the answer
+   may have been sent and offers no keys for that request again.
 
 This path is race-free. A decision is bound to one hook invocation, so it can
 never answer a later prompt. If the user answers in the terminal first, Claude
@@ -339,14 +342,24 @@ order, through the bridge:
 
 1. `agent.get`: `agent_status` is blocked and `state_change_seq` equals the
    item's.
-2. `pane.read`: the screen shows the item's question or plan title (the 80
-   character summary as a prefix of the on-screen text) and the chosen label.
-3. A second `pane.read` immediately before the send repeats check 2.
-4. `agent.send_keys` with the option number.
+2. The hook's pane state lists the item's request as its only pending
+   request. `drovr_wait` names the oldest one, so with two pending (a Codex
+   command approved in the terminal and still running) the dialog on screen
+   may belong to the other.
+3. `pane.read`: the prompt at the bottom of the screen shows the item's
+   question (the 80 character summary as a prefix of the on-screen text)
+   between its options and the nearest rule or transcript line above them,
+   and exactly one option with the chosen label. A label that wraps continues
+   on the lines under its numbered line. A plan is pinned by its one
+   "manually approve" option instead of its title, which scrolls off above a
+   long plan and loses its Markdown on screen.
+4. A second `pane.read` immediately before the send repeats check 3.
+5. `agent.send_keys` with the option number.
 
 Any failed check removes the answer keys and shows "Changed in the terminal.
 Jump to see it." Options are shown only after the screen confirms them, so
-stale tokens never produce an answerable item.
+stale tokens never produce an answerable item; until then the item says its
+options are not confirmed on screen yet.
 
 Residual race on this path: herdr bumps `state_change_seq` only when the state
 changes, and stock herdr has no compare-and-send. Between the last read and the
@@ -462,12 +475,15 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
      file in any case.
    - Label mapping: the options are the last run of numbered lines `1. …`,
      `2. …` at the bottom of the screen, so a plan's own numbered steps are
-     not options. Question keys match the `drovr_oN` label (prefix match
-     only when the token was cut at 80 characters); plan `y` matches
+     not options. A label that wraps continues on the lines under its
+     numbered line, up to a blank line. Question keys match the `drovr_oN`
+     label (prefix match only when the token was cut at 80 characters);
+     each confirmed option gets its own row in the item. Plan `y` matches
      "manually approve"; Codex `y`/`a`/`n` match "Yes" without, "Yes" with,
      and "No" with a grant word. Exactly one option must match. A grant
      label ("always", "don't ask again", "auto-accept") and `a` need a
-     second press of the same key.
+     second press of the same key; the "press a again" prompt is also a
+     click target.
    - Screen reads use the detection source (the bottom of the screen, which
      scrolling does not move). The inbox reads the screen when a waiting
      item is selected, and again every 2 s while no key-path option is
@@ -476,12 +492,16 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
      check, or a send that reports a changed prompt, removes the item's
      answer keys and shows "Changed in the terminal. Jump to see it." until
      its state or request changes; a transport error shows a notice and
-     the item returns with its keys. Editor text that was sent comes back
+     the item returns with its keys, except after a decision script was
+     sent (section 9, step 5). Editor text that was sent comes back
      as the item's draft when the answer fails.
    - Editor: `ctrl+e` writes the draft to
      `<state dir>/drovr-inbox/note-<pane>.md` and opens `$EDITOR` on it in a
      pane split below the focused pane of the local server; the inbox
-     reloads the file whenever it changes. Ceiling: with a remote workspace
+     reloads the file whenever it changes. The file stays when the editor
+     closes (`$EDITOR` may still run) and is reloaded when it opens again;
+     a sent answer removes it. `$EDITOR` runs through `sh`, so a value with
+     arguments works from zsh or fish. Ceiling: with a remote workspace
      on screen there is no local pane to split, so `ctrl+e` asks for a local
      workspace. A note longer than 4000 bytes (the hook's limit) is not
      sent.
@@ -492,7 +512,8 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
      Deviation: while a remote workspace is on screen, a local doc pane
      would not be visible, so the plan opens beside the agent on its
      machine instead (the remote Ctrl+click route, which needs drovr or the
-     drovr.docs plugin there).
+     drovr.docs plugin there). With a third machine on screen, neither
+     pane would be visible, so a notice asks to switch.
    - Not verified live: that a digit on Claude's AskUserQuestion and
      ExitPlanMode dialogs, and on Codex's approval dialog, picks and
      submits that option, and Codex's exact labels. The label checks fail

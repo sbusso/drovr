@@ -11,9 +11,10 @@
 //!   A decision is bound to one hook invocation, so it never answers a later
 //!   prompt.
 //! - Option keys ([`Action::Keys`]): `agent.get` (blocked, same
-//!   `state_change_seq`, same request), two `pane.read`s that both show the
-//!   item's text and the chosen label, then `agent.send_keys` with that
-//!   option's on-screen number. Keys map to labels, never to positions.
+//!   `state_change_seq`, same request), the hook's pane state listing that
+//!   request as its only pending one, two `pane.read`s whose bottom prompt
+//!   shows the item's text and the chosen label, then `agent.send_keys` with
+//!   that option's on-screen number. Keys map to labels, never to positions.
 //! - Replies ([`Action::Prompt`]): `agent.prompt`, unless the agent is
 //!   working or blocked.
 //!
@@ -34,6 +35,11 @@ use super::inbox::{ApiRoute, InboxReply};
 
 /// What a failed check reports; the inbox shows it on the item.
 pub(crate) const CHANGED: &str = "Changed in the terminal. Jump to see it.";
+/// What a decision reports when the link failed after its script may have
+/// run: the hook may have answered already, so the keys are not offered
+/// again.
+pub(crate) const UNKNOWN: &str =
+    "The answer may have been sent: the connection failed. Check the terminal.";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Exit status of the scripts when the request is no longer pending.
 const NOT_PENDING: i32 = 3;
@@ -233,15 +239,30 @@ pub(crate) fn run_answer(machine: &dyn Machine, answer: &Answer) -> Result<(), S
                 &answer.pane_id,
                 &answer.wait_id,
                 &decision.json(),
-            ))?;
-            match output.code {
-                Some(0) => Ok(()),
-                Some(NOT_PENDING) => Err(changed()),
-                _ => Err(format!("decision not written: {}", output.stderr)),
+            ));
+            match output.map(|output| output.code) {
+                Ok(Some(0)) => Ok(()),
+                Ok(Some(NOT_PENDING)) => Err(changed()),
+                // The script ran and failed before the rename.
+                Ok(Some(1)) => Err("decision not written".to_owned()),
+                // A dropped or timed-out link (ssh exits 255): the file may
+                // be written.
+                _ => Err(UNKNOWN.to_owned()),
             }
         }
         Action::Keys { text, choice } => {
             if !same_request || agent["state_change_seq"].as_u64() != Some(answer.seq) {
+                return Err(changed());
+            }
+            // drovr_wait names the oldest pending request; with another one
+            // pending (a Codex command approved in the terminal and still
+            // running), the dialog on screen may be the other one's.
+            if !valid_request_id(&answer.wait_id)
+                || machine
+                    .sh(&only_pending_script(&answer.pane_id, &answer.wait_id))?
+                    .code
+                    != Some(0)
+            {
                 return Err(changed());
             }
             let first = read_screen(machine, &answer.pane_id)?;
@@ -352,6 +373,18 @@ fn decide_script(pane_id: &str, req: &str, decision: &str) -> String {
     )
 }
 
+/// Exits 0 when the pane state lists `req` as its only pending request,
+/// [`NOT_PENDING`] otherwise. Same grep ceiling as [`decide_script`]; a
+/// `"req": "` inside a string value is escaped, so only keys match.
+fn only_pending_script(pane_id: &str, req: &str) -> String {
+    let quote = crate::remote::shell_quote;
+    format!(
+        "{STATE_ROOT}pending=$(grep -o '\"req\": \"[A-Za-z0-9]*\"' \"$root\"/{state} 2>/dev/null)\n[ \"$pending\" = {want} ] || exit {NOT_PENDING}\n",
+        state = quote(&format!("{}.json", pane_file(pane_id))),
+        want = quote(&format!("\"req\": \"{req}\"")),
+    )
+}
+
 /// Prints the plan file path of pending request `req`, a newline, then the
 /// file (at most [`PLAN_MAX_BYTES`]); exits [`NOT_PENDING`] when the request
 /// or its path is gone.
@@ -390,30 +423,74 @@ fn normalize(text: &str) -> String {
         .join(" ")
 }
 
+/// An on-screen option: its number, its numbered line, then the lines under
+/// it.
+type ScreenOption = (u8, Vec<String>);
+
 /// The numbered options of the prompt at the bottom of `screen`: the last run
 /// of lines `1. …`, `2. …` with consecutive numbers. Numbered lists above it
-/// (a plan's steps) are not options.
-pub(crate) fn screen_options(screen: &str) -> Vec<(u8, String)> {
-    let mut runs: Vec<Vec<(u8, String)>> = Vec::new();
-    for line in screen.lines() {
+/// (a plan's steps) are not options. Each option keeps the lines under its
+/// numbered line, up to a blank line: a label that wraps continues there
+/// (a question option's description too).
+#[cfg(test)]
+fn screen_options(screen: &str) -> Vec<ScreenOption> {
+    option_run(screen).map_or_else(Vec::new, |(_, run)| run)
+}
+
+/// The options of the prompt at the bottom of `screen` (see
+/// [`screen_options`]) and the index of the line of its option 1.
+fn option_run(screen: &str) -> Option<(usize, Vec<ScreenOption>)> {
+    let mut runs: Vec<(usize, Vec<ScreenOption>)> = Vec::new();
+    // Continuation lines attach to the last option until a blank line.
+    let mut open = false;
+    for (index, line) in screen.lines().enumerate() {
         let line = line.trim_matches(frame_char);
-        let Some((number, label)) = line.split_once(". ") else {
-            continue;
-        };
-        let Ok(number) = number.parse::<u8>() else {
-            continue;
-        };
-        let label = normalize(label);
-        if number == 1 {
-            runs.push(vec![(1, label)]);
-        } else if let Some(run) = runs
-            .last_mut()
-            .filter(|run| run.last().is_some_and(|(last, _)| *last + 1 == number))
-        {
-            run.push((number, label));
+        let numbered = line
+            .split_once(". ")
+            .and_then(|(number, label)| Some((number.parse::<u8>().ok()?, normalize(label))));
+        match numbered {
+            Some((1, label)) => {
+                runs.push((index, vec![(1, vec![label])]));
+                open = true;
+            }
+            Some((number, label))
+                if runs
+                    .last()
+                    .and_then(|(_, run)| run.last())
+                    .map(|(n, _)| *n + 1)
+                    == Some(number) =>
+            {
+                if let Some((_, run)) = runs.last_mut() {
+                    run.push((number, vec![label]));
+                }
+                open = true;
+            }
+            _ if line.is_empty() => open = false,
+            _ if open => {
+                if let Some((_, lines)) = runs.last_mut().and_then(|(_, run)| run.last_mut()) {
+                    lines.push(normalize(line));
+                }
+            }
+            _ => {}
         }
     }
-    runs.pop().unwrap_or_default()
+    runs.pop()
+}
+
+/// The prompt's own lines above its options: up to the nearest rule
+/// (`────`) or transcript line (`⏺`, `•`, `⎿`, `└`) above them, so text in
+/// the transcript above a dialog is not taken for the dialog's.
+fn prompt_block(screen: &str, options_at: usize) -> String {
+    let lines: Vec<&str> = screen.lines().take(options_at).collect();
+    let start = lines
+        .iter()
+        .rposition(|line| {
+            let line = line.trim();
+            (line.chars().count() >= 3 && line.chars().all(|c| matches!(c, '─' | '━' | '═')))
+                || line.starts_with(['⏺', '•', '⎿', '└'])
+        })
+        .map_or(0, |index| index + 1);
+    lines[start..].join("\n")
 }
 
 /// A label that grants a session or persistent permission; the key that
@@ -425,23 +502,30 @@ pub(crate) fn grants(label: &str) -> bool {
         .any(|word| label.contains(word))
 }
 
-fn chooses(label: &str, choice: &Choice) -> bool {
-    let lower = label.to_lowercase();
+/// Whether the option drawn as `lines` (its numbered line, then the lines
+/// under it) is the one `choice` picks.
+fn chooses(lines: &[String], choice: &Choice) -> bool {
+    let first = lines.first().map(String::as_str).unwrap_or_default();
+    let all = lines.join(" ");
     match choice {
         Choice::Label(want) => {
             let cut = want.ends_with('…');
             let want = normalize(want.trim_end_matches('…'));
+            // The numbered line alone, or with the lines a wrap moved under it.
             !want.is_empty()
-                && if cut {
-                    label.starts_with(&want)
-                } else {
-                    label == want
-                }
+                && (1..=lines.len()).any(|count| {
+                    let label = lines[..count].join(" ");
+                    if cut {
+                        label.starts_with(&want)
+                    } else {
+                        label == want
+                    }
+                })
         }
-        Choice::ApprovePlan => lower.contains("manually approve"),
-        Choice::Yes => first_word(&lower) == "yes" && !grants(label),
-        Choice::Always => first_word(&lower) == "yes" && grants(label),
-        Choice::No => first_word(&lower) == "no",
+        Choice::ApprovePlan => all.to_lowercase().contains("manually approve"),
+        Choice::Yes => first_word(&first.to_lowercase()) == "yes" && !grants(&all),
+        Choice::Always => first_word(&first.to_lowercase()) == "yes" && grants(&all),
+        Choice::No => first_word(&first.to_lowercase()) == "no",
     }
 }
 
@@ -454,8 +538,8 @@ fn first_word(label: &str) -> &str {
 
 /// The on-screen number of the one option `choice` picks, if exactly one
 /// matches.
-pub(crate) fn pick(options: &[(u8, String)], choice: &Choice) -> Option<u8> {
-    let mut found = options.iter().filter(|(_, label)| chooses(label, choice));
+pub(crate) fn pick(options: &[ScreenOption], choice: &Choice) -> Option<u8> {
+    let mut found = options.iter().filter(|(_, lines)| chooses(lines, choice));
     match (found.next(), found.next()) {
         (Some((number, _)), None) => Some(*number),
         _ => None,
@@ -469,11 +553,15 @@ pub(crate) fn shows(screen: &str, text: &str) -> bool {
     !text.is_empty() && normalize(screen).contains(&text)
 }
 
-/// The number to send: `screen` shows `text` and exactly one option that
-/// `choice` picks.
+/// The number to send: the prompt at the bottom of `screen` shows `text`
+/// above its options, and exactly one option that `choice` picks. A plan's
+/// title scrolls off above a long plan and Claude renders its Markdown, so
+/// plan approval is pinned by its one "manually approve" option and the
+/// request checks instead.
 pub(crate) fn confirm(screen: &str, text: &str, choice: &Choice) -> Option<u8> {
-    shows(screen, text)
-        .then(|| pick(&screen_options(screen), choice))
+    let (start, options) = option_run(screen)?;
+    (*choice == Choice::ApprovePlan || shows(&prompt_block(screen, start), text))
+        .then(|| pick(&options, choice))
         .flatten()
 }
 
@@ -516,12 +604,16 @@ Which layout for the inbox?
             }
         }
 
+        /// Calls that answer: keys, prompts and decision scripts (the
+        /// pending check is not one).
         fn sent(&self) -> Vec<String> {
             self.calls
                 .borrow()
                 .iter()
                 .filter(|call| {
-                    call.starts_with("send") || call.starts_with("prompt") || call.starts_with("sh")
+                    call.starts_with("send")
+                        || call.starts_with("prompt")
+                        || (call.starts_with("sh") && call.contains("decide"))
                 })
                 .cloned()
                 .collect()
@@ -588,8 +680,14 @@ Which layout for the inbox?
 
     #[test]
     fn options_map_to_on_screen_labels_not_positions() {
+        let labels = |screen: &str| -> Vec<(u8, String)> {
+            screen_options(screen)
+                .into_iter()
+                .map(|(number, lines)| (number, lines[0].clone()))
+                .collect()
+        };
         assert_eq!(
-            screen_options(QUESTION),
+            labels(QUESTION),
             [
                 (1, "two panes".to_owned()),
                 (2, "one pane".to_owned()),
@@ -627,7 +725,7 @@ Ready to code?
         let options = screen_options(screen);
         assert_eq!(options.len(), 3);
         assert_eq!(pick(&options, &Choice::ApprovePlan), Some(2));
-        assert!(grants(&options[0].1) && !grants(&options[1].1));
+        assert!(grants(&options[0].1[0]) && !grants(&options[1].1[0]));
         assert_eq!(
             confirm(screen, "Inbox answers", &Choice::ApprovePlan),
             Some(2)
@@ -715,6 +813,91 @@ Ready to code?
     }
 
     #[test]
+    fn text_counts_only_inside_the_prompt_above_its_options() {
+        // Request A's command is in the transcript above request B's dialog.
+        let codex = "\
+• Running cargo test --workspace
+
+ Allow command?
+ $ rm -rf target/x
+ › 1. Yes, proceed
+   2. No, and tell Codex what to do differently
+";
+        assert_eq!(confirm(codex, "cargo test --workspace", &Choice::Yes), None);
+        assert_eq!(confirm(codex, "rm -rf target/x", &Choice::Yes), Some(1));
+        let claude = format!("⏺ Which layout for the inbox?\n{}\n", "─".repeat(20))
+            + &QUESTION.replace("Which layout for the inbox?", "Which colour?");
+        assert_eq!(
+            confirm(
+                &claude,
+                "Which layout for the inbox?",
+                &Choice::Label("one pane".into())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn wrapped_labels_and_long_plans_are_confirmed() {
+        // A narrow pane wraps the label under its numbered line; the
+        // description follows it.
+        let narrow = "\
+Which layout for the inbox?
+
+❯ 1. Keep the current single-pane
+     layout (Recommended)
+     One pane for everything
+  2. two panes
+";
+        let want = Choice::Label("Keep the current single-pane layout (Recommended)".into());
+        assert_eq!(
+            confirm(narrow, "Which layout for the inbox?", &want),
+            Some(1)
+        );
+        assert_eq!(
+            confirm(
+                narrow,
+                "Which layout for the inbox?",
+                &Choice::Label("Keep the current".into())
+            ),
+            None
+        );
+        // The plan's title scrolled off; only the end of the plan and the
+        // options are on screen.
+        let plan = "\
+ 9. Run the checks
+ 10. Commit
+
+ Would you like to proceed?
+ ❯ 1. Yes, and auto-accept edits
+   2. Yes, and manually approve edits
+   3. No, keep planning
+";
+        assert_eq!(confirm(plan, "", &Choice::ApprovePlan), Some(2));
+        let fake = Fake::blocked(&[plan, plan]);
+        let approve = Action::Keys {
+            text: String::new(),
+            choice: Choice::ApprovePlan,
+        };
+        assert_eq!(run_answer(&fake, &answer(approve)), Ok(()));
+        assert_eq!(fake.sent(), ["send 2"]);
+    }
+
+    #[test]
+    fn keys_wait_while_another_request_is_pending() {
+        let fake = Fake {
+            sh_code: NOT_PENDING,
+            ..Fake::blocked(&[QUESTION, QUESTION])
+        };
+        assert_eq!(
+            run_answer(&fake, &answer(option("one pane"))),
+            Err(CHANGED.to_owned())
+        );
+        assert!(fake.sent().is_empty());
+        assert!(!fake.calls.borrow().iter().any(|call| call == "read"));
+    }
+
+    #[test]
     fn decisions_and_replies_check_the_agent_first() {
         let deny = || Action::Decide {
             decision: Decision::Deny("use two panes".into()),
@@ -745,6 +928,20 @@ Ready to code?
             ..Fake::blocked(&[])
         };
         assert_eq!(run_answer(&fake, &answer(deny())), Err(CHANGED.to_owned()));
+        // The link failed after the script was sent: the outcome is unknown.
+        let fake = Fake {
+            sh_code: 255,
+            ..Fake::blocked(&[])
+        };
+        assert_eq!(run_answer(&fake, &answer(deny())), Err(UNKNOWN.to_owned()));
+        let fake = Fake {
+            sh_code: 1,
+            ..Fake::blocked(&[])
+        };
+        assert_eq!(
+            run_answer(&fake, &answer(deny())),
+            Err("decision not written".to_owned())
+        );
         // A request id that is not a plain id never reaches a file name.
         let fake = Fake {
             wait: "permission|../x||Bash".into(),
@@ -821,6 +1018,25 @@ Ready to code?
             Some(NOT_PENDING)
         );
         assert!(!state.join("decide/deadbeef.json").exists());
+        // Keys only while the request is the pane's one pending request.
+        assert_eq!(run(&only_pending_script("w1:p2", "ab12cd34")).0, Some(0));
+        assert_eq!(
+            run(&only_pending_script("w1:p2", "deadbeef")).0,
+            Some(NOT_PENDING)
+        );
+        let two = r#"{"pending": [{"req": "ab12cd34", "summary": "say \"req\": \"x\""}, {"req": "ffff0000"}]}"#;
+        std::fs::write(state.join("w1_p3.json"), two).expect("pane state");
+        assert_eq!(
+            run(&only_pending_script("w1:p3", "ab12cd34")).0,
+            Some(NOT_PENDING)
+        );
+        let one = r#"{"pending": [{"req": "ab12cd34", "summary": "say \"req\": \"x\""}]}"#;
+        std::fs::write(state.join("w1_p3.json"), one).expect("pane state");
+        assert_eq!(run(&only_pending_script("w1:p3", "ab12cd34")).0, Some(0));
+        assert_eq!(
+            run(&only_pending_script("w1:p4", "ab12cd34")).0,
+            Some(NOT_PENDING)
+        );
 
         if std::process::Command::new("python3")
             .arg("-V")
