@@ -1,6 +1,18 @@
-# drovr: ship a ready rebase. Moves main to rebase/<herdr tag>, tags
-# drovr-<herdr tag>-1 and builds the release (a tag pushed by a workflow does
-# not trigger other workflows, so the release build is called directly).
+# drovr: ship a ready rebase. Moves main to rebase/<herdr tag> and tags it
+# drovr-<herdr tag>-1; the tag push starts "drovr release", which builds macOS
+# and Linux (x86_64, arm64) binaries and publishes the GitHub release.
+#
+# main is force-pushed with --force-with-lease against the main commit the
+# rebase replaced (tag drovr-rebase-base-<herdr tag>, written by drovr rebase),
+# so commits pushed to main after the rebase are never dropped: rerun
+# drovr rebase instead.
+#
+# Every step checks what is already done, so a failed run can simply be rerun.
+#
+# Required secret: DROVR_PUSH_TOKEN, a fine-grained PAT for sbusso/drovr with
+# "Contents: read and write" and "Workflows: read and write". GITHUB_TOKEN
+# cannot update main with workflow changes, and tags it pushes do not start
+# other workflows.
 name: drovr promote
 
 on:
@@ -10,32 +22,101 @@ on:
         description: 'herdr release the ready rebase is based on, e.g. v0.9.4'
         required: true
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: drovr-promote
+  cancel-in-progress: false
 
 jobs:
   promote:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.push.outputs.tag }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      HERDR_TAG: ${{ inputs.herdr_tag }}
+      PUSH_TOKEN: ${{ secrets.DROVR_PUSH_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
+      - name: Validate input and token
+        run: |
+          if ! [[ "$HERDR_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::herdr_tag must look like v0.9.4, got '$HERDR_TAG'"
+            exit 1
+          fi
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::Secret DROVR_PUSH_TOKEN is not set. Add a fine-grained PAT for $GH_REPO with Contents and Workflows read/write; GITHUB_TOKEN cannot update main with workflow changes."
+            exit 1
+          fi
+
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
-      - id: push
-        run: |
-          herdr_tag=${{ inputs.herdr_tag }}
-          git fetch origin "rebase/$herdr_tag"
-          tag="drovr-$herdr_tag-1"
-          # The rebase rewrote drovr's commits on top of the new herdr, so main
-          # moves to it (this is the one intentional force-push).
-          git push --force origin "origin/rebase/$herdr_tag:refs/heads/main"
-          git tag "$tag" "origin/rebase/$herdr_tag" && git push origin "$tag"
-          git push origin --delete "rebase/$herdr_tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          persist-credentials: false
 
-  release:
-    needs: promote
-    uses: ./.github/workflows/drovr-release.yml
-    with:
-      tag: ${{ needs.promote.outputs.tag }}
+      - name: Promote
+        run: |
+          remote="https://x-access-token:${PUSH_TOKEN}@github.com/$GH_REPO.git"
+          tag="drovr-$HERDR_TAG-1"
+          base_tag="drovr-rebase-base-$HERDR_TAG"
+          git fetch --force --tags "$remote" "+refs/heads/*:refs/remotes/origin/*"
+          sha() { git rev-parse --verify --quiet "$1^{commit}" || true; }
+
+          target=$(sha "origin/rebase/$HERDR_TAG")
+          existing_tag=$(sha "refs/tags/$tag")
+          main=$(sha origin/main)
+          if [ -z "$target" ]; then
+            # A previous run may have finished and deleted the branch.
+            target=$existing_tag
+          fi
+          if [ -z "$target" ]; then
+            echo "::error::Neither branch rebase/$HERDR_TAG nor tag $tag exists. Run drovr rebase first."
+            exit 1
+          fi
+          if [ -n "$existing_tag" ] && [ "$existing_tag" != "$target" ]; then
+            echo "::error::Tag $tag already points at $existing_tag, not $target."
+            exit 1
+          fi
+
+          if [ "$main" = "$target" ]; then
+            echo "main is already at $target"
+          else
+            expected=$(sha "refs/tags/$base_tag")
+            if [ -z "$expected" ]; then
+              echo "::error::Tag $base_tag (main before the rebase) is missing. Delete branch rebase/$HERDR_TAG and rerun drovr rebase."
+              exit 1
+            fi
+            if [ "$main" != "$expected" ]; then
+              echo "::error::main moved from $expected to $main after the rebase was made. Delete branch rebase/$HERDR_TAG and rerun drovr rebase."
+              exit 1
+            fi
+            # The rebase rewrote drovr's commits on top of the new herdr, so
+            # main moves to it (the one intentional force-push).
+            git push --force-with-lease="refs/heads/main:$expected" "$remote" "$target:refs/heads/main"
+          fi
+
+          if [ -z "$existing_tag" ]; then
+            # Pushed with the PAT so that it starts drovr release.
+            git push "$remote" "$target:refs/tags/$tag"
+          else
+            echo "tag $tag already exists; rerun drovr release for it if the release is missing"
+          fi
+
+          if git ls-remote --exit-code "$remote" "refs/heads/rebase/$HERDR_TAG" >/dev/null; then
+            git push "$remote" --delete "refs/heads/rebase/$HERDR_TAG"
+          fi
+          if git ls-remote --exit-code "$remote" "refs/tags/$base_tag" >/dev/null; then
+            git push "$remote" --delete "refs/tags/$base_tag"
+          fi
+          echo "Promoted $target as $tag. Release build: $GITHUB_SERVER_URL/$GH_REPO/actions/workflows/drovr-release.yml" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close the rebase issue
+        run: |
+          title="drovr rebase onto herdr $HERDR_TAG"
+          gh issue list --state open --limit 100 --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" \
+          | while read -r number; do
+              gh issue close "$number" --comment "Promoted to main and tagged drovr-$HERDR_TAG-1."
+            done
