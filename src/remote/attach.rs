@@ -2930,8 +2930,10 @@ fn ssh_user_config_include(path: Option<&Path>) -> Option<String> {
 fn write_managed_ssh_config(target: &str) -> io::Result<ManagedSshConfig> {
     let paths = crate::platform::remote_ssh_config_paths();
     let control_path = if paths.multiplexing {
+        // drovr fork: herdr's path, so creating a drovr config does not
+        // move the shared SSH control sockets.
         Some(crate::platform::shared_ssh_control_path(
-            &crate::config::config_path(),
+            &crate::config::herdr_config_path(),
             target,
         )?)
     } else {

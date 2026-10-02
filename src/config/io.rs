@@ -192,11 +192,43 @@ pub(super) fn resolve_config_relative_path(path: &Path) -> PathBuf {
         .join(path)
 }
 
+/// The config file drovr reads and writes: `HERDR_CONFIG_PATH`, else the
+/// drovr file when it exists, else herdr's file.
 pub fn config_path() -> PathBuf {
+    if std::env::var_os(CONFIG_PATH_ENV_VAR).is_some() {
+        return herdr_config_path();
+    }
+    select_config_path(drovr_config_path(), herdr_config_path())
+}
+
+/// drovr fork: herdr's config file, ignoring the drovr file. Names things
+/// that must stay the same whether or not a drovr config exists.
+pub fn herdr_config_path() -> PathBuf {
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
         return PathBuf::from(path);
     }
     config_dir().join("config.toml")
+}
+
+/// drovr fork: `drovr/config.toml` beside herdr's config directory
+/// (`drovr-dev` for debug builds, like `herdr-dev`).
+fn drovr_config_path() -> PathBuf {
+    let name = if cfg!(debug_assertions) {
+        "drovr-dev"
+    } else {
+        "drovr"
+    };
+    config_dir().with_file_name(name).join("config.toml")
+}
+
+/// The drovr file when it exists; otherwise herdr's, so a herdr setup keeps
+/// working until the user creates a drovr config.
+fn select_config_path(drovr: PathBuf, herdr: PathBuf) -> PathBuf {
+    if drovr.is_file() {
+        drovr
+    } else {
+        herdr
+    }
 }
 
 pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
@@ -749,6 +781,20 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drovr_config_wins_when_it_exists_else_herdr() {
+        let dir = std::env::temp_dir().join(format!("drovr-config-path-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("drovr")).unwrap();
+        let (drovr, herdr) = (dir.join("drovr/config.toml"), dir.join("herdr/config.toml"));
+        assert_eq!(
+            super::select_config_path(drovr.clone(), herdr.clone()),
+            herdr
+        );
+        std::fs::write(&drovr, "").unwrap();
+        assert_eq!(super::select_config_path(drovr.clone(), herdr), drovr);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
