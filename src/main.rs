@@ -22,6 +22,7 @@ mod client;
 mod config;
 mod copy_mode;
 mod detect;
+mod doc_view;
 mod events;
 use ghostty_vt as ghostty;
 mod handoff_runtime;
@@ -548,6 +549,17 @@ fn main() -> io::Result<()> {
         eprintln!("error: --remote can only be used with the default launch command");
         eprintln!("run 'herdr --help' for usage");
         std::process::exit(2);
+    }
+
+    // drovr fork: Markdown document viewer for a herdr pane.
+    if args.get(1).map(String::as_str) == Some("doc")
+        && args.get(2).map(String::as_str) == Some("view")
+    {
+        let Some(path) = args.get(3) else {
+            eprintln!("usage: drovr doc view <path>");
+            std::process::exit(2);
+        };
+        return doc_view::run_doc_view(std::path::Path::new(path));
     }
 
     finish_cli(cli::maybe_run(&args))?;

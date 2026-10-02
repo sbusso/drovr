@@ -1,0 +1,1100 @@
+//! `drovr doc view <path>`: a full-screen Markdown viewer that runs inside a
+//! herdr pane, reloads the file when it changes and follows links.
+
+mod render;
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
+
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
+
+use render::{line_text, Doc, RLine, Theme};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const WHEEL_LINES: usize = 3;
+/// Metadata source and token other drovr commands use to find doc panes.
+pub const METADATA_SOURCE: &str = "drovr";
+pub const METADATA_TOKEN: &str = "drovr_doc";
+
+/// Control file `drovr doc open` writes to point an existing viewer pane at
+/// another document.
+pub fn control_file_path(pane_id: &str) -> PathBuf {
+    crate::config::state_dir()
+        .join("drovr")
+        .join(format!("doc-pane-{pane_id}.path"))
+}
+
+/// Where a link points, relative to the document that contains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Anchor(String),
+    Doc(PathBuf, Option<String>),
+    File(PathBuf),
+    External(String),
+}
+
+pub fn resolve_link(url: &str, current: &Path) -> Target {
+    let url = url.trim();
+    let file_url = url.strip_prefix("file://");
+    if file_url.is_none() && has_scheme(url) {
+        return Target::External(url.to_string());
+    }
+    let url = file_url.unwrap_or(url);
+    let (path, anchor) = match url.split_once('#') {
+        Some((path, anchor)) => (path, Some(anchor.to_string()).filter(|a| !a.is_empty())),
+        None => (url, None),
+    };
+    let path = render::percent_decode(path.split('?').next().unwrap_or(""));
+    if path.is_empty() {
+        return match anchor {
+            Some(anchor) => Target::Anchor(anchor),
+            None => Target::Doc(current.to_path_buf(), None),
+        };
+    }
+    let resolved = if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(&path))
+    } else if Path::new(&path).is_absolute() {
+        PathBuf::from(&path)
+    } else {
+        current.parent().unwrap_or(Path::new("/")).join(&path)
+    };
+    let resolved = normalize(&resolved);
+    if is_markdown(&resolved) {
+        Target::Doc(resolved, anchor)
+    } else {
+        Target::File(resolved)
+    }
+}
+
+fn has_scheme(url: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    // A single letter is a Windows drive, not a scheme.
+    scheme.len() > 1
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["md", "markdown", "mdown", "mkd"]
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+/// Lexically removes `.` and `..` so the back stack and header show clean paths.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Side effects the viewer asks the event loop to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+    OpenExternal(String),
+    OpenFile(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+pub struct Viewer {
+    path: PathBuf,
+    source: Result<String, String>,
+    stamp: Option<Stamp>,
+    updated: Option<String>,
+    theme: Theme,
+    doc: Doc,
+    width: u16,
+    height: usize,
+    scroll: usize,
+    back: Vec<(PathBuf, usize)>,
+    selected: Option<usize>,
+    search_input: Option<String>,
+    query: Option<String>,
+    last_match: Option<usize>,
+    message: Option<String>,
+    pending_anchor: Option<String>,
+    control_path: Option<PathBuf>,
+    control_seen: Option<String>,
+    /// Set whenever the shown path changes, so the loop can report metadata.
+    path_changed: bool,
+}
+
+impl Viewer {
+    pub fn new(path: PathBuf, theme: Theme, control_path: Option<PathBuf>) -> Self {
+        let control_seen = control_path
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        let mut viewer = Self {
+            path,
+            source: Err(String::new()),
+            stamp: None,
+            updated: None,
+            theme,
+            doc: Doc::default(),
+            width: 80,
+            height: 20,
+            scroll: 0,
+            back: Vec::new(),
+            selected: None,
+            search_input: None,
+            query: None,
+            last_match: None,
+            message: None,
+            pending_anchor: None,
+            control_path,
+            control_seen,
+            path_changed: true,
+        };
+        viewer.load();
+        viewer
+    }
+
+    fn load(&mut self) {
+        self.stamp = stamp(&self.path);
+        self.source = match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(err) => Err(err.to_string()),
+        };
+        self.rerender();
+    }
+
+    fn rerender(&mut self) {
+        self.doc = match &self.source {
+            Ok(text) => render::render(text, self.width, &self.theme),
+            Err(err) => self.missing_doc(err),
+        };
+        if self
+            .selected
+            .is_some_and(|index| index >= self.doc.links.len())
+        {
+            self.selected = None;
+        }
+        if let Some(anchor) = self.pending_anchor.take() {
+            if !self.jump_to_anchor(&anchor) && self.source.is_err() {
+                self.pending_anchor = Some(anchor);
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    fn missing_doc(&self, err: &str) -> Doc {
+        let warn = Style::default()
+            .fg(self.theme.warn)
+            .add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(self.theme.dim);
+        let span = |text: String, style| render::RSpan {
+            text,
+            style,
+            link: None,
+        };
+        Doc {
+            lines: vec![
+                vec![span("Cannot read this document.".into(), warn)],
+                vec![],
+                vec![span(self.path.display().to_string(), Style::default())],
+                vec![span(err.to_string(), dim)],
+                vec![],
+                vec![span(
+                    "Waiting for it to appear; the view refreshes on its own.".into(),
+                    dim,
+                )],
+            ],
+            ..Doc::default()
+        }
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.height = usize::from(height.saturating_sub(2)).max(1);
+        if width != self.width {
+            self.width = width;
+            self.rerender();
+        } else {
+            self.clamp_scroll();
+        }
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.doc.lines.len().saturating_sub(self.height)
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn scroll_by(&mut self, delta: isize) {
+        self.scroll = self.scroll.saturating_add_signed(delta);
+        self.clamp_scroll();
+    }
+
+    fn scroll_to_line(&mut self, line: usize) {
+        self.scroll = line;
+        self.clamp_scroll();
+    }
+
+    /// Reloads when the file's mtime or size changed. Returns true on change.
+    pub fn poll_file(&mut self) -> bool {
+        let current = stamp(&self.path);
+        if current == self.stamp && (current.is_some() || self.source.is_err()) {
+            return false;
+        }
+        let scroll = self.scroll;
+        self.load();
+        self.scroll = scroll;
+        self.clamp_scroll();
+        self.updated = Some(local_time());
+        true
+    }
+
+    /// Follows `drovr doc open` requests written to the control file.
+    pub fn poll_control(&mut self) -> bool {
+        let Some(path) = self.control_path.as_deref() else {
+            return false;
+        };
+        let content = std::fs::read_to_string(path).ok();
+        if content == self.control_seen {
+            return false;
+        }
+        self.control_seen = content.clone();
+        let Some(target) = content
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+        else {
+            return false;
+        };
+        let target = PathBuf::from(target);
+        if target == self.path {
+            self.load();
+        } else {
+            self.open_doc(target, None);
+        }
+        true
+    }
+
+    pub fn open_doc(&mut self, path: PathBuf, anchor: Option<String>) {
+        if path == self.path {
+            if let Some(anchor) = anchor {
+                self.jump_to_anchor(&anchor);
+            }
+            return;
+        }
+        self.back
+            .push((std::mem::replace(&mut self.path, path), self.scroll));
+        self.after_switch(0, anchor);
+    }
+
+    pub fn go_back(&mut self) -> bool {
+        let Some((path, scroll)) = self.back.pop() else {
+            return false;
+        };
+        self.path = path;
+        self.after_switch(scroll, None);
+        true
+    }
+
+    fn after_switch(&mut self, scroll: usize, anchor: Option<String>) {
+        self.selected = None;
+        self.query = None;
+        self.last_match = None;
+        self.updated = None;
+        self.message = None;
+        self.pending_anchor = anchor;
+        self.scroll = scroll;
+        self.path_changed = true;
+        self.load();
+        self.clamp_scroll();
+    }
+
+    fn jump_to_anchor(&mut self, anchor: &str) -> bool {
+        match self.doc.anchor_line(anchor) {
+            Some(line) => {
+                self.scroll_to_line(line);
+                true
+            }
+            None => {
+                self.message = Some(format!("no heading #{anchor}"));
+                false
+            }
+        }
+    }
+
+    fn select_link(&mut self, forward: bool) {
+        let count = self.doc.links.len();
+        if count == 0 {
+            self.message = Some("no links in this document".into());
+            return;
+        }
+        let next = match self.selected {
+            Some(index) if forward => (index + 1) % count,
+            Some(index) => (index + count - 1) % count,
+            None if forward => self
+                .doc
+                .links
+                .iter()
+                .position(|link| link.line >= self.scroll)
+                .unwrap_or(0),
+            None => self
+                .doc
+                .links
+                .iter()
+                .rposition(|link| link.line < self.scroll + self.height)
+                .unwrap_or(count - 1),
+        };
+        self.selected = Some(next);
+        let line = self.doc.links[next].line;
+        if line < self.scroll || line >= self.scroll + self.height {
+            self.scroll_to_line(line.saturating_sub(self.height / 3));
+        }
+    }
+
+    pub fn follow(&mut self, index: usize) -> Action {
+        let Some(link) = self.doc.links.get(index) else {
+            return Action::None;
+        };
+        match resolve_link(&link.url, &self.path) {
+            Target::Anchor(anchor) => {
+                self.jump_to_anchor(&anchor);
+                Action::None
+            }
+            Target::Doc(path, anchor) => {
+                self.open_doc(path, anchor);
+                Action::None
+            }
+            Target::File(path) => Action::OpenFile(path),
+            Target::External(url) => Action::OpenExternal(url),
+        }
+    }
+
+    fn matches(&self) -> Vec<usize> {
+        let Some(query) = self.query.as_deref().filter(|q| !q.is_empty()) else {
+            return Vec::new();
+        };
+        let query = query.to_lowercase();
+        self.doc
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_text(line).to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn jump_match(&mut self, forward: bool) {
+        let matches = self.matches();
+        if matches.is_empty() {
+            if let Some(query) = &self.query {
+                self.message = Some(format!("not found: {query}"));
+            }
+            return;
+        }
+        let found = match (self.last_match, forward) {
+            (None, _) => matches.iter().find(|&&line| line >= self.scroll),
+            (Some(last), true) => matches.iter().find(|&&line| line > last),
+            (Some(last), false) => matches.iter().rev().find(|&&line| line < last),
+        };
+        let line = match found {
+            Some(&line) => line,
+            None if forward => matches[0],
+            None => matches[matches.len() - 1],
+        };
+        self.last_match = Some(line);
+        self.scroll_to_line(line.saturating_sub(2));
+        let position = matches.iter().position(|&l| l == line).unwrap_or(0);
+        self.message = Some(format!("match {}/{}", position + 1, matches.len()));
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind == KeyEventKind::Release {
+            return Action::None;
+        }
+        if let Some(input) = self.search_input.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.search_input = None,
+                KeyCode::Enter => {
+                    let query = self.search_input.take().unwrap_or_default();
+                    self.query = (!query.is_empty()).then_some(query);
+                    self.last_match = None;
+                    self.jump_match(true);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(c),
+                _ => {}
+            }
+            return Action::None;
+        }
+        self.message = None;
+        let page = self.height.saturating_sub(1).max(1) as isize;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => return Action::Quit,
+            KeyCode::Char('d') if ctrl => self.scroll_by(page / 2),
+            KeyCode::Char('u') if ctrl => self.scroll_by(-page / 2),
+            KeyCode::Char('f') if ctrl => self.scroll_by(page),
+            KeyCode::Char('b') if ctrl => self.scroll_by(-page),
+            KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page),
+            KeyCode::PageUp => self.scroll_by(-page),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
+            KeyCode::Tab => self.select_link(true),
+            KeyCode::BackTab => self.select_link(false),
+            KeyCode::Enter => {
+                if let Some(index) = self.selected {
+                    return self.follow(index);
+                }
+            }
+            KeyCode::Backspace | KeyCode::Char('b') => {
+                if !self.go_back() {
+                    self.message = Some("no previous document".into());
+                }
+            }
+            KeyCode::Char('/') => self.search_input = Some(String::new()),
+            KeyCode::Char('n') => self.jump_match(true),
+            KeyCode::Char('N') => self.jump_match(false),
+            KeyCode::Char('r') => {
+                self.load();
+                self.updated = Some(local_time());
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
+            MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_LINES as isize)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = self.link_at(mouse.column, mouse.row) {
+                    self.selected = Some(index);
+                    return self.follow(index);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Link under a screen cell. Row 0 is the header line.
+    fn link_at(&self, column: u16, row: u16) -> Option<usize> {
+        let row = usize::from(row).checked_sub(1)?;
+        if row >= self.height {
+            return None;
+        }
+        let line = self.doc.lines.get(self.scroll + row)?;
+        let mut x = 0;
+        for span in line {
+            let width = span.text.width();
+            if usize::from(column) < x + width {
+                return span.link;
+            }
+            x += width;
+        }
+        None
+    }
+
+    fn header(&self) -> Line<'static> {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string());
+        let dir = self
+            .path
+            .parent()
+            .map(|p| abbreviate_home(p) + "/")
+            .unwrap_or_default();
+        let dim = Style::default().fg(self.theme.dim);
+        let mut spans = vec![
+            Span::styled(
+                format!(" {name}"),
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {dir}"), dim),
+        ];
+        if let Some(updated) = &self.updated {
+            spans.push(Span::styled(
+                format!("  updated {updated}"),
+                Style::default().fg(self.theme.checked),
+            ));
+        }
+        if !self.back.is_empty() {
+            spans.push(Span::styled(format!("  ← {}", self.back.len()), dim));
+        }
+        Line::from(spans)
+    }
+
+    fn status(&self, width: usize) -> Line<'static> {
+        let dim = Style::default().fg(self.theme.dim);
+        if let Some(input) = &self.search_input {
+            return Line::from(vec![
+                Span::styled("/", Style::default().fg(self.theme.accent)),
+                Span::raw(input.clone()),
+                Span::styled("█", dim),
+            ]);
+        }
+        let left = if let Some(message) = &self.message {
+            Span::styled(format!(" {message}"), Style::default().fg(self.theme.warn))
+        } else if let Some(link) = self.selected.and_then(|i| self.doc.links.get(i)) {
+            Span::styled(
+                format!(" → {}", link.url),
+                Style::default().fg(self.theme.link),
+            )
+        } else {
+            Span::styled(
+                " j/k scroll  tab links  enter open  b back  / search  q quit",
+                dim,
+            )
+        };
+        let total = self.doc.lines.len();
+        let position = if total <= self.height {
+            "all".to_string()
+        } else {
+            format!("{}%", (self.scroll + self.height).min(total) * 100 / total)
+        };
+        let gap = width.saturating_sub(left.content.width() + position.width() + 1);
+        Line::from(vec![
+            left,
+            Span::raw(" ".repeat(gap)),
+            Span::styled(position, dim),
+        ])
+    }
+
+    fn styled_line(&self, line: &RLine) -> Line<'static> {
+        let query = self
+            .query
+            .as_deref()
+            .filter(|q| !q.is_empty())
+            .map(str::to_lowercase);
+        let match_style = Style::default()
+            .fg(self.theme.match_fg)
+            .bg(self.theme.match_bg);
+        let mut spans = Vec::new();
+        for span in line {
+            let mut style = span.style;
+            if span.link.is_some() && span.link == self.selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            match &query {
+                Some(query) => {
+                    for (text, hit) in split_matches(&span.text, query) {
+                        spans.push(Span::styled(
+                            text,
+                            if hit { style.patch(match_style) } else { style },
+                        ));
+                    }
+                }
+                None => spans.push(Span::styled(span.text.clone(), style)),
+            }
+        }
+        Line::from(spans)
+    }
+
+    pub fn draw(&self, frame: &mut Frame) {
+        let area = frame.area();
+        frame.render_widget(
+            Paragraph::new(self.header()),
+            Rect::new(area.x, area.y, area.width, 1.min(area.height)),
+        );
+        let body_height = area.height.saturating_sub(2);
+        let lines: Vec<Line> = self
+            .doc
+            .lines
+            .iter()
+            .skip(self.scroll)
+            .take(usize::from(body_height))
+            .map(|line| self.styled_line(line))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(area.x, area.y + 1, area.width, body_height),
+        );
+        if area.height >= 2 {
+            frame.render_widget(
+                Paragraph::new(self.status(usize::from(area.width))),
+                Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+            );
+        }
+    }
+}
+
+/// Splits `text` into pieces flagged as search hits (case-insensitive).
+fn split_matches(text: &str, query: &str) -> Vec<(String, bool)> {
+    let lower = text.to_lowercase();
+    // Lowercasing can change byte lengths outside ASCII; fall back to no
+    // highlight for such spans rather than slicing at a bad boundary.
+    if lower.len() != text.len() || query.is_empty() {
+        return vec![(text.to_string(), false)];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(found) = lower[start..].find(query) {
+        let begin = start + found;
+        if begin > start {
+            out.push((text[start..begin].to_string(), false));
+        }
+        out.push((text[begin..begin + query.len()].to_string(), true));
+        start = begin + query.len();
+    }
+    if start < text.len() {
+        out.push((text[start..].to_string(), false));
+    }
+    out
+}
+
+fn abbreviate_home(path: &Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
+            format!("~{}", &shown[home.len()..])
+        }
+        _ => shown,
+    }
+}
+
+fn local_time() -> String {
+    crate::platform::local_datetime()
+        .map(|t| format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second()))
+        .unwrap_or_default()
+}
+
+fn herdr_pane_id() -> Option<String> {
+    std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Runs this binary's herdr CLI in the background, output discarded.
+fn spawn_cli(args: Vec<String>) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = Command::new(exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+}
+
+fn report_doc(pane_id: &str, path: &Path) {
+    spawn_cli(vec![
+        "pane".into(),
+        "report-metadata".into(),
+        pane_id.into(),
+        "--source".into(),
+        METADATA_SOURCE.into(),
+        "--token".into(),
+        format!("{METADATA_TOKEN}={}", path.display()),
+    ]);
+}
+
+fn clear_doc_report(pane_id: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = Command::new(exe)
+        .args([
+            "pane",
+            "report-metadata",
+            pane_id,
+            "--source",
+            METADATA_SOURCE,
+            "--clear-token",
+            METADATA_TOKEN,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Opens a non-Markdown file: `$EDITOR` in a new herdr pane when running
+/// inside herdr, the OS opener otherwise.
+fn open_file(path: &Path) -> String {
+    if let Some(pane_id) = herdr_pane_id() {
+        let Ok(exe) = std::env::current_exe() else {
+            return "cannot locate drovr binary".into();
+        };
+        let editor = std::env::var("EDITOR")
+            .ok()
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or_else(|| "vi".into());
+        let cwd = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let command = format!("{editor} {}", shell_quote(&path.display().to_string()));
+        std::thread::spawn(move || {
+            let Ok(output) = Command::new(&exe)
+                .args(["pane", "split", &pane_id, "--direction", "right", "--focus"])
+                .arg("--cwd")
+                .arg(&cwd)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            else {
+                return;
+            };
+            let new_pane = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|v| v["result"]["pane"]["pane_id"].as_str().map(String::from));
+            if let Some(new_pane) = new_pane {
+                let _ = Command::new(&exe)
+                    .args(["pane", "run", &new_pane, &command])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        return format!("opening {} in $EDITOR", path.display());
+    }
+    open_external(&path.display().to_string())
+}
+
+fn open_external(url: &str) -> String {
+    match crate::platform::open_url(url) {
+        Ok(Some(mut child)) => {
+            std::thread::spawn(move || child.wait());
+            format!("opened {url}")
+        }
+        Ok(None) => format!("no opener available for {url}"),
+        Err(err) => format!("cannot open {url}: {err}"),
+    }
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+}
+
+pub fn run_doc_view(path: &Path) -> io::Result<()> {
+    let path = normalize(&std::path::absolute(path)?);
+    let palette = crate::app::client_palette_from_config(&crate::config::Config::load().config);
+    let pane_id = herdr_pane_id();
+    let control_path = pane_id.as_deref().map(control_file_path);
+    let mut viewer = Viewer::new(path, Theme::from_palette(&palette), control_path);
+
+    enable_raw_mode()?;
+    let _guard = TerminalGuard;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous_hook(info);
+    }));
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
+
+    let mut next_poll = Instant::now() + POLL_INTERVAL;
+    loop {
+        if viewer.path_changed {
+            viewer.path_changed = false;
+            if let Some(pane_id) = &pane_id {
+                report_doc(pane_id, &viewer.path);
+            }
+        }
+        let size = terminal.size()?;
+        viewer.resize(size.width, size.height);
+        terminal.draw(|frame| viewer.draw(frame))?;
+
+        let timeout = next_poll.saturating_duration_since(Instant::now());
+        if event::poll(timeout)? {
+            let action = match event::read()? {
+                Event::Key(key) => viewer.handle_key(key),
+                Event::Mouse(mouse) => viewer.handle_mouse(mouse),
+                _ => Action::None,
+            };
+            match action {
+                Action::None => {}
+                Action::Quit => break,
+                Action::OpenExternal(url) => viewer.message = Some(open_external(&url)),
+                Action::OpenFile(path) => viewer.message = Some(open_file(&path)),
+            }
+        }
+        if Instant::now() >= next_poll {
+            viewer.poll_control();
+            viewer.poll_file();
+            next_poll = Instant::now() + POLL_INTERVAL;
+        }
+    }
+    drop(terminal);
+    if let Some(pane_id) = &pane_id {
+        clear_doc_report(pane_id);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::Palette;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "drovr-doc-view-{}-{name}-{:?}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn viewer(path: PathBuf, control: Option<PathBuf>) -> Viewer {
+        let mut viewer = Viewer::new(path, Theme::from_palette(&Palette::catppuccin()), control);
+        viewer.resize(40, 12);
+        viewer
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn numbered(count: usize) -> String {
+        (0..count).map(|i| format!("line {i}\n\n")).collect()
+    }
+
+    #[test]
+    fn resolves_relative_absolute_anchor_and_external_links() {
+        let current = Path::new("/docs/plans/plan.md");
+        assert_eq!(
+            resolve_link("../notes.md#next-step", current),
+            Target::Doc(PathBuf::from("/docs/notes.md"), Some("next-step".into()))
+        );
+        assert_eq!(
+            resolve_link("./sub/a%20b.MD", current),
+            Target::Doc(PathBuf::from("/docs/plans/sub/a b.MD"), None)
+        );
+        assert_eq!(
+            resolve_link("/etc/hosts", current),
+            Target::File(PathBuf::from("/etc/hosts"))
+        );
+        assert_eq!(
+            resolve_link("file:///tmp/x.md", current),
+            Target::Doc(PathBuf::from("/tmp/x.md"), None)
+        );
+        assert_eq!(
+            resolve_link("#intro", current),
+            Target::Anchor("intro".into())
+        );
+        assert_eq!(
+            resolve_link("https://example.com/a.md", current),
+            Target::External("https://example.com/a.md".into())
+        );
+        assert_eq!(
+            resolve_link("mailto:a@b.c", current),
+            Target::External("mailto:a@b.c".into())
+        );
+        assert_eq!(
+            resolve_link("src/main.rs", current),
+            Target::File(PathBuf::from("/docs/plans/src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn links_navigate_with_a_back_stack() {
+        let dir = TempDir::new("nav");
+        let main = dir.write(
+            "main.md",
+            &format!("[next](next.md#target)\n\n{}", numbered(10)),
+        );
+        dir.write("next.md", &format!("{}# Target\n\ntext", numbered(20)));
+        let mut v = viewer(main.clone(), None);
+        v.scroll_by(3);
+        v.handle_key(key(KeyCode::Tab));
+        assert_eq!(v.selected, Some(0));
+        assert_eq!(v.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(v.path, dir.0.join("next.md"));
+        let target = v.doc.anchor_line("target").unwrap();
+        assert_eq!(v.scroll, target.min(v.max_scroll()));
+        assert_eq!(v.back, vec![(main.clone(), 0)]);
+        v.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(v.path, main);
+        assert!(v.back.is_empty());
+        v.handle_key(key(KeyCode::Backspace));
+        assert_eq!(v.message.as_deref(), Some("no previous document"));
+    }
+
+    #[test]
+    fn back_restores_scroll() {
+        let dir = TempDir::new("back");
+        let main = dir.write("main.md", &numbered(30));
+        let other = dir.write("other.md", "other");
+        let mut v = viewer(main.clone(), None);
+        v.scroll_by(15);
+        v.open_doc(other.clone(), None);
+        assert_eq!(v.scroll, 0);
+        assert!(v.go_back());
+        assert_eq!((v.path.clone(), v.scroll), (main, 15));
+    }
+
+    #[test]
+    fn reload_keeps_scroll_and_clamps_it() {
+        let dir = TempDir::new("reload");
+        let path = dir.write("doc.md", &numbered(30));
+        let mut v = viewer(path.clone(), None);
+        v.scroll_by(20);
+        assert!(!v.poll_file());
+        std::fs::write(&path, numbered(31)).unwrap();
+        assert!(v.poll_file());
+        assert_eq!(v.scroll, 20);
+        assert!(v.updated.is_some());
+        std::fs::write(&path, numbered(5)).unwrap();
+        assert!(v.poll_file());
+        assert_eq!(v.scroll, v.max_scroll());
+    }
+
+    #[test]
+    fn missing_file_shows_message_and_loads_when_created() {
+        let dir = TempDir::new("missing");
+        let path = dir.0.join("later.md");
+        let mut v = viewer(path.clone(), None);
+        assert!(line_text(&v.doc.lines[0]).contains("Cannot read"));
+        assert!(!v.poll_file());
+        std::fs::write(&path, "# Ready").unwrap();
+        assert!(v.poll_file());
+        assert_eq!(line_text(&v.doc.lines[0]), "Ready");
+    }
+
+    #[test]
+    fn control_file_switches_document() {
+        let dir = TempDir::new("control");
+        let first = dir.write("first.md", "first");
+        let second = dir.write("second.md", "second");
+        let control = dir.write("pane.path", "stale");
+        let mut v = viewer(first.clone(), Some(control.clone()));
+        assert!(!v.poll_control());
+        std::fs::write(&control, format!("{}\n", second.display())).unwrap();
+        assert!(v.poll_control());
+        assert_eq!(v.path, second);
+        assert_eq!(v.back.len(), 1);
+        assert_eq!(line_text(&v.doc.lines[0]), "second");
+    }
+
+    #[test]
+    fn search_jumps_between_matches() {
+        let dir = TempDir::new("search");
+        let path = dir.write(
+            "doc.md",
+            &format!("{}Needle\n\n{}needle", numbered(10), numbered(10)),
+        );
+        let mut v = viewer(path, None);
+        v.handle_key(key(KeyCode::Char('/')));
+        for c in "needle".chars() {
+            v.handle_key(key(KeyCode::Char(c)));
+        }
+        v.handle_key(key(KeyCode::Enter));
+        assert_eq!(v.scroll, 20 - 2);
+        v.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(v.scroll, v.max_scroll());
+        v.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(v.scroll, 18);
+        assert_eq!(
+            split_matches("a Needle b", "needle"),
+            vec![
+                ("a ".to_string(), false),
+                ("Needle".to_string(), true),
+                (" b".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn mouse_click_follows_link_under_cursor() {
+        let dir = TempDir::new("mouse");
+        let main = dir.write("main.md", "go [there](#end)\n\n# End");
+        let mut v = viewer(main, None);
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(v.link_at(0, 1), None);
+        assert_eq!(v.link_at(4, 1), Some(0));
+        assert_eq!(v.handle_mouse(click(4)), Action::None);
+        assert_eq!(v.selected, Some(0));
+    }
+}
