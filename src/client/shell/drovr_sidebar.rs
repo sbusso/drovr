@@ -1,4 +1,4 @@
-//! andreconde fork (sheprd): one combined sidebar for 2+ machines.
+//! drovr fork: one combined sidebar for 2+ machines.
 //!
 //! Replaces upstream's "machines" + "agents" split with a single list:
 //! project headers (pinned first), then "Other" for everything ungrouped, with
@@ -429,7 +429,7 @@ pub(super) fn render_panel(
     } else {
         " ○ all agents"
     };
-    hits.sheprd_filter_toggle = Rect::new(inner.x, inner.y, display_width(filter), 1);
+    hits.drovr_filter_toggle = Rect::new(inner.x, inner.y, display_width(filter), 1);
     put_text(
         buffer,
         inner.x,
@@ -446,11 +446,11 @@ pub(super) fn render_panel(
     );
     // Attention counter: how many agents need you; click = next one (prefix+u).
     let (needing, blocked) = attention_count(endpoints, &layout);
-    hits.sheprd_attention = Rect::default();
+    hits.drovr_attention = Rect::default();
     if needing > 0 {
         let counter = format!(" ● {needing}");
         let x = inner.x + display_width(filter);
-        hits.sheprd_attention = Rect::new(x, inner.y, display_width(&counter), 1);
+        hits.drovr_attention = Rect::new(x, inner.y, display_width(&counter), 1);
         put_text(
             buffer,
             x,
@@ -472,7 +472,7 @@ pub(super) fn render_panel(
         "detailed "
     };
     let view_width = display_width(view);
-    hits.sheprd_view_toggle = Rect::new(
+    hits.drovr_view_toggle = Rect::new(
         inner.right().saturating_sub(view_width),
         inner.y,
         view_width,
@@ -814,7 +814,7 @@ fn render_row(
             }
             hits.endpoint_agents
                 .push((rect, endpoint.endpoint_id.clone(), pane_id.clone()));
-            hits.sheprd_rows.push(RowHit {
+            hits.drovr_rows.push(RowHit {
                 rect,
                 endpoint_id: endpoint.endpoint_id.clone(),
                 workspace_id: workspace_id.clone(),
@@ -884,7 +884,7 @@ fn render_row(
             if *stale || *hidden || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
             }
-            hits.sheprd_rows.push(RowHit {
+            hits.drovr_rows.push(RowHit {
                 rect,
                 endpoint_id: endpoint.endpoint_id.clone(),
                 workspace_id: workspace_id.clone(),
@@ -990,7 +990,7 @@ fn rail_projects(
     projects
 }
 
-/// andreconde fork (sheprd): the collapsed sidebar as a 3-column project rail:
+/// drovr fork: the collapsed sidebar as a 3-column project rail:
 /// needs-you counter, one row per project (worst status + 2-letter tag), the
 /// current project's name written vertically, and the expand toggle.
 pub(super) fn render_collapsed(
@@ -1013,7 +1013,7 @@ pub(super) fn render_collapsed(
     let (needing, blocked) = attention_count(state.endpoints, &layout);
     if needing > 0 {
         let counter = format!("●{}", needing.min(99));
-        hits.sheprd_attention = Rect::new(area.x, y, width, 1);
+        hits.drovr_attention = Rect::new(area.x, y, width, 1);
         put_text(
             buffer,
             area.x,
@@ -1067,7 +1067,7 @@ pub(super) fn render_collapsed(
                 })
                 .add_modifier(Modifier::BOLD),
         );
-        hits.sheprd_rail.push((rect, project.key.clone()));
+        hits.drovr_rail.push((rect, project.key.clone()));
         y += 1;
         if project.current && project.key != OTHER {
             // The project you're in, spelled downwards (up to 8 letters).
@@ -1083,7 +1083,7 @@ pub(super) fn render_collapsed(
                     &letter.to_string(),
                     Style::default().fg(palette.accent),
                 );
-                hits.sheprd_rail
+                hits.drovr_rail
                     .push((Rect::new(area.x, y, width, 1), project.key.clone()));
                 y += 1;
             }

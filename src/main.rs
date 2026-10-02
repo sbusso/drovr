@@ -572,23 +572,23 @@ fn main() -> io::Result<()> {
         return client::run_client();
     }
 
-    // andreconde fork (sheprd): `sheprd update` installs the latest sheprd
-    // release; herdr's own updater would replace sheprd with stock herdr.
+    // drovr fork: `drovr update` installs the latest drovr
+    // release; herdr's own updater would replace drovr with stock herdr.
     if args.get(1).map(|s| s.as_str()) == Some("update") {
         let status = std::process::Command::new("bash")
             .arg("-c")
             .arg(
-                "curl -fsSL https://raw.githubusercontent.com/andreconde21/sheprd/main/scripts/sheprd-install | bash",
+                "curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-install | bash",
             )
             .status();
         match status {
             Ok(status) if status.success() => {
-                println!("Restart sheprd to use it (detach with prefix+d, then run sheprd again).");
+                println!("Restart drovr to use it (detach with prefix+d, then run drovr again).");
                 std::process::exit(0);
             }
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(err) => {
-                eprintln!("sheprd update: could not run the installer: {err}");
+                eprintln!("drovr update: could not run the installer: {err}");
                 std::process::exit(1);
             }
         }

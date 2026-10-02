@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Install sheprd's Claude Code usage hook on this machine (run on every machine
+# Install drovr's Claude Code usage hook on this machine (run on every machine
 # where agents run). Copies the hook to ~/.local/bin and registers it as a Stop
 # hook in ~/.claude/settings.json (backup kept; existing hooks untouched).
 set -euo pipefail
-src="$(cd "$(dirname "$0")" && pwd)/sheprd-usage-hook"
+src="$(cd "$(dirname "$0")" && pwd)/drovr-usage-hook"
 if [ ! -f "$src" ]; then
   src="$(mktemp)"
-  curl -fsSL https://raw.githubusercontent.com/andreconde21/sheprd/main/scripts/sheprd-usage-hook -o "$src"
+  curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-usage-hook -o "$src"
 fi
 mkdir -p "$HOME/.local/bin"
-install -m 0755 "$src" "$HOME/.local/bin/sheprd-usage-hook"
+install -m 0755 "$src" "$HOME/.local/bin/drovr-usage-hook"
 settings="$HOME/.claude/settings.json"
 [ -f "$settings" ] || echo '{}' > "$settings"
-cp "$settings" "$settings.bak-pre-sheprd-usage"
-python3 - "$settings" "$HOME/.local/bin/sheprd-usage-hook" <<'EOF'
+cp "$settings" "$settings.bak-pre-drovr-usage"
+python3 - "$settings" "$HOME/.local/bin/drovr-usage-hook" <<'EOF'
 import json, sys
 path, hook = sys.argv[1], sys.argv[2]
 settings = json.load(open(path))
@@ -24,4 +24,4 @@ if not any(h.get("command") == command for group in stop for h in group.get("hoo
 json.dump(settings, open(path, "w"), indent=2)
 print("registered:", command)
 EOF
-echo "sheprd usage hook installed (backup: $settings.bak-pre-sheprd-usage)"
+echo "drovr usage hook installed (backup: $settings.bak-pre-drovr-usage)"

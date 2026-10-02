@@ -1,4 +1,4 @@
-//! andreconde fork (sheprd): client-local project groups for the federated sidebar.
+//! drovr fork: client-local project groups for the federated sidebar.
 //! User-facing docs: .github/README.md.
 //!
 //! Projects group workspaces from any machine (Local, gpu-box, ...) under one header,
@@ -198,8 +198,7 @@ pub(super) fn update(change: impl FnOnce(&mut ProjectLayout)) {
     }
     let path = path();
     if let Ok(content) = toml::to_string_pretty(&guard.layout) {
-        let header =
-            "# herdr (andreconde fork) sidebar projects. Hand-editable; see projects.rs.\n";
+        let header = "# herdr (drovr fork) sidebar projects. Hand-editable; see projects.rs.\n";
         let tmp = path.with_extension("toml.tmp");
         if std::fs::write(&tmp, format!("{header}{content}")).is_ok()
             && std::fs::rename(&tmp, &path).is_ok()
@@ -604,8 +603,8 @@ impl ProjectLayout {
 }
 
 /// When each agent last changed state (unix seconds), as observed by this
-/// client. herdr sends no timestamps, so sheprd records them itself and keeps
-/// them in `<state_dir>/sheprd-activity.json` so restarts don't reset them.
+/// client. herdr sends no timestamps, so drovr records them itself and keeps
+/// them in `<state_dir>/drovr-activity.json` so restarts don't reset them.
 #[derive(Default, Deserialize, Serialize)]
 struct Activity {
     #[serde(default)]
@@ -619,7 +618,7 @@ struct Activity {
 }
 
 fn activity_path() -> PathBuf {
-    crate::config::state_dir().join("sheprd-activity.json")
+    crate::config::state_dir().join("drovr-activity.json")
 }
 
 fn activity() -> &'static std::sync::Mutex<Activity> {
@@ -717,9 +716,9 @@ pub(super) fn idle_secs(key: &str) -> Option<u64> {
         .and_then(|(_, at)| (*at > 0).then(|| unix_now().saturating_sub(*at)))
 }
 
-/// Token/time usage per agent session, reported by the sheprd usage hook as
-/// pane metadata (`sheprd_u_YYYYMMDD`, `sheprd_session`) and kept here so it
-/// outlives the agent: `<state_dir>/sheprd-usage.json`.
+/// Token/time usage per agent session, reported by the drovr usage hook as
+/// pane metadata (`drovr_u_YYYYMMDD`, `drovr_session`) and kept here so it
+/// outlives the agent: `<state_dir>/drovr-usage.json`.
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct UsageRecord {
     /// Workspace key at last sighting, plus what project rules match on.
@@ -742,7 +741,7 @@ struct UsageStore {
 }
 
 fn usage_path() -> PathBuf {
-    crate::config::state_dir().join("sheprd-usage.json")
+    crate::config::state_dir().join("drovr-usage.json")
 }
 
 fn usage_store() -> &'static std::sync::Mutex<UsageStore> {
@@ -769,21 +768,21 @@ fn agent_token<'a>(agent: &'a crate::protocol::ClientShellAgent, name: &str) -> 
 
 /// Current context size of an agent, from the usage hook.
 pub(super) fn agent_context_tokens(agent: &crate::protocol::ClientShellAgent) -> Option<u64> {
-    agent_token(agent, "sheprd_ctx")?.parse().ok()
+    agent_token(agent, "drovr_ctx")?.parse().ok()
 }
 
 fn observe_usage(endpoint: &ClientShellEndpoint, snapshot: &crate::protocol::ClientShellSnapshot) {
     let mut store = usage_store().lock().unwrap_or_else(|e| e.into_inner());
     for agent in &snapshot.agents {
-        let Some(session) = agent_token(agent, "sheprd_session") else {
+        let Some(session) = agent_token(agent, "drovr_session") else {
             continue;
         };
-        // One token per day: sheprd_u_YYYYMMDD = "in,out,cache_read,cache_write,minutes".
+        // One token per day: drovr_u_YYYYMMDD = "in,out,cache_read,cache_write,minutes".
         let days = agent
             .tokens
             .iter()
             .filter_map(|(name, value)| {
-                let date = name.trim_start_matches('$').strip_prefix("sheprd_u_")?;
+                let date = name.trim_start_matches('$').strip_prefix("drovr_u_")?;
                 if date.len() != 8 {
                     return None;
                 }
@@ -943,7 +942,7 @@ pub(super) fn format_age(secs: u64) -> String {
     }
 }
 
-/// A workspace sheprd just asked a machine to create, waiting to appear so the
+/// A workspace drovr just asked a machine to create, waiting to appear so the
 /// agent command can be typed into it.
 #[derive(Clone, Debug)]
 pub(super) struct PendingLaunch {
@@ -1033,7 +1032,7 @@ pub(super) fn hinting() -> bool {
     HINTING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A press on a sheprd sidebar row, kept until the button comes up so the
+/// A press on a drovr sidebar row, kept until the button comes up so the
 /// same gesture can be a click (focus) or a drag (move to a project).
 #[derive(Clone, Debug)]
 pub(super) struct RowPress {

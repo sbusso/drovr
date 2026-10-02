@@ -17,6 +17,7 @@ mod endpoint_notices;
 mod endpoint_sidebar;
 mod endpoints;
 pub(super) use endpoints::*;
+mod drovr_sidebar;
 mod global_menu;
 mod graphics;
 mod input;
@@ -33,7 +34,6 @@ mod projects;
 mod render;
 mod scroll;
 mod settings;
-mod sheprd_sidebar;
 mod state;
 mod surface_patch;
 mod text_editor;
@@ -285,7 +285,7 @@ fn blit_pane_surface(target: &mut FrameData, source: &FrameData, area: Rect) {
 #[cfg(test)]
 mod tests;
 
-/// andreconde fork (sheprd): queue an agent to focus (from a notification click).
+/// drovr fork: queue an agent to focus (from a notification click).
 pub(crate) fn request_agent_focus(endpoint_id: ClientEndpointId, pane_id: String) {
     projects::request_focus(endpoint_id, pane_id);
 }

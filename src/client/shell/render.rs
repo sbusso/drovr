@@ -270,8 +270,8 @@ pub(super) fn render_shell(
     if layout.sidebar.width > 0 {
         if state.endpoints.len() > 1 {
             if state.sidebar_collapsed && !cfg!(test) {
-                // andreconde fork (sheprd): project rail instead of machines + agents.
-                super::sheprd_sidebar::render_collapsed(
+                // drovr fork: project rail instead of machines + agents.
+                super::drovr_sidebar::render_collapsed(
                     buffer,
                     layout.sidebar,
                     config,
@@ -287,7 +287,7 @@ pub(super) fn render_shell(
                     &mut hits,
                 );
             } else {
-                // andreconde fork (sheprd): one combined projects + agents list.
+                // drovr fork: one combined projects + agents list.
                 // Unit tests keep exercising the stock renderer they were written for.
                 if cfg!(test) {
                     super::endpoint_sidebar::render_expanded(
@@ -299,7 +299,7 @@ pub(super) fn render_shell(
                         &mut hits,
                     );
                 } else {
-                    super::sheprd_sidebar::render(
+                    super::drovr_sidebar::render(
                         buffer,
                         layout.sidebar,
                         config,
@@ -351,11 +351,11 @@ pub(super) fn render_shell(
         hits.new_workspace = Rect::default();
         hits.machines.clear();
         hits.projects.clear();
-        hits.sheprd_rows.clear();
-        hits.sheprd_view_toggle = Rect::default();
-        hits.sheprd_filter_toggle = Rect::default();
-        hits.sheprd_attention = Rect::default();
-        hits.sheprd_rail.clear();
+        hits.drovr_rows.clear();
+        hits.drovr_view_toggle = Rect::default();
+        hits.drovr_filter_toggle = Rect::default();
+        hits.drovr_attention = Rect::default();
+        hits.drovr_rail.clear();
         hits.workspaces.clear();
         hits.agents.clear();
         hits.endpoint_agents.clear();

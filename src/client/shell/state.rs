@@ -84,15 +84,15 @@ pub(super) enum ClientMobileTarget {
 #[derive(Default)]
 pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
-    /// andreconde fork: project header rows (rect, group name).
+    /// drovr fork: project header rows (rect, group name).
     pub(super) projects: Vec<(Rect, String)>,
-    /// andreconde fork (sheprd): combined sidebar rows and header toggles.
-    pub(super) sheprd_rows: Vec<super::sheprd_sidebar::RowHit>,
-    pub(super) sheprd_view_toggle: Rect,
-    pub(super) sheprd_filter_toggle: Rect,
-    pub(super) sheprd_attention: Rect,
+    /// drovr fork: combined sidebar rows and header toggles.
+    pub(super) drovr_rows: Vec<super::drovr_sidebar::RowHit>,
+    pub(super) drovr_view_toggle: Rect,
+    pub(super) drovr_filter_toggle: Rect,
+    pub(super) drovr_attention: Rect,
     /// Collapsed rail rows (rect, project key).
-    pub(super) sheprd_rail: Vec<(Rect, String)>,
+    pub(super) drovr_rail: Vec<(Rect, String)>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -324,7 +324,7 @@ pub(super) enum ClientRenameTarget {
     Pane {
         pane_id: String,
     },
-    /// andreconde fork prompts (answered client-side, never sent to a server).
+    /// drovr fork prompts (answered client-side, never sent to a server).
     ProjectAssign {
         key: String,
     },
@@ -551,7 +551,7 @@ pub(super) enum ClientContextMenuAction {
     Zoom,
     ToggleRightClickPassthrough,
     ClosePane,
-    // andreconde fork: project sidebar actions.
+    // drovr fork: project sidebar actions.
     ProjectAssignTo(usize),
     ProjectAssignNew,
     ProjectRemove,
@@ -596,7 +596,7 @@ pub(super) enum ClientContextMenuTarget {
         has_manual_label: bool,
         right_click_passthrough: bool,
     },
-    /// andreconde fork: a sidebar workspace on any machine. `base` carries the
+    /// drovr fork: a sidebar workspace on any machine. `base` carries the
     /// stock workspace menu when the workspace is on the active machine.
     ProjectWorkspace {
         key: String,
@@ -610,7 +610,7 @@ pub(super) enum ClientContextMenuTarget {
         pinned: bool,
         collapsed: bool,
     },
-    /// Pick the machine for a new workspace (sheprd).
+    /// Pick the machine for a new workspace (drovr).
     NewWorkspacePicker {
         machines: Vec<(ClientEndpointId, String)>,
         project: Option<String>,
@@ -803,7 +803,7 @@ pub(crate) enum ClientShellNotificationEffect {
         body: Option<String>,
         #[cfg(windows)]
         target: Option<ClientSystemNotificationTarget>,
-        /// andreconde fork (sheprd): the agent to jump to when it is clicked.
+        /// drovr fork: the agent to jump to when it is clicked.
         #[cfg(not(windows))]
         click: Option<(ClientEndpointId, String)>,
     },
@@ -1656,7 +1656,7 @@ impl ClientShellState {
             }
         }
         self.snapshot = Some(snapshot);
-        // andreconde fork: focusing an agent clears its manual unread mark.
+        // drovr fork: focusing an agent clears its manual unread mark.
         let focused_agent = self
             .snapshot
             .as_deref()

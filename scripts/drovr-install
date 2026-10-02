@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Install/update drovr (client-side herdr fork) from GitHub releases.
+# Usage: drovr-install [tag]   (default: latest drovr-v* release)
+# Installs ~/.local/share/drovr/drovr and a ~/.local/bin/drovr symlink.
+# Leaves any existing herdr install untouched.
+set -euo pipefail
+repo=sbusso/drovr
+tag=${1:-$(curl -fsSL "https://api.github.com/repos/$repo/releases" | grep -o '"tag_name": *"drovr-v[^"]*"' | head -1 | sed 's/.*"\(drovr-v[^"]*\)"/\1/')}
+[ -n "$tag" ] || { echo "no drovr-v* release found" >&2; exit 1; }
+dir="$HOME/.local/share/drovr"
+mkdir -p "$dir" "$HOME/.local/bin"
+base="https://github.com/$repo/releases/download/$tag"
+curl -fsSL "$base/drovr-linux-x86_64" -o "$dir/drovr.new"
+expected=$(curl -fsSL "$base/drovr-linux-x86_64.sha256" | awk '{print $1}')
+actual=$(sha256sum "$dir/drovr.new" | awk '{print $1}')
+[ "$expected" = "$actual" ] || { echo "checksum mismatch" >&2; rm -f "$dir/drovr.new"; exit 1; }
+chmod +x "$dir/drovr.new" && mv "$dir/drovr.new" "$dir/drovr"
+ln -sfn "$dir/drovr" "$HOME/.local/bin/drovr"
+echo "$tag" > "$dir/VERSION"
+echo "installed drovr $tag -> $dir/drovr"

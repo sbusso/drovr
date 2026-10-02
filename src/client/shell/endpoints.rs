@@ -622,7 +622,7 @@ impl ClientShellState {
         endpoint.agent_recency = recency;
         endpoint.snapshot_generation = generation;
         endpoint.snapshot = Some(snapshot);
-        // andreconde fork (sheprd): remember when agents change state.
+        // drovr fork: remember when agents change state.
         super::projects::observe_activity(endpoint);
         let pending_matches =
             endpoint

@@ -1,4 +1,4 @@
-//! andreconde fork: menus, clicks, prompts and keys for sidebar projects.
+//! drovr fork: menus, clicks, prompts and keys for sidebar projects.
 //! The layout model lives in `projects.rs`; this file only turns UI gestures
 //! into layout changes (and, for agents on the active machine, stock methods).
 
@@ -26,7 +26,7 @@ fn move_items(items: &mut Vec<ClientContextMenuItem>, groups: &[String], grouped
     items.push(item("→ New project…", Action::ProjectAssignNew));
 }
 
-/// Read-only usage lines for a project's menu (from the sheprd usage hook).
+/// Read-only usage lines for a project's menu (from the drovr usage hook).
 fn usage_items(name: &str) -> Vec<ClientContextMenuItem> {
     let layout = projects::layout();
     let group = (name != projects::OTHER).then_some(name);
@@ -311,15 +311,15 @@ impl ClientShellState {
             .map(|(_, key)| key.clone())
     }
 
-    fn row_at(&self, point: (u16, u16)) -> Option<super::sheprd_sidebar::RowHit> {
+    fn row_at(&self, point: (u16, u16)) -> Option<super::drovr_sidebar::RowHit> {
         self.hits
-            .sheprd_rows
+            .drovr_rows
             .iter()
             .find(|hit| super::contains(hit.rect, point))
             .cloned()
     }
 
-    /// Right-click in the sheprd sidebar: headers, agent rows, workspace rows.
+    /// Right-click in the drovr sidebar: headers, agent rows, workspace rows.
     pub(super) fn open_project_context_menu_at(
         &mut self,
         point: (u16, u16),
@@ -461,8 +461,8 @@ impl ClientShellState {
         point: (u16, u16),
         outcome: &mut ClientShellInput,
     ) -> bool {
-        let sheprd_sidebar = self.hits.sheprd_view_toggle.width > 0;
-        if sheprd_sidebar && super::contains(self.hits.new_workspace, point) {
+        let drovr_sidebar = self.hits.drovr_view_toggle.width > 0;
+        if drovr_sidebar && super::contains(self.hits.new_workspace, point) {
             let project = self.focused_project();
             self.open_new_workspace_picker(project, false);
             outcome.repaint = true;
@@ -470,12 +470,12 @@ impl ClientShellState {
         }
         if let Some(key) = self
             .hits
-            .sheprd_rail
+            .drovr_rail
             .iter()
             .find(|(rect, _)| super::contains(*rect, point))
             .map(|(_, key)| key.clone())
         {
-            if let Some((endpoint_id, target)) = super::sheprd_sidebar::project_target(
+            if let Some((endpoint_id, target)) = super::drovr_sidebar::project_target(
                 &self.endpoints,
                 &self.active_endpoint_id,
                 &key,
@@ -485,13 +485,13 @@ impl ClientShellState {
             outcome.repaint = true;
             return true;
         }
-        if super::contains(self.hits.sheprd_attention, point) {
+        if super::contains(self.hits.drovr_attention, point) {
             self.focus_next_attention_agent(outcome);
             return true;
         }
-        if super::contains(self.hits.sheprd_view_toggle, point) {
+        if super::contains(self.hits.drovr_view_toggle, point) {
             projects::update(|layout| layout.compact = !layout.compact);
-        } else if super::contains(self.hits.sheprd_filter_toggle, point) {
+        } else if super::contains(self.hits.drovr_filter_toggle, point) {
             projects::update(|layout| layout.active_only = !layout.active_only);
             self.workspace_scroll = 0;
         } else if let Some(key) = self.header_at(point) {
@@ -807,7 +807,7 @@ impl ClientShellState {
         let endpoint_id = self.active_endpoint_id.clone();
         let (x, y) = self
             .hits
-            .sheprd_rows
+            .drovr_rows
             .iter()
             .find(|hit| hit.endpoint_id == endpoint_id && hit.workspace_id == workspace_id)
             .map_or((2, 2), |hit| (hit.rect.x + 2, hit.rect.y));
@@ -946,7 +946,7 @@ impl ClientShellState {
             .as_deref()?
             .boot_id
             .clone();
-        let id = format!("sheprd:{}", self.next_request_id);
+        let id = format!("drovr:{}", self.next_request_id);
         self.next_request_id = self.next_request_id.saturating_add(1);
         Some(ClientShellAction::Endpoint {
             endpoint_id: endpoint_id.clone(),
@@ -1016,9 +1016,9 @@ impl ClientShellState {
         }
     }
 
-    /// Periodic sheprd work, from the client loop's 100 ms timer.
-    pub(crate) fn tick_sheprd(&mut self, outcome: &mut ClientShellInput) {
-        outcome.actions.extend(self.tick_sheprd_launch());
+    /// Periodic drovr work, from the client loop's 100 ms timer.
+    pub(crate) fn tick_drovr(&mut self, outcome: &mut ClientShellInput) {
+        outcome.actions.extend(self.tick_drovr_launch());
         for (endpoint_id, pane_id) in projects::take_focus_requests() {
             self.focus_or_activate(
                 endpoint_id,
@@ -1032,7 +1032,7 @@ impl ClientShellState {
 
     /// Once the workspace created above shows up, type the agent command into
     /// its first pane (and stop waiting after a minute).
-    fn tick_sheprd_launch(&mut self) -> Vec<ClientShellAction> {
+    fn tick_drovr_launch(&mut self) -> Vec<ClientShellAction> {
         let Some(launch) = projects::launch() else {
             return Vec::new();
         };

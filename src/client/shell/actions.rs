@@ -43,7 +43,7 @@ impl ClientShellState {
                     self.begin_worktree_action(action, outcome);
                     return;
                 }
-                // andreconde fork: sidebar project keys.
+                // drovr fork: sidebar project keys.
                 match action {
                     crate::input::KeybindAction::NextAttentionAgent => {
                         self.focus_next_attention_agent(outcome);

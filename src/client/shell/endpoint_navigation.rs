@@ -113,7 +113,7 @@ impl ClientShellState {
             action,
             KeybindAction::PreviousWorkspace | KeybindAction::NextWorkspace
         ) {
-            // andreconde fork (sheprd): walk the combined sidebar's order and skip
+            // drovr fork: walk the combined sidebar's order and skip
             // hidden/filtered workspaces. Upstream's tests keep the stock order.
             let workspaces = if cfg!(test) {
                 self.endpoints
@@ -139,7 +139,7 @@ impl ClientShellState {
                     })
                     .collect::<Vec<_>>()
             } else {
-                super::sheprd_sidebar::ordered_workspaces(&self.endpoints, &self.active_endpoint_id)
+                super::drovr_sidebar::ordered_workspaces(&self.endpoints, &self.active_endpoint_id)
             };
             if workspaces.is_empty() {
                 return true;

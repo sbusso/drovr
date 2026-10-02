@@ -58,9 +58,9 @@ impl EndpointHealth {
     }
 }
 
-/// andreconde fork (sheprd): smoothed round-trip time per endpoint, for the
+/// drovr fork: smoothed round-trip time per endpoint, for the
 /// sidebar. herdr only pings after HEARTBEAT_INTERVAL of silence, so a busy
-/// link would never be measured; sheprd sends its own light probe every
+/// link would never be measured; drovr sends its own light probe every
 /// RTT_PROBE_INTERVAL and times the matching pong.
 pub(super) const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 

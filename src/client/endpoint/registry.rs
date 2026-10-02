@@ -213,7 +213,7 @@ impl EndpointRegistry {
             })
             .filter(|(_, action)| *action != HealthAction::None)
             .collect::<Vec<_>>();
-        // andreconde fork (sheprd): periodic latency probe on remote machines.
+        // drovr fork: periodic latency probe on remote machines.
         let probes = self
             .connections
             .iter()

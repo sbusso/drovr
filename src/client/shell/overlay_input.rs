@@ -193,7 +193,7 @@ impl ClientShellState {
     pub(super) fn open_navigator_overlay(&mut self) {
         let mut navigator = ClientNavigatorOverlay {
             query: TextEditor::default(),
-            // andreconde fork (sheprd): open ready to type; arrows/Enter still pick.
+            // drovr fork: open ready to type; arrows/Enter still pick.
             // (Upstream's tests keep its default so they test upstream behaviour.)
             search_focused: !cfg!(test),
             selected: None,
@@ -640,7 +640,7 @@ impl ClientShellState {
                 }))
             );
             if code == KeyCode::Esc {
-                // andreconde fork (sheprd): Esc on an empty search closes at once.
+                // drovr fork: Esc on an empty search closes at once.
                 let empty_query = matches!(
                     self.overlay.as_ref(),
                     Some(ClientShellOverlay::Navigator(navigator)) if navigator.query.trim().is_empty()
@@ -660,7 +660,7 @@ impl ClientShellState {
                 return;
             }
             if search_focused {
-                // andreconde fork (sheprd): with nothing typed yet, Left/Right keep
+                // drovr fork: with nothing typed yet, Left/Right keep
                 // jumping between workspaces even though the search box has focus.
                 let empty_query = matches!(
                     self.overlay.as_ref(),
@@ -941,7 +941,7 @@ impl ClientShellState {
         }
         if rename.input.handle_key(key).is_some() {
             outcome.repaint = true;
-            // andreconde fork (sheprd): jump as soon as the number is unambiguous.
+            // drovr fork: jump as soon as the number is unambiguous.
             if matches!(rename.target, ClientRenameTarget::JumpAgent) {
                 let typed = rename.input.trim().parse::<usize>().ok();
                 if typed.is_some_and(|n| self.jump_number_is_final(n)) {

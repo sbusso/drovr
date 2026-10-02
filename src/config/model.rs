@@ -357,17 +357,17 @@ pub struct KeysConfig {
     pub workspace_picker: BindingConfig,
     /// Open the session navigator. Default: "prefix+g"
     pub goto: BindingConfig,
-    /// sidebar project menu (andreconde fork). Default: "prefix+."
+    /// sidebar project menu (drovr fork). Default: "prefix+."
     pub project_menu: BindingConfig,
-    /// Peek at idle age, context, numbers and latency (sheprd). Default: "prefix+space"
+    /// Peek at idle age, context, numbers and latency (drovr). Default: "prefix+space"
     pub peek_details: BindingConfig,
-    /// New workspace on a chosen machine (sheprd). Default: "prefix+alt+c"
+    /// New workspace on a chosen machine (drovr). Default: "prefix+alt+c"
     pub new_workspace_on: BindingConfig,
-    /// next agent that needs you (sheprd). Default: "prefix+u"
+    /// next agent that needs you (drovr). Default: "prefix+u"
     pub next_attention_agent: BindingConfig,
-    /// jump to agent by number (andreconde fork). Default: "prefix+#"
+    /// jump to agent by number (drovr fork). Default: "prefix+#"
     pub jump_agent: BindingConfig,
-    /// show/conceal hidden workspaces (andreconde fork). Default: "prefix+alt+h"
+    /// show/conceal hidden workspaces (drovr fork). Default: "prefix+alt+h"
     pub toggle_hidden_workspaces: BindingConfig,
     /// Move workspace selection up in navigate mode. Default: "up".
     pub navigate_workspace_up: BindingConfig,

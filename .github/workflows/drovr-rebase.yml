@@ -1,13 +1,13 @@
-# sheprd: follow herdr. Daily, check whether herdrdev published a newer stable
-# release than the one sheprd is based on. If so, rebase sheprd onto it:
+# drovr: follow herdr. Daily, check whether herdrdev published a newer stable
+# release than the one drovr is based on. If so, rebase drovr onto it:
 #   clean (or replayed by rerere) + tests pass -> push branch rebase/<tag> and
 #                                                 open an issue "ready to ship"
 #   conflict -> open an issue listing the conflicting files and the upstream
 #               commits that touched them; nothing changes
-# main is never touched here; "sheprd promote" ships a ready rebase.
+# main is never touched here; "drovr promote" ships a ready rebase.
 # Resolutions recorded with `git rerere` live in .github/rr-cache, so a conflict
 # resolved once is replayed automatically next time.
-name: sheprd rebase
+name: drovr rebase
 
 on:
   schedule:
@@ -51,8 +51,8 @@ jobs:
         if: steps.find.outputs.skip != 'true'
         run: |
           latest=${{ steps.find.outputs.latest }}; base=${{ steps.find.outputs.base }}
-          git config user.name "sheprd bot"
-          git config user.email "sheprd-bot@users.noreply.github.com"
+          git config user.name "drovr bot"
+          git config user.email "drovr-bot@users.noreply.github.com"
           git config rerere.enabled true
           git config rerere.autoupdate true
           mkdir -p .git/rr-cache && cp -r .github/rr-cache/. .git/rr-cache/ 2>/dev/null || true
@@ -63,7 +63,7 @@ jobs:
             if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
               files=$(git diff --name-only --diff-filter=U)
               {
-                echo "## Conflicts rebasing sheprd onto herdr $latest"
+                echo "## Conflicts rebasing drovr onto herdr $latest"
                 echo
                 echo "Files:"
                 echo "$files" | sed 's/^/- `/;s/$/`/'
@@ -107,5 +107,5 @@ jobs:
         run: |
           latest=${{ steps.find.outputs.latest }}
           git push origin "rebase/$latest"
-          gh issue create --title "herdr $latest: sheprd rebased cleanly, ready to ship" --body \
-            "Branch \`rebase/$latest\` builds and the client tests pass. Ship it from Actions → **sheprd promote** with \`$latest\` (or ask Claude). Upstream notes: https://github.com/herdrdev/herdr/releases/tag/$latest"
+          gh issue create --title "herdr $latest: drovr rebased cleanly, ready to ship" --body \
+            "Branch \`rebase/$latest\` builds and the client tests pass. Ship it from Actions → **drovr promote** with \`$latest\` (or ask Claude). Upstream notes: https://github.com/herdrdev/herdr/releases/tag/$latest"

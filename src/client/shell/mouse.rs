@@ -1018,7 +1018,7 @@ impl ClientShellState {
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
             && super::projects::press().is_some()
         {
-            // andreconde fork (sheprd): a sidebar row is being dragged.
+            // drovr fork: a sidebar row is being dragged.
             if super::projects::drag_to(point) {
                 outcome.repaint = true;
             }
@@ -1262,7 +1262,7 @@ impl ClientShellState {
         if mouse.kind == MouseEventKind::Up(MouseButton::Left)
             && self.finish_row_press(point, outcome)
         {
-            // andreconde fork (sheprd): click or drag-and-drop on a sidebar row.
+            // drovr fork: click or drag-and-drop on a sidebar row.
             return;
         }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
@@ -2117,7 +2117,7 @@ impl ClientShellState {
                     return;
                 }
                 if self.begin_row_press(point) {
-                    // andreconde fork (sheprd): combined sidebar row.
+                    // drovr fork: combined sidebar row.
                     return;
                 }
                 let workspace_press = self

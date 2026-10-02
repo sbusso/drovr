@@ -68,15 +68,15 @@ pub(super) fn handle_shell_notification_effects(
                     warn!(err = %err, "failed to emit terminal notification");
                 }
             }
-            // andreconde fork (sheprd): clickable notify-send notification.
+            // drovr fork: clickable notify-send notification.
             #[cfg(not(windows))]
             shell::ClientShellNotificationEffect::System {
                 title,
                 body,
                 click: Some((endpoint_id, pane_id)),
                 ..
-            } if sheprd_has_display() => {
-                sheprd_clickable_notification(title, body, endpoint_id, pane_id)
+            } if drovr_has_display() => {
+                drovr_clickable_notification(title, body, endpoint_id, pane_id)
             }
             shell::ClientShellNotificationEffect::System {
                 title,
@@ -204,18 +204,18 @@ pub(super) fn sound_from_notify_message(message: &str) -> Option<crate::sound::S
     }
 }
 
-/// andreconde fork (sheprd): clickable notifications need an X11/Wayland display;
+/// drovr fork: clickable notifications need an X11/Wayland display;
 /// without one the effect falls back to a plain notification.
 #[cfg(not(windows))]
-fn sheprd_has_display() -> bool {
+fn drovr_has_display() -> bool {
     std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
-/// andreconde fork (sheprd): a desktop notification you can click. notify-send
+/// drovr fork: a desktop notification you can click. notify-send
 /// waits (on its own thread) for the click; clicking raises the terminal running
-/// sheprd and focuses the agent. Falls back to a plain notification.
+/// drovr and focuses the agent. Falls back to a plain notification.
 #[cfg(not(windows))]
-fn sheprd_clickable_notification(
+fn drovr_clickable_notification(
     title: String,
     body: Option<String>,
     endpoint_id: super::endpoint::ClientEndpointId,
@@ -225,7 +225,7 @@ fn sheprd_clickable_notification(
         let mut command = std::process::Command::new("notify-send");
         command
             .arg("--app-name")
-            .arg("sheprd")
+            .arg("drovr")
             .arg("--action=default=Open")
             .arg("--wait")
             .arg("--")

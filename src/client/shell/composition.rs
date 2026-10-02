@@ -54,7 +54,7 @@ impl ClientShellState {
                 && self.endpoint_status(&self.active_endpoint_id)
                     == Some(ClientEndpointStatus::Online)
         });
-        // andreconde fork (sheprd): rows show jump numbers while the jump prompt is open.
+        // drovr fork: rows show jump numbers while the jump prompt is open.
         super::projects::set_hinting(matches!(
             &self.overlay,
             Some(ClientShellOverlay::Rename(ClientRenameOverlay {
@@ -360,7 +360,7 @@ impl ClientShellState {
         });
         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
-        // andreconde fork (sheprd): peek while the sidebar is collapsed draws the
+        // drovr fork: peek while the sidebar is collapsed draws the
         // full sidebar over the panes for a moment (view only).
         if self.endpoints.len() > 1
             && self.sidebar_collapsed
@@ -377,7 +377,7 @@ impl ClientShellState {
             let mut panel = Buffer::empty(Rect::new(0, 0, cols, rows));
             let mut scroll = 0usize;
             let mut scratch = ShellHitMap::default();
-            super::sheprd_sidebar::render_panel(
+            super::drovr_sidebar::render_panel(
                 &mut panel,
                 area,
                 &self.config,

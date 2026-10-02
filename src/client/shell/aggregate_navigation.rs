@@ -158,7 +158,7 @@ pub(super) fn aggregate_agent_rows<'a>(
     rows
 }
 
-/// andreconde fork: drop agents of hidden workspaces and, in the stable
+/// drovr fork: drop agents of hidden workspaces and, in the stable
 /// "grouped" order, list agents project by project across machines.
 fn apply_projects(
     endpoints: &[ClientShellEndpoint],

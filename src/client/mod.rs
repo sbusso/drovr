@@ -2046,7 +2046,7 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => {
-                                // andreconde fork (sheprd): time the latency probe.
+                                // drovr fork: time the latency probe.
                                 endpoint::rtt_pong(&endpoint_id);
                                 continue;
                             }
@@ -2268,8 +2268,8 @@ async fn run_client_loop(
                     let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
                         let mut outcome = shell.tick_selection_autoscroll(now);
-                        // andreconde fork (sheprd): agent launch, notification clicks, peek expiry.
-                        shell.tick_sheprd(&mut outcome);
+                        // drovr fork: agent launch, notification clicks, peek expiry.
+                        shell.tick_drovr(&mut outcome);
                         for expired in expired_endpoints {
                             if !shell.endpoint_is_active(&expired.endpoint_id) {
                                 continue;
