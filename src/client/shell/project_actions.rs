@@ -455,7 +455,7 @@ impl ClientShellState {
     }
 
     /// Left-click on a project header toggles it; the header toggles switch
-    /// the view (detailed/compact) and the filter (all/active).
+    /// the view (detailed/compact/structured) and the filter (all/active).
     pub(super) fn handle_project_click(
         &mut self,
         point: (u16, u16),
@@ -490,7 +490,7 @@ impl ClientShellState {
             return true;
         }
         if super::contains(self.hits.drovr_view_toggle, point) {
-            projects::update(|layout| layout.compact = !layout.compact);
+            projects::update(projects::ProjectLayout::cycle_view);
         } else if super::contains(self.hits.drovr_filter_toggle, point) {
             projects::update(|layout| layout.active_only = !layout.active_only);
             self.workspace_scroll = 0;

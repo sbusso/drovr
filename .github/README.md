@@ -39,6 +39,14 @@ agents from **every** machine, then **Other** for everything not in a project.
  new · Local              menu
 ```
 
+Clicking the view label cycles *detailed*, *compact* (one line per workspace)
+and *structured*: workspace headers (remote machine on the right) with one line
+per agent, a vendor mark and a title coloured by state (working in the vendor's
+colour, done green, blocked red, idle fading over 15 minutes and 2 hours). The
+marks use the [herdr-radar](https://github.com/hhdebb/herdr-radar) icon font;
+without it set `agent_icons = "letter"` (or `"none"`) under `[ui.sidebar]` in
+herdr's `config.toml`.
+
 The sidebar stays quiet: status and topic only. **Peek** (`prefix+space`)
 reveals, for ten seconds (press again to hide): idle age, context size
 (`ctx 581k`) and jump number per agent, today's time and tokens per project,
@@ -125,6 +133,7 @@ it, and hand edits reload within a second:
 
 ```toml
 compact = false                        # view: one row per agent / per workspace
+structured = false                     # view: workspace headers + one line per agent
 active_only = false                    # filter: all agents / active ones
 recent_hours = 24                      # idle agents stay "active" this long
 hidden = ["gpu-box/scratch"]           # machine/workspace

@@ -23,6 +23,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) hide_tab_bar_when_single_tab: bool,
     pub(super) spaces: SpacesSidebarConfig,
     pub(super) agents: crate::config::AgentsSidebarConfig,
+    /// drovr fork: vendor mark style for the structured sidebar view.
+    pub(super) agent_icons: crate::config::AgentIconsConfig,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
     pub(super) sound_enabled: bool,

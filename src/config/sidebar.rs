@@ -480,6 +480,20 @@ impl Default for SpacesSidebarConfig {
 pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
+    /// drovr fork: vendor mark in the structured sidebar view.
+    pub agent_icons: AgentIconsConfig,
+}
+
+/// drovr fork: how the structured sidebar view marks an agent's vendor.
+/// `radar` uses the herdr-radar icon font codepoints (the font must be
+/// installed), `letter` the vendor's first letter, `none` no mark. Default: radar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentIconsConfig {
+    #[default]
+    Radar,
+    Letter,
+    None,
 }
 
 #[cfg(test)]

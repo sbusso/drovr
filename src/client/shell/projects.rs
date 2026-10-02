@@ -95,6 +95,10 @@ pub(super) struct ProjectLayout {
     /// Compact view: one line per workspace instead of one row per agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) compact: bool,
+    /// Structured view: workspace headers with one line per agent (vendor mark,
+    /// state-coloured title). Ignored while `compact` is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) structured: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) other_collapsed: bool,
     /// Show only agents that are working or need attention.
@@ -595,6 +599,15 @@ impl ProjectLayout {
         } else {
             self.kept.push(key.to_owned());
         }
+    }
+
+    /// The view toggle: detailed -> compact -> structured -> detailed.
+    pub(super) fn cycle_view(&mut self) {
+        (self.compact, self.structured) = match (self.compact, self.structured) {
+            (false, false) => (true, false),
+            (true, _) => (false, true),
+            (false, true) => (false, false),
+        };
     }
 
     pub(super) fn recent_secs(&self) -> u64 {

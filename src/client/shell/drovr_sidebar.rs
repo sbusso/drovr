@@ -2,8 +2,12 @@
 //!
 //! Replaces upstream's "machines" + "agents" split with a single list:
 //! project headers (pinned first), then "Other" for everything ungrouped, with
-//! agents from every machine under them. Two views: detailed (one row per agent)
-//! and compact (one line per workspace). Layout state lives in `projects.rs`.
+//! agents from every machine under them. Three views: detailed (one row per
+//! agent), compact (one line per workspace) and structured (workspace headers,
+//! one line per agent with a vendor mark and a state-coloured title, styled
+//! after herdr-radar; see `radar.rs`). Layout state lives in `projects.rs`.
+
+mod radar;
 
 use std::collections::HashMap;
 
@@ -47,6 +51,9 @@ enum Row {
         age: Option<String>,
         faded: bool,
         ctx: Option<String>,
+        /// Agent id ("claude", "codex"), for the structured view's mark.
+        vendor: Option<String>,
+        tone: radar::Tone,
     },
     Workspace {
         endpoint: usize,
@@ -88,6 +95,8 @@ struct AgentInfo {
     current: bool,
     /// Context size from the usage hook ("581k"), shown while peeking.
     ctx: Option<String>,
+    vendor: Option<String>,
+    tone: radar::Tone,
 }
 
 fn agent_title(agent: &crate::protocol::ClientShellAgent) -> String {
@@ -185,6 +194,7 @@ fn build_rows(
             .then(|| projects::idle_secs(&key))
             .flatten();
         let recent = idle.is_some_and(|secs| secs < layout.recent_secs());
+        let unknown = row.agent.agent_status == crate::api::schema::AgentStatus::Unknown;
         agents
             .entry((row.endpoint.endpoint_index, row.agent.workspace_id.clone()))
             .or_default()
@@ -200,6 +210,8 @@ fn build_rows(
                 stale,
                 title: agent_title(row.agent),
                 number,
+                vendor: row.agent.agent.clone(),
+                tone: radar::tone(presence, unknown, idle),
             });
     }
 
@@ -242,6 +254,7 @@ fn build_rows(
         other,
     ));
 
+    let structured = layout.structured && !layout.compact;
     let mut rows = Vec::new();
     for (key, label, pinned, collapsed, members) in groups {
         let mut body = Vec::new();
@@ -300,10 +313,36 @@ fn build_rows(
                 continue;
             }
             let show_workspace = !workspace.label.eq_ignore_ascii_case(&label);
+            let workspace_agents = workspace_agents
+                .into_iter()
+                .filter(|agent| !layout.active_only || agent.current)
+                .collect::<Vec<_>>();
+            if structured && !workspace_agents.is_empty() {
+                // Header for the agents below; it carries the highlight only
+                // when none of them is the focused pane.
+                body.push(Row::Workspace {
+                    endpoint: endpoint_index,
+                    workspace_id: workspace.workspace_id.clone(),
+                    label: workspace.label.clone(),
+                    presence,
+                    focused: focused && !workspace_agents.iter().any(|agent| agent.focused),
+                    stale,
+                    hidden,
+                    machine: machine.clone(),
+                    number: None,
+                    age: None,
+                    faded: !current,
+                });
+            }
             for agent in workspace_agents {
-                if layout.active_only && !agent.current {
-                    continue;
-                }
+                let (subtitle, machine) = if structured {
+                    (None, None)
+                } else {
+                    (
+                        show_workspace.then(|| workspace.label.clone()),
+                        machine.clone(),
+                    )
+                };
                 body.push(Row::Agent {
                     endpoint: endpoint_index,
                     workspace_id: workspace.workspace_id.clone(),
@@ -312,13 +351,15 @@ fn build_rows(
                     focused: agent.focused,
                     stale: agent.stale,
                     title: agent.title,
-                    workspace: show_workspace.then(|| workspace.label.clone()),
-                    machine: machine.clone(),
+                    workspace: subtitle,
+                    machine,
                     number: agent.number,
                     kept: agent.kept,
                     age: agent.age,
                     faded: !agent.current,
                     ctx: agent.ctx,
+                    vendor: agent.vendor,
+                    tone: agent.tone,
                 });
             }
         }
@@ -468,6 +509,8 @@ pub(super) fn render_panel(
     }
     let view = if layout.compact {
         "compact "
+    } else if layout.structured {
+        "structured "
     } else {
         "detailed "
     };
@@ -502,7 +545,9 @@ pub(super) fn render_panel(
         .enumerate()
         .map(|(index, row)| match (row, rows.get(index + 1)) {
             (_, Some(Row::Header { .. })) => 1,
-            (Row::Agent { .. }, Some(Row::Agent { .. })) if !layout.compact => {
+            (Row::Agent { .. }, Some(Row::Agent { .. }))
+                if !layout.compact && !layout.structured =>
+            {
                 config.agents.row_gap
             }
             _ => 0,
@@ -668,6 +713,10 @@ fn render_row(
                 (String::new(), Style::default())
             }
         };
+    if layout.structured && !layout.compact && !matches!(row, Row::Header { .. }) {
+        render_structured_row(buffer, rect, row, endpoints, config, &right_slot, hits);
+        return;
+    }
     match row {
         Row::Header {
             key,
@@ -735,6 +784,7 @@ fn render_row(
             age,
             faded,
             ctx,
+            ..
         } => {
             let endpoint = &endpoints[*endpoint];
             if *focused {
@@ -880,6 +930,163 @@ fn render_row(
                 rect.y,
                 &tag,
                 Style::default().fg(palette.overlay0),
+            );
+            if *stale || *hidden || (*faded && !*focused) {
+                buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            hits.drovr_rows.push(RowHit {
+                rect,
+                endpoint_id: endpoint.endpoint_id.clone(),
+                workspace_id: workspace_id.clone(),
+                pane_id: None,
+            });
+        }
+    }
+}
+
+/// Structured rows start one column right of the project header's "▾".
+const STRUCTURED_INDENT: u16 = 2;
+
+type RightSlot<'a> =
+    dyn Fn(Option<usize>, &Option<String>, &Option<String>) -> (String, Style) + 'a;
+
+/// Structured view rows: a workspace header (label, remote machine on the
+/// right) or one agent line (vendor mark, state mark, state-coloured title).
+fn render_structured_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    row: &Row,
+    endpoints: &[ClientShellEndpoint],
+    config: &ClientShellConfig,
+    right_slot: &RightSlot<'_>,
+    hits: &mut ShellHitMap,
+) {
+    let palette = &config.palette;
+    let light = radar::is_light(palette);
+    match row {
+        Row::Header { .. } => {}
+        Row::Agent {
+            endpoint,
+            workspace_id,
+            pane_id,
+            focused,
+            stale,
+            title,
+            number,
+            kept,
+            age,
+            faded,
+            ctx,
+            vendor,
+            tone,
+            ..
+        } => {
+            let endpoint = &endpoints[*endpoint];
+            if *focused {
+                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            }
+            let (slot, slot_style) = right_slot(*number, age, ctx);
+            put_right_text(buffer, rect, rect.y, &slot, slot_style);
+            let right = rect
+                .right()
+                .saturating_sub(display_width(&slot) + u16::from(!slot.is_empty()));
+            let mut x = rect.x + STRUCTURED_INDENT;
+            if let Some((mark, color)) = radar::logo(
+                vendor.as_deref(),
+                config.agent_icons,
+                light,
+                palette.overlay0,
+            ) {
+                put_text(buffer, x, rect.y, 1, &mark, Style::default().fg(color));
+                x = x.saturating_add(2);
+            }
+            let (color, bold) = radar::title_style(*tone, vendor.as_deref(), light);
+            let mut style = Style::default().fg(color);
+            if bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let text = [
+                radar::lead(*tone),
+                kept.then_some("⚑"),
+                Some(title.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            let width = right.saturating_sub(x);
+            put_text(buffer, x, rect.y, width, &radar::fit(&text, width), style);
+            if *stale || (*faded && !*focused) {
+                buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            hits.endpoint_agents
+                .push((rect, endpoint.endpoint_id.clone(), pane_id.clone()));
+            hits.drovr_rows.push(RowHit {
+                rect,
+                endpoint_id: endpoint.endpoint_id.clone(),
+                workspace_id: workspace_id.clone(),
+                pane_id: Some(pane_id.clone()),
+            });
+        }
+        Row::Workspace {
+            endpoint,
+            workspace_id,
+            label,
+            focused,
+            stale,
+            hidden,
+            machine,
+            number,
+            age,
+            faded,
+            ..
+        } => {
+            let endpoint = &endpoints[*endpoint];
+            if *focused {
+                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            }
+            let (slot, slot_style) = right_slot(*number, age, &None);
+            put_right_text(buffer, rect, rect.y, &slot, slot_style);
+            let tag = machine
+                .as_ref()
+                .map(|machine| format!("{machine} "))
+                .unwrap_or_default();
+            let tag_rect = Rect::new(
+                rect.x,
+                rect.y,
+                rect.width.saturating_sub(display_width(&slot)),
+                1,
+            );
+            put_right_text(
+                buffer,
+                tag_rect,
+                rect.y,
+                &tag,
+                Style::default().fg(palette.overlay0),
+            );
+            let x = rect.x + STRUCTURED_INDENT;
+            let width = tag_rect
+                .right()
+                .saturating_sub(display_width(&tag) + u16::from(!tag.is_empty()))
+                .saturating_sub(x);
+            let text = if *hidden {
+                format!("⊘ {label}")
+            } else {
+                label.clone()
+            };
+            put_text(
+                buffer,
+                x,
+                rect.y,
+                width,
+                &radar::fit(&text, width),
+                Style::default()
+                    .fg(if *focused {
+                        palette.text
+                    } else {
+                        radar::subtle(light)
+                    })
+                    .add_modifier(Modifier::BOLD),
             );
             if *stale || *hidden || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
@@ -1159,4 +1366,259 @@ pub(super) fn project_target(
         }
     }
     best.map(|(_, endpoint_id, target)| (endpoint_id, target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::schema::AgentStatus;
+    use crate::protocol::{ClientShellAgent, ClientShellPane};
+
+    fn workspace(id: &str, label: &str) -> ClientShellWorkspace {
+        let mut workspace = super::super::tests::snapshot().workspaces.remove(0);
+        workspace.workspace_id = id.into();
+        workspace.label = label.into();
+        workspace.new_workspace_cwd = format!("/src/{label}");
+        workspace.focused = false;
+        workspace
+    }
+
+    fn agent(pane: &str, workspace: &str, vendor: &str, title: &str) -> ClientShellAgent {
+        ClientShellAgent {
+            pane_id: pane.into(),
+            workspace_id: workspace.into(),
+            tab_id: "tab_1".into(),
+            name: None,
+            display_agent: None,
+            agent: Some(vendor.into()),
+            title: Some(title.into()),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Idle,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: false,
+        }
+    }
+
+    fn endpoint(
+        endpoint_id: ClientEndpointId,
+        label: &str,
+        workspaces: Vec<ClientShellWorkspace>,
+        agents: Vec<ClientShellAgent>,
+    ) -> ClientShellEndpoint {
+        let mut snapshot = super::super::tests::snapshot();
+        snapshot.panes = agents
+            .iter()
+            .map(|agent| ClientShellPane {
+                pane_id: agent.pane_id.clone(),
+                workspace_id: agent.workspace_id.clone(),
+                tab_id: "tab_1".into(),
+                label: None,
+                cwd: None,
+                foreground_cwd: None,
+                focused: false,
+                right_click_passthrough: false,
+            })
+            .collect();
+        snapshot.workspaces = workspaces;
+        snapshot.agents = agents;
+        let mut endpoint = super::super::endpoints::local_endpoint();
+        endpoint.endpoint_id = endpoint_id;
+        endpoint.label = label.into();
+        endpoint.snapshot = Some(Box::new(snapshot));
+        endpoint
+    }
+
+    /// GTM project: local gtm-rd (2 agents) and Code (1 agent); Other: the
+    /// remote machine's turfobet.fr (1 agent) and an empty local scratch.
+    fn fixture() -> Vec<ClientShellEndpoint> {
+        let remote = ClientEndpointId::Ssh(
+            crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef")
+                .expect("valid profile id"),
+        );
+        let mut first = agent("p1", "w1", "claude", "Fix auth flow in gateway");
+        first.focused = true;
+        vec![
+            endpoint(
+                ClientEndpointId::Local,
+                "Local",
+                vec![
+                    workspace("w1", "gtm-rd"),
+                    workspace("w2", "Code"),
+                    workspace("w3", "scratch"),
+                ],
+                vec![
+                    first,
+                    agent("p2", "w1", "codex", "Review PR 42"),
+                    agent("p3", "w2", "claude", "Herdr mix local and remote"),
+                ],
+            ),
+            endpoint(
+                remote,
+                "mato",
+                vec![workspace("w9", "turfobet.fr")],
+                vec![agent(
+                    "p9",
+                    "w9",
+                    "claude",
+                    "Claude Code settings permissions",
+                )],
+            ),
+        ]
+    }
+
+    fn structured_layout() -> ProjectLayout {
+        ProjectLayout {
+            structured: true,
+            groups: vec![projects::ProjectGroup {
+                name: "GTM".into(),
+                members: vec!["local/w1:gtm-rd".into(), "local/w2:Code".into()],
+                ..projects::ProjectGroup::default()
+            }],
+            ..ProjectLayout::default()
+        }
+    }
+
+    /// One line per row: H(eader), W(orkspace) with machine tag, A(gent).
+    fn describe(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                Row::Header { label, .. } => format!("H {label}"),
+                Row::Workspace { label, machine, .. } => {
+                    format!("W {label} {}", machine.as_deref().unwrap_or("-"))
+                }
+                Row::Agent { title, vendor, .. } => {
+                    format!(
+                        "A {} {title} h{}",
+                        vendor.as_deref().unwrap_or("-"),
+                        row.height()
+                    )
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn view_toggle_cycles_through_three_views() {
+        let mut layout = ProjectLayout::default();
+        layout.cycle_view();
+        assert!(layout.compact && !layout.structured);
+        layout.cycle_view();
+        assert!(!layout.compact && layout.structured);
+        layout.cycle_view();
+        assert!(!layout.compact && !layout.structured);
+    }
+
+    #[test]
+    fn structured_rows_have_workspace_headers_and_one_line_per_agent() {
+        let endpoints = fixture();
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &structured_layout());
+        assert_eq!(
+            describe(&rows),
+            vec![
+                "H GTM",
+                "W gtm-rd -",
+                "A claude Fix auth flow in gateway h1",
+                "A codex Review PR 42 h1",
+                "W Code -",
+                "A claude Herdr mix local and remote h1",
+                "H Other",
+                "W scratch -",
+                "W turfobet.fr mato",
+                "A claude Claude Code settings permissions h1",
+            ]
+        );
+        // The header of the workspace holding the focused agent stays plain.
+        assert!(rows
+            .iter()
+            .all(|row| !matches!(row, Row::Workspace { focused: true, .. })));
+    }
+
+    #[test]
+    fn active_filter_drops_headers_whose_agents_are_all_filtered() {
+        let endpoints = fixture();
+        let mut layout = structured_layout();
+        layout.active_only = true;
+        // Every agent is idle with an unknown age, so none is current; the
+        // focused workspace still is, but detailed view would show nothing for
+        // it, and neither does structured.
+        let mut local = endpoints[0].clone();
+        if let Some(snapshot) = local.snapshot.as_deref_mut() {
+            snapshot.workspaces[0].focused = true;
+        }
+        let rows = build_rows(&[local], &ClientEndpointId::Local, &layout);
+        assert!(describe(&rows)
+            .iter()
+            .all(|row| !row.starts_with("W gtm-rd")));
+    }
+
+    #[test]
+    fn structured_hits_match_drawn_rows() {
+        let endpoints = fixture();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let area = Rect::new(0, 0, 34, 20);
+        let mut buffer = Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        let layout = structured_layout();
+        // Same stacking as render_panel: one line per row, a gap before headers.
+        let mut y = 0;
+        for (index, row) in build_rows(&endpoints, &ClientEndpointId::Local, &layout)
+            .iter()
+            .enumerate()
+        {
+            if index > 0 && matches!(row, Row::Header { .. }) {
+                y += 1;
+            }
+            let rect = Rect::new(0, y, area.width, row.height());
+            render_row(
+                &mut buffer,
+                rect,
+                row,
+                &layout,
+                &endpoints,
+                &config,
+                None,
+                &mut hits,
+            );
+            y += row.height();
+        }
+        let line = |y: u16| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect::<String>()
+        };
+        let drawn = hits
+            .drovr_rows
+            .iter()
+            .map(|hit| {
+                assert_eq!(hit.rect.height, 1);
+                (hit.pane_id.clone(), line(hit.rect.y))
+            })
+            .collect::<Vec<_>>();
+        let find = |pane: Option<&str>, text: &str| {
+            drawn
+                .iter()
+                .any(|(hit, line)| hit.as_deref() == pane && line.contains(text))
+        };
+        assert!(find(Some("p1"), "Fix auth flow in gateway"));
+        assert!(find(Some("p2"), "Review PR 42"));
+        assert!(find(Some("p3"), "Herdr mix local and remote"));
+        assert!(find(None, "gtm-rd"));
+        assert!(find(None, "scratch"));
+        // Remote workspace header: machine tag on the right; local ones have none.
+        assert!(drawn.iter().any(|(hit, line)| hit.is_none()
+            && line.contains("turfobet.fr")
+            && line.trim_end().ends_with("mato")));
+        assert!(!find(None, "Local"));
+        // A long title is cut with an ellipsis inside the row.
+        assert!(find(Some("p9"), "…"));
+        // Project headers sit on their own lines, between the rows.
+        for (rect, _) in &hits.projects {
+            assert!(hits.drovr_rows.iter().all(|hit| hit.rect.y != rect.y));
+        }
+        assert_eq!(hits.drovr_rows.len(), 8);
+        assert_eq!(hits.endpoint_agents.len(), 4);
+    }
 }
