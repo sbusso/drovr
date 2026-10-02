@@ -468,6 +468,23 @@ impl ClientShellState {
             outcome.repaint = true;
             return true;
         }
+        if let Some(key) = self
+            .hits
+            .sheprd_rail
+            .iter()
+            .find(|(rect, _)| super::contains(*rect, point))
+            .map(|(_, key)| key.clone())
+        {
+            if let Some((endpoint_id, target)) = super::sheprd_sidebar::project_target(
+                &self.endpoints,
+                &self.active_endpoint_id,
+                &key,
+            ) {
+                self.focus_or_activate(endpoint_id, target, outcome);
+            }
+            outcome.repaint = true;
+            return true;
+        }
         if super::contains(self.hits.sheprd_attention, point) {
             self.focus_next_attention_agent(outcome);
             return true;

@@ -62,6 +62,14 @@ Install the hook on every machine where agents run:
   24 h ago (`recent_hours`), so something you just read doesn't vanish.
   Older idle agents are dimmed in *all agents*.
 
+### Collapsed sidebar: a project rail
+Collapsed, the sidebar becomes a 3-column rail: the needs-you counter, then one
+row per project (worst status + a 2-letter tag, e.g. `●TC`), with the project
+you're in spelled downwards beneath its row. Click a row to jump to that
+project's most urgent agent. Peek (`prefix+space`) shows the full sidebar over
+the panes for a moment. Tags are derived from the name; set `short = "OP"` on a
+project to choose your own.
+
 ### Projects across machines
 - **Drag** any row onto a project header to move its workspace there. Drop it on
   **Other** to take it out, or on another row to place it just above that row.

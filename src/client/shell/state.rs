@@ -91,6 +91,8 @@ pub(super) struct ShellHitMap {
     pub(super) sheprd_view_toggle: Rect,
     pub(super) sheprd_filter_toggle: Rect,
     pub(super) sheprd_attention: Rect,
+    /// Collapsed rail rows (rect, project key).
+    pub(super) sheprd_rail: Vec<(Rect, String)>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,

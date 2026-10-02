@@ -42,6 +42,45 @@ pub(super) struct ProjectGroup {
     pub(super) members: Vec<String>,
     #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
     pub(super) rules: Vec<String>,
+    /// Two-letter tag for the collapsed rail (default: derived from the name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) short: Option<String>,
+}
+
+/// Rail tag: explicit `short`, else capitals ("TheCalendar" -> "TC"), else
+/// first letters of the first two words ("Outsmartis ops" -> "OO"), else the
+/// first two letters ("Infrastructure" -> "In").
+pub(super) fn project_tag(name: &str, short: Option<&str>) -> String {
+    if let Some(short) = short.filter(|short| !short.trim().is_empty()) {
+        return short.trim().chars().take(2).collect();
+    }
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    if words.len() >= 2 {
+        return words
+            .iter()
+            .take(2)
+            .filter_map(|word| word.chars().next())
+            .flat_map(char::to_uppercase)
+            .collect();
+    }
+    let capitals = name
+        .chars()
+        .filter(|c| c.is_uppercase())
+        .take(2)
+        .collect::<String>();
+    if capitals.chars().count() == 2 {
+        return capitals;
+    }
+    let mut chars = name.chars();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    let second = chars
+        .next()
+        .map(|c| c.to_lowercase().collect::<String>())
+        .unwrap_or_default();
+    format!("{first}{second}")
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -1115,6 +1154,16 @@ mod tests {
         layout.assign("local/x", "A");
         assert_eq!(layout.groups[0].members, vec!["local/x".to_string()]);
         assert!(layout.groups[1].members.is_empty());
+    }
+
+    #[test]
+    fn rail_tags() {
+        assert_eq!(project_tag("TheCalendar", None), "TC");
+        assert_eq!(project_tag("Outsmartis ops", None), "OO");
+        assert_eq!(project_tag("Infrastructure", None), "In");
+        assert_eq!(project_tag("LF", None), "LF");
+        assert_eq!(project_tag("VTM", None), "VT");
+        assert_eq!(project_tag("Anything", Some("op")), "op");
     }
 
     #[test]

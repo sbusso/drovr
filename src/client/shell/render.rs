@@ -269,7 +269,16 @@ pub(super) fn render_shell(
     }
     if layout.sidebar.width > 0 {
         if state.endpoints.len() > 1 {
-            if state.sidebar_collapsed {
+            if state.sidebar_collapsed && !cfg!(test) {
+                // andreconde fork (sheprd): project rail instead of machines + agents.
+                super::sheprd_sidebar::render_collapsed(
+                    buffer,
+                    layout.sidebar,
+                    config,
+                    &mut state,
+                    &mut hits,
+                );
+            } else if state.sidebar_collapsed {
                 super::endpoint_sidebar::render_collapsed(
                     buffer,
                     layout.sidebar,
@@ -346,6 +355,7 @@ pub(super) fn render_shell(
         hits.sheprd_view_toggle = Rect::default();
         hits.sheprd_filter_toggle = Rect::default();
         hits.sheprd_attention = Rect::default();
+        hits.sheprd_rail.clear();
         hits.workspaces.clear();
         hits.agents.clear();
         hits.endpoint_agents.clear();

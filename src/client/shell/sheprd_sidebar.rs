@@ -383,6 +383,32 @@ pub(super) fn render(
     state: &mut ShellRenderState<'_>,
     hits: &mut ShellHitMap,
 ) {
+    let _ = std::mem::take(state.reveal_navigation_workspace);
+    let reveal_focused = std::mem::take(state.reveal_focused_workspace);
+    render_panel(
+        buffer,
+        area,
+        config,
+        state.endpoints,
+        state.active_endpoint_id,
+        state.workspace_scroll,
+        reveal_focused,
+        hits,
+    );
+}
+
+/// The full sidebar into `area` (also used for the peek over a collapsed rail).
+#[allow(clippy::too_many_arguments)] // one render pass; a struct would only shuffle these
+pub(super) fn render_panel(
+    buffer: &mut Buffer,
+    area: Rect,
+    config: &ClientShellConfig,
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    workspace_scroll: &mut usize,
+    reveal_focused: bool,
+    hits: &mut ShellHitMap,
+) {
     let palette = &config.palette;
     super::render::render_sidebar_background(buffer, area, palette);
     hits.sidebar_divider = if area.is_empty() {
@@ -419,7 +445,7 @@ pub(super) fn render(
             .add_modifier(Modifier::BOLD),
     );
     // Attention counter: how many agents need you; click = next one (prefix+u).
-    let (needing, blocked) = attention_count(state.endpoints, &layout);
+    let (needing, blocked) = attention_count(endpoints, &layout);
     hits.sheprd_attention = Rect::default();
     if needing > 0 {
         let counter = format!(" ● {needing}");
@@ -462,7 +488,7 @@ pub(super) fn render(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = build_rows(state.endpoints, state.active_endpoint_id, &layout);
+    let rows = build_rows(endpoints, active_endpoint_id, &layout);
     let body = Rect::new(
         inner.x,
         inner.y + 1,
@@ -482,30 +508,25 @@ pub(super) fn render(
             _ => 0,
         })
         .collect::<Vec<_>>();
-    let _ = std::mem::take(state.reveal_navigation_workspace);
-    if std::mem::take(state.reveal_focused_workspace) {
+    if reveal_focused {
         if let Some(target) = rows.iter().position(|row| match row {
             Row::Agent { focused, .. } | Row::Workspace { focused, .. } => *focused,
             Row::Header { .. } => false,
         }) {
-            *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
+            *workspace_scroll = super::scroll::list_scroll_start_to_reveal(
                 &row_heights,
                 &gaps,
                 body.height,
-                *state.workspace_scroll,
+                *workspace_scroll,
                 target,
             );
         }
     }
-    let metrics = super::scroll::list_scroll_metrics(
-        &row_heights,
-        &gaps,
-        body.height,
-        *state.workspace_scroll,
-    );
+    let metrics =
+        super::scroll::list_scroll_metrics(&row_heights, &gaps, body.height, *workspace_scroll);
     hits.workspace_max_scroll = metrics.max_offset_from_bottom;
     hits.workspace_scroll_metrics = Some(metrics);
-    *state.workspace_scroll = metrics
+    *workspace_scroll = metrics
         .max_offset_from_bottom
         .saturating_sub(metrics.offset_from_bottom);
     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
@@ -513,13 +534,15 @@ pub(super) fn render(
     let drag_point = projects::press().and_then(|press| press.dragging);
 
     let mut y = body.y;
-    for (index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
+    for (index, row) in rows.iter().enumerate().skip(*workspace_scroll) {
         let height = row_heights[index];
         if y.saturating_add(height) > body.bottom() {
             break;
         }
         let rect = Rect::new(body.x, y, width, height);
-        render_row(buffer, rect, row, &layout, state, config, drag_point, hits);
+        render_row(
+            buffer, rect, row, &layout, endpoints, config, drag_point, hits,
+        );
         y = y.saturating_add(height).saturating_add(gaps[index]);
     }
     if show_scrollbar {
@@ -531,10 +554,9 @@ pub(super) fn render(
     // Footer: new workspace, menu, collapse.
     let footer_y = inner.bottom().saturating_sub(1);
     if config.mouse_capture {
-        let active_label = state
-            .endpoints
+        let active_label = endpoints
             .iter()
-            .find(|endpoint| &endpoint.endpoint_id == state.active_endpoint_id)
+            .find(|endpoint| &endpoint.endpoint_id == active_endpoint_id)
             .map_or("Local", |endpoint| endpoint.label.as_str());
         let label = format!(" new · {active_label}");
         hits.new_workspace =
@@ -557,8 +579,7 @@ pub(super) fn render(
         );
         // Remote machines: latency while peeking; a problem state always.
         let peeking = projects::peeking();
-        let machines = state
-            .endpoints
+        let machines = endpoints
             .iter()
             .filter(|endpoint| !endpoint.endpoint_id.is_local())
             .map(|endpoint| match endpoint.status {
@@ -605,7 +626,7 @@ fn render_row(
     rect: Rect,
     row: &Row,
     layout: &ProjectLayout,
-    state: &ShellRenderState<'_>,
+    endpoints: &[ClientShellEndpoint],
     config: &ClientShellConfig,
     drag_point: Option<(u16, u16)>,
     hits: &mut ShellHitMap,
@@ -715,7 +736,7 @@ fn render_row(
             faded,
             ctx,
         } => {
-            let endpoint = &state.endpoints[*endpoint];
+            let endpoint = &endpoints[*endpoint];
             if *focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
@@ -813,7 +834,7 @@ fn render_row(
             age,
             faded,
         } => {
-            let endpoint = &state.endpoints[*endpoint];
+            let endpoint = &endpoints[*endpoint];
             if *focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
@@ -908,4 +929,234 @@ fn attention_count(endpoints: &[ClientShellEndpoint], layout: &ProjectLayout) ->
         }
     }
     (count, blocked)
+}
+
+/// One project as the collapsed rail sees it.
+struct RailProject {
+    key: String,
+    tag: String,
+    name: String,
+    presence: Presence,
+    current: bool,
+}
+
+/// Projects (and Other) in display order with their worst status, honouring
+/// the active filter; `current` marks the project of the focused workspace.
+fn rail_projects(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    layout: &ProjectLayout,
+) -> Vec<RailProject> {
+    let mut view = layout.clone();
+    view.compact = true;
+    view.other_collapsed = false;
+    for group in &mut view.groups {
+        group.collapsed = false;
+    }
+    let mut projects: Vec<RailProject> = Vec::new();
+    for row in build_rows(endpoints, active_endpoint_id, &view) {
+        match row {
+            Row::Header {
+                key,
+                label,
+                presence,
+                ..
+            } => {
+                let short = layout
+                    .groups
+                    .iter()
+                    .find(|group| group.name == key)
+                    .and_then(|group| group.short.as_deref());
+                projects.push(RailProject {
+                    tag: if key == OTHER {
+                        "··".to_owned()
+                    } else {
+                        projects::project_tag(&label, short)
+                    },
+                    name: label,
+                    key,
+                    presence,
+                    current: false,
+                });
+            }
+            Row::Workspace { focused: true, .. } => {
+                if let Some(project) = projects.last_mut() {
+                    project.current = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    projects
+}
+
+/// andreconde fork (sheprd): the collapsed sidebar as a 3-column project rail:
+/// needs-you counter, one row per project (worst status + 2-letter tag), the
+/// current project's name written vertically, and the expand toggle.
+pub(super) fn render_collapsed(
+    buffer: &mut Buffer,
+    area: Rect,
+    config: &ClientShellConfig,
+    state: &mut ShellRenderState<'_>,
+    hits: &mut ShellHitMap,
+) {
+    let palette = &config.palette;
+    super::render::render_sidebar_background(buffer, area, palette);
+    hits.sidebar_divider = Rect::default();
+    if area.height < 4 || area.width < 3 {
+        return;
+    }
+    let width = area.width.saturating_sub(1).max(1);
+    let layout = projects::layout();
+    let mut y = area.y;
+
+    let (needing, blocked) = attention_count(state.endpoints, &layout);
+    if needing > 0 {
+        let counter = format!("●{}", needing.min(99));
+        hits.sheprd_attention = Rect::new(area.x, y, width, 1);
+        put_text(
+            buffer,
+            area.x,
+            y,
+            width,
+            &counter,
+            Style::default()
+                .fg(if blocked {
+                    status_color(crate::api::schema::AgentStatus::Blocked, palette)
+                } else {
+                    Color::Yellow
+                })
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    y += 1;
+    put_text(
+        buffer,
+        area.x,
+        y,
+        width,
+        &"─".repeat(width as usize),
+        Style::default().fg(palette.surface_dim),
+    );
+    y += 1;
+
+    let bottom = area.bottom().saturating_sub(1);
+    for project in rail_projects(state.endpoints, state.active_endpoint_id, &layout) {
+        if y >= bottom {
+            break;
+        }
+        let rect = Rect::new(area.x, y, width, 1);
+        if project.current {
+            buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+        }
+        let (icon, color) = presence_icon(project.presence, config);
+        put_text(buffer, area.x, y, 1, icon, Style::default().fg(color));
+        put_text(
+            buffer,
+            area.x + 1,
+            y,
+            width.saturating_sub(1),
+            &project.tag,
+            Style::default()
+                .fg(if project.key == OTHER {
+                    palette.overlay0
+                } else if project.current {
+                    palette.text
+                } else {
+                    palette.subtext0
+                })
+                .add_modifier(Modifier::BOLD),
+        );
+        hits.sheprd_rail.push((rect, project.key.clone()));
+        y += 1;
+        if project.current && project.key != OTHER {
+            // The project you're in, spelled downwards (up to 8 letters).
+            for letter in project.name.chars().filter(|c| !c.is_whitespace()).take(8) {
+                if y >= bottom {
+                    break;
+                }
+                put_text(
+                    buffer,
+                    area.x + 1,
+                    y,
+                    1,
+                    &letter.to_string(),
+                    Style::default().fg(palette.accent),
+                );
+                hits.sheprd_rail
+                    .push((Rect::new(area.x, y, width, 1), project.key.clone()));
+                y += 1;
+            }
+        }
+    }
+
+    hits.sidebar_toggle = Rect::new(area.x + width / 2, bottom, 1, 1);
+    put_text(
+        buffer,
+        hits.sidebar_toggle.x,
+        bottom,
+        1,
+        "»",
+        Style::default().fg(palette.overlay0),
+    );
+}
+
+/// Where clicking a project on the rail goes: its most urgent agent (blocked,
+/// unread, finished, working, then any), else its first workspace.
+pub(super) fn project_target(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    key: &str,
+) -> Option<(ClientEndpointId, ClientEndpointFocusTarget)> {
+    let mut layout = projects::layout();
+    layout.compact = false;
+    layout.active_only = false;
+    layout.other_collapsed = false;
+    for group in &mut layout.groups {
+        group.collapsed = false;
+    }
+    let rank = |presence: Presence| match presence {
+        Presence::Blocked => 0,
+        Presence::Unread => 1,
+        Presence::Done => 2,
+        Presence::Working => 3,
+        Presence::Idle => 4,
+    };
+    let mut in_project = false;
+    let mut best: Option<(u8, ClientEndpointId, ClientEndpointFocusTarget)> = None;
+    for row in build_rows(endpoints, active_endpoint_id, &layout) {
+        match row {
+            Row::Header { key: header, .. } => in_project = header == key,
+            Row::Agent {
+                endpoint,
+                pane_id,
+                presence,
+                stale: false,
+                ..
+            } if in_project => {
+                let candidate = rank(presence);
+                if best.as_ref().is_none_or(|(rank, _, _)| candidate < *rank) {
+                    best = Some((
+                        candidate,
+                        endpoints[endpoint].endpoint_id.clone(),
+                        ClientEndpointFocusTarget::Pane(pane_id),
+                    ));
+                }
+            }
+            Row::Workspace {
+                endpoint,
+                workspace_id,
+                stale: false,
+                ..
+            } if in_project && best.is_none() => {
+                best = Some((
+                    5,
+                    endpoints[endpoint].endpoint_id.clone(),
+                    ClientEndpointFocusTarget::Workspace(workspace_id),
+                ));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(_, endpoint_id, target)| (endpoint_id, target))
 }

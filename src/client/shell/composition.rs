@@ -360,6 +360,42 @@ impl ClientShellState {
         });
         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
+        // andreconde fork (sheprd): peek while the sidebar is collapsed draws the
+        // full sidebar over the panes for a moment (view only).
+        if self.endpoints.len() > 1
+            && self.sidebar_collapsed
+            && layout.sidebar.width > 0
+            && super::projects::peeking()
+        {
+            let width = 34u16.min(cols.saturating_sub(layout.sidebar.x));
+            let area = Rect::new(
+                layout.sidebar.x,
+                layout.sidebar.y,
+                width,
+                layout.sidebar.height,
+            );
+            let mut panel = Buffer::empty(Rect::new(0, 0, cols, rows));
+            let mut scroll = 0usize;
+            let mut scratch = ShellHitMap::default();
+            super::sheprd_sidebar::render_panel(
+                &mut panel,
+                area,
+                &self.config,
+                &self.endpoints,
+                &self.active_endpoint_id,
+                &mut scroll,
+                true,
+                &mut scratch,
+            );
+            let panel = FrameData::from_ratatui_buffer_with_hyperlinks(&panel, None, &[]);
+            for y in area.y..area.bottom() {
+                let start = usize::from(y) * usize::from(frame.width) + usize::from(area.x);
+                let end = start + usize::from(area.width);
+                if end <= frame.cells.len() && end <= panel.cells.len() {
+                    frame.cells[start..end].clone_from_slice(&panel.cells[start..end]);
+                }
+            }
+        }
         let mut occlusion = crate::kitty_graphics::surface::Occlusion::default();
         let has_selection = self
             .selection
