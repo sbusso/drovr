@@ -567,6 +567,8 @@ pub(super) enum ClientContextMenuAction {
     NewOnMachine(usize),
     ProjectNewWorkspace,
     ProjectNewAgent,
+    /// A read-only line (usage); picking it does nothing.
+    Info,
     AgentFocus,
     AgentRename,
 }

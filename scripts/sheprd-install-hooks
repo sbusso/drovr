@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Install sheprd's Claude Code usage hook on this machine (run on every machine
+# where agents run). Copies the hook to ~/.local/bin and registers it as a Stop
+# hook in ~/.claude/settings.json (backup kept; existing hooks untouched).
+set -euo pipefail
+src="$(cd "$(dirname "$0")" && pwd)/sheprd-usage-hook"
+if [ ! -f "$src" ]; then
+  src="$(mktemp)"
+  curl -fsSL https://raw.githubusercontent.com/andreconde21/sheprd/main/scripts/sheprd-usage-hook -o "$src"
+fi
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "$src" "$HOME/.local/bin/sheprd-usage-hook"
+settings="$HOME/.claude/settings.json"
+[ -f "$settings" ] || echo '{}' > "$settings"
+cp "$settings" "$settings.bak-pre-sheprd-usage"
+python3 - "$settings" "$HOME/.local/bin/sheprd-usage-hook" <<'EOF'
+import json, sys
+path, hook = sys.argv[1], sys.argv[2]
+settings = json.load(open(path))
+stop = settings.setdefault("hooks", {}).setdefault("Stop", [])
+command = f"python3 {hook}"
+if not any(h.get("command") == command for group in stop for h in group.get("hooks", [])):
+    stop.append({"hooks": [{"type": "command", "command": command}]})
+json.dump(settings, open(path, "w"), indent=2)
+print("registered:", command)
+EOF
+echo "sheprd usage hook installed (backup: $settings.bak-pre-sheprd-usage)"

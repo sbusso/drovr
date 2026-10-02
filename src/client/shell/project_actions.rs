@@ -26,6 +26,29 @@ fn move_items(items: &mut Vec<ClientContextMenuItem>, groups: &[String], grouped
     items.push(item("→ New project…", Action::ProjectAssignNew));
 }
 
+/// Read-only usage lines for a project's menu (from the sheprd usage hook).
+fn usage_items(name: &str) -> Vec<ClientContextMenuItem> {
+    let layout = projects::layout();
+    let group = (name != projects::OTHER).then_some(name);
+    let line = |label: &str, days: i64| {
+        let usage = projects::project_usage(&layout, group, days);
+        (usage[4] > 0).then(|| {
+            item(
+                format!(
+                    "{label}: {} · {} tokens",
+                    projects::format_minutes(usage[4]),
+                    projects::format_tokens(usage[0] + usage[1] + usage[3])
+                ),
+                Action::Info,
+            )
+        })
+    };
+    [line("Today", 1), line("Last 7 days", 7)]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<ClientContextMenuItem> {
     match target {
         ClientContextMenuTarget::ProjectWorkspace {
@@ -60,14 +83,17 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
                 if *collapsed { "Expand" } else { "Collapse" },
                 Action::ProjectToggleCollapse,
             );
+            let usage = usage_items(name);
             if name == projects::OTHER {
-                return vec![
+                let mut items = vec![
                     item("New agent…", Action::ProjectNewAgent),
                     item("New workspace…", Action::ProjectNewWorkspace),
                     collapse,
                 ];
+                items.extend(usage);
+                return items;
             }
-            vec![
+            let mut items = vec![
                 item("New agent here…", Action::ProjectNewAgent),
                 item("New workspace here…", Action::ProjectNewWorkspace),
                 collapse,
@@ -80,7 +106,9 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
                 item("Rename…", Action::ProjectRename),
                 item("Auto-match rules…", Action::ProjectRules),
                 item("Delete project", Action::ProjectDelete),
-            ]
+            ];
+            items.extend(usage);
+            items
         }
         ClientContextMenuTarget::NewWorkspacePicker { machines, .. } => machines
             .iter()

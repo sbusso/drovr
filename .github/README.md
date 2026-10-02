@@ -39,8 +39,21 @@ agents from **every** machine, then **Other** for everything not in a project.
 ```
 
 The sidebar stays quiet: status and topic only. **Peek** (`prefix+space`)
-reveals idle age, jump numbers and each machine's latency for ten seconds
-(press again to hide).
+reveals, for ten seconds (press again to hide): idle age, context size
+(`ctx 581k`) and jump number per agent, today's time and tokens per project,
+and each machine's latency.
+
+### Time and tokens per project
+A small Claude Code hook (`scripts/sheprd-usage-hook`, a Stop hook) reads each
+session's transcript incrementally after every turn and attaches the session's
+context size and per-day usage to its pane as herdr metadata, so it reaches the
+sidebar from any machine without syncing files. sheprd keeps the history in
+`~/.local/state/herdr/sheprd-usage.json` and attributes it to projects with the
+same rules as the sidebar. Right-click a project for *Today* and *Last 7 days*
+(active time · input + output + cache-write tokens; cache reads are excluded).
+
+Install the hook on every machine where agents run:
+`curl -fsSL https://raw.githubusercontent.com/andreconde21/sheprd/main/scripts/sheprd-install-hooks | bash`
 
 - **Two views** (click the right header label): *detailed*, one row per agent
   with its topic, and *compact*, one line per workspace.
@@ -90,7 +103,7 @@ reveals idle age, jump numbers and each machine's latency for ten seconds
 ### Keys (defaults; no config needed)
 | Key | Action |
 |---|---|
-| `prefix+space` | peek: idle age, numbers, latency |
+| `prefix+space` | peek: idle age, context, numbers, usage, latency |
 | `prefix+u` | next agent that needs you |
 | `prefix+#` | show jump numbers, type one to jump |
 | `prefix+alt+c` | new workspace on a machine you pick |

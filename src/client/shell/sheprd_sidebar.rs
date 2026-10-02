@@ -29,6 +29,8 @@ enum Row {
         collapsed: bool,
         presence: Presence,
         count: usize,
+        /// Today's active time and tokens ("37m · 1.2M"), shown while peeking.
+        usage: Option<String>,
     },
     Agent {
         endpoint: usize,
@@ -44,6 +46,7 @@ enum Row {
         kept: bool,
         age: Option<String>,
         faded: bool,
+        ctx: Option<String>,
     },
     Workspace {
         endpoint: usize,
@@ -83,6 +86,8 @@ struct AgentInfo {
     age: Option<String>,
     /// Shown in the "active" filter: working, needs you, kept or recently idle.
     current: bool,
+    /// Context size from the usage hook ("581k"), shown while peeking.
+    ctx: Option<String>,
 }
 
 fn agent_title(agent: &crate::protocol::ClientShellAgent) -> String {
@@ -189,6 +194,8 @@ fn build_rows(
                 kept,
                 age: idle.map(projects::format_age),
                 current: presence.is_active() || kept || recent,
+                ctx: projects::agent_context_tokens(row.agent)
+                    .map(|tokens| format!("ctx {}", projects::format_tokens(tokens))),
                 focused: row.agent.focused && &endpoint.endpoint_id == active_endpoint_id,
                 stale,
                 title: agent_title(row.agent),
@@ -311,12 +318,21 @@ fn build_rows(
                     kept: agent.kept,
                     age: agent.age,
                     faded: !agent.current,
+                    ctx: agent.ctx,
                 });
             }
         }
         if count == 0 && (layout.active_only || key == OTHER) {
             continue;
         }
+        let today = projects::project_usage(layout, (key != OTHER).then_some(key.as_str()), 1);
+        let usage = (today[4] > 0).then(|| {
+            format!(
+                "{} · {}",
+                projects::format_minutes(today[4]),
+                projects::format_tokens(today[0] + today[1] + today[3])
+            )
+        });
         rows.push(Row::Header {
             key,
             label,
@@ -324,6 +340,7 @@ fn build_rows(
             collapsed,
             presence: worst(presences),
             count,
+            usage,
         });
         if !collapsed {
             rows.extend(body);
@@ -598,33 +615,38 @@ fn render_row(
     let peeking = projects::peeking();
     // Right-hand slot: empty normally; the jump number while the jump prompt
     // is open; idle age + number while peeking (prefix+space).
-    let right_slot = |number: Option<usize>, age: &Option<String>| -> (String, Style) {
-        if hinting {
-            (
-                number
-                    .map(|number| format!("{number} "))
-                    .unwrap_or_default(),
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if peeking {
-            let parts = [age.clone(), number.map(|number| format!("#{number}"))]
+    let right_slot =
+        |number: Option<usize>, age: &Option<String>, ctx: &Option<String>| -> (String, Style) {
+            if hinting {
+                (
+                    number
+                        .map(|number| format!("{number} "))
+                        .unwrap_or_default(),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if peeking {
+                let parts = [
+                    age.clone(),
+                    ctx.clone(),
+                    number.map(|number| format!("#{number}")),
+                ]
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            (
-                if parts.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} ", parts.join(" "))
-                },
-                Style::default().fg(palette.overlay0),
-            )
-        } else {
-            (String::new(), Style::default())
-        }
-    };
+                (
+                    if parts.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} ", parts.join(" "))
+                    },
+                    Style::default().fg(palette.overlay0),
+                )
+            } else {
+                (String::new(), Style::default())
+            }
+        };
     match row {
         Row::Header {
             key,
@@ -633,6 +655,7 @@ fn render_row(
             collapsed,
             presence,
             count,
+            usage,
         } => {
             if drag_point.is_some_and(|point| super::contains(rect, point)) {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
@@ -654,7 +677,17 @@ fn render_row(
                     })
                     .add_modifier(Modifier::BOLD),
             );
-            if *collapsed {
+            if peeking {
+                if let Some(usage) = usage {
+                    put_right_text(
+                        buffer,
+                        rect,
+                        rect.y,
+                        &format!("{usage} "),
+                        Style::default().fg(palette.overlay0),
+                    );
+                }
+            } else if *collapsed {
                 let (icon, color) = presence_icon(*presence, config);
                 put_right_text(
                     buffer,
@@ -680,13 +713,14 @@ fn render_row(
             kept,
             age,
             faded,
+            ctx,
         } => {
             let endpoint = &state.endpoints[*endpoint];
             if *focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
             let (icon, color) = presence_icon(*presence, config);
-            let (slot, slot_style) = right_slot(*number, age);
+            let (slot, slot_style) = right_slot(*number, age, ctx);
             let number_width = display_width(&slot) + u16::from(!slot.is_empty());
             let title = if *kept {
                 format!("⚑ {title}")
@@ -792,7 +826,7 @@ fn render_row(
                 if *hidden { "⊘" } else { icon },
                 Style::default().fg(color),
             );
-            let (slot, slot_style) = right_slot(*number, age);
+            let (slot, slot_style) = right_slot(*number, age, &None);
             let tag = match machine {
                 Some(machine) => format!("{machine} "),
                 None => String::new(),

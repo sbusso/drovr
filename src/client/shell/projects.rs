@@ -644,6 +644,9 @@ pub(super) fn observe_activity(endpoint: &ClientShellEndpoint) {
         }
     }
     store.primed.insert(machine);
+    drop(store);
+    observe_usage(endpoint, snapshot);
+    let mut store = activity().lock().unwrap_or_else(|e| e.into_inner());
     let due = store
         .saved
         .is_none_or(|saved| saved.elapsed().as_secs() >= 10);
@@ -673,6 +676,215 @@ pub(super) fn idle_secs(key: &str) -> Option<u64> {
         .agents
         .get(key)
         .and_then(|(_, at)| (*at > 0).then(|| unix_now().saturating_sub(*at)))
+}
+
+/// Token/time usage per agent session, reported by the sheprd usage hook as
+/// pane metadata (`sheprd_u_YYYYMMDD`, `sheprd_session`) and kept here so it
+/// outlives the agent: `<state_dir>/sheprd-usage.json`.
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub(super) struct UsageRecord {
+    /// Workspace key at last sighting, plus what project rules match on.
+    pub(super) key: String,
+    pub(super) label: String,
+    #[serde(default)]
+    pub(super) paths: Vec<String>,
+    /// day -> [input, output, cache_read, cache_write, active_minutes]
+    pub(super) days: std::collections::BTreeMap<String, [u64; 5]>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct UsageStore {
+    #[serde(default)]
+    sessions: std::collections::HashMap<String, UsageRecord>,
+    #[serde(skip)]
+    dirty: bool,
+    #[serde(skip)]
+    saved: Option<Instant>,
+}
+
+fn usage_path() -> PathBuf {
+    crate::config::state_dir().join("sheprd-usage.json")
+}
+
+fn usage_store() -> &'static std::sync::Mutex<UsageStore> {
+    static USAGE: OnceLock<std::sync::Mutex<UsageStore>> = OnceLock::new();
+    USAGE.get_or_init(|| {
+        let loaded = if cfg!(test) {
+            None
+        } else {
+            std::fs::read_to_string(usage_path())
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+        };
+        std::sync::Mutex::new(loaded.unwrap_or_default())
+    })
+}
+
+fn agent_token<'a>(agent: &'a crate::protocol::ClientShellAgent, name: &str) -> Option<&'a str> {
+    agent
+        .tokens
+        .iter()
+        .find(|(token, _)| token == name || token.strip_prefix('$') == Some(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Current context size of an agent, from the usage hook.
+pub(super) fn agent_context_tokens(agent: &crate::protocol::ClientShellAgent) -> Option<u64> {
+    agent_token(agent, "sheprd_ctx")?.parse().ok()
+}
+
+fn observe_usage(endpoint: &ClientShellEndpoint, snapshot: &crate::protocol::ClientShellSnapshot) {
+    let mut store = usage_store().lock().unwrap_or_else(|e| e.into_inner());
+    for agent in &snapshot.agents {
+        let Some(session) = agent_token(agent, "sheprd_session") else {
+            continue;
+        };
+        // One token per day: sheprd_u_YYYYMMDD = "in,out,cache_read,cache_write,minutes".
+        let days = agent
+            .tokens
+            .iter()
+            .filter_map(|(name, value)| {
+                let date = name.trim_start_matches('$').strip_prefix("sheprd_u_")?;
+                if date.len() != 8 {
+                    return None;
+                }
+                let mut totals = [0u64; 5];
+                let mut parts = value.split(',');
+                for slot in &mut totals {
+                    *slot = parts.next()?.trim().parse().ok()?;
+                }
+                Some((
+                    format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8]),
+                    totals,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if days.is_empty() {
+            continue;
+        }
+        let Some(workspace) = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == agent.workspace_id)
+        else {
+            continue;
+        };
+        let record = store
+            .sessions
+            .entry(format!("{}/{session}", machine_key(endpoint)))
+            .or_default();
+        let key = workspace_key(endpoint, workspace);
+        let mut changed = record.key != key;
+        record.key = key;
+        record.label = workspace.label.clone();
+        record.paths = workspace_paths(snapshot, workspace);
+        for (day, totals) in days {
+            if record.days.get(&day) != Some(&totals) {
+                record.days.insert(day, totals);
+                changed = true;
+            }
+        }
+        store.dirty |= changed;
+    }
+    let due = store
+        .saved
+        .is_none_or(|saved| saved.elapsed().as_secs() >= 30);
+    if store.dirty && due && !cfg!(test) {
+        if let Ok(content) = serde_json::to_vec(&*store) {
+            let path = usage_path();
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, content).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                store.dirty = false;
+                store.saved = Some(Instant::now());
+            }
+        }
+    }
+}
+
+/// Usage of one project (`None` = Other) over the last `days` local days:
+/// [input, output, cache_read, cache_write, active_minutes].
+pub(super) fn project_usage(layout: &ProjectLayout, group: Option<&str>, days: i64) -> [u64; 5] {
+    let since = (chrono_like_today_minus(days - 1)).unwrap_or_default();
+    let store = usage_store().lock().unwrap_or_else(|e| e.into_inner());
+    let mut total = [0u64; 5];
+    for record in store.sessions.values() {
+        let owner = layout
+            .group_of(&record.key, &record.label, &record.paths)
+            .map(|index| layout.groups[index].name.as_str());
+        if owner != group {
+            continue;
+        }
+        for totals in record.days.range(since.clone()..).map(|(_, totals)| totals) {
+            for (sum, value) in total.iter_mut().zip(totals) {
+                *sum += value;
+            }
+        }
+    }
+    total
+}
+
+/// Local date `n` days ago as YYYY-MM-DD (no chrono dependency: ask `date`
+/// once per call is too slow, so compute from the system clock + local offset).
+fn chrono_like_today_minus(n: i64) -> Option<String> {
+    let offset = local_utc_offset_secs();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64
+        + offset;
+    let days = now.div_euclid(86_400) - n;
+    Some(civil_from_days(days))
+}
+
+fn local_utc_offset_secs() -> i64 {
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|output| {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let sign = if text.starts_with('-') { -1 } else { 1 };
+                let digits = text.trim_start_matches(['+', '-']);
+                let hours: i64 = digits.get(0..2)?.parse().ok()?;
+                let minutes: i64 = digits.get(2..4)?.parse().ok()?;
+                Some(sign * (hours * 3600 + minutes * 60))
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Days since 1970-01-01 -> "YYYY-MM-DD" (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// "1h05m" / "37m".
+pub(super) fn format_minutes(minutes: u64) -> String {
+    if minutes >= 60 {
+        format!("{}h{:02}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+/// "1.2M" / "340k" / "900".
+pub(super) fn format_tokens(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=999_999 => format!("{}k", tokens / 1_000),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+    }
 }
 
 /// Seconds since a workspace first appeared, if this client saw it appear.
@@ -903,6 +1115,15 @@ mod tests {
         layout.assign("local/x", "A");
         assert_eq!(layout.groups[0].members, vec!["local/x".to_string()]);
         assert!(layout.groups[1].members.is_empty());
+    }
+
+    #[test]
+    fn civil_dates_and_formatting() {
+        assert_eq!(civil_from_days(0), "1970-01-01");
+        assert_eq!(civil_from_days(20_727), "2026-10-01");
+        assert_eq!(format_minutes(65), "1h05m");
+        assert_eq!(format_tokens(1_234_567), "1.2M");
+        assert_eq!(format_tokens(340_000), "340k");
     }
 
     #[test]
