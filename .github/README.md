@@ -8,8 +8,15 @@ drovr is a fork of [sheprd](https://github.com/andreconde21/sheprd) by André
 Conde, which is itself a *client-side* fork of
 [herdr](https://github.com/herdrdev/herdr) by herdrdev. The server is
 unchanged, so the `drovr` client attaches to stock `herdr` servers of the same
-version, locally and over SSH, and uses herdr's own config, state and socket
-paths. Everything herdr does, drovr does; this page lists only the differences.
+version, locally and over SSH, and uses herdr's state and socket paths. It
+reads `~/.config/drovr/config.toml` when that file exists and herdr's
+`config.toml` otherwise. Everything herdr does, drovr does; this page lists
+only the differences.
+
+![drovr with the structured sidebar, two Claude Code agents and a document pane](drovr-screenshot.png)
+
+*The structured sidebar (left) with a workflow's progress under its agent, two
+Claude Code agents, and the document pane showing this README (right).*
 
 > Upstream does not accept outside pull requests, and drovr does not send any.
 > Please don't report drovr behaviour to herdr.
@@ -106,6 +113,23 @@ Install the hook on every machine where agents run:
   24 h ago (`recent_hours`), so something you just read doesn't vanish.
   Older idle agents are dimmed in *all agents*.
 
+### Workflow progress
+When a Claude Code agent runs a background workflow, its sidebar row gets a
+second line with the progress: `▰▰▰▱▱▱ 3/6 · sidebar signals`. The bar and the
+count show the finished phases of the workflow script; the text after them is
+the current phase's detail, or its title when it has none. The colour shows the
+state: the accent colour while it runs, green when it is done, red when it
+failed. Click the line to open a live view of the run in the document pane:
+the phases, each agent and its status, and the results of finished agents.
+
+A Claude Code hook (`scripts/drovr-workflow-hook`, PostToolUse on `Workflow`)
+starts a small watcher when a workflow launches. The watcher reads the run's
+journal every 3 seconds, reports the progress as pane metadata
+(`drovr_wf`, `drovr_wf_phase`, `drovr_wf_doc`), and writes the view to
+`~/.cache/drovr/workflows/<run>.md`. It stops when the session reports the
+workflow's end; the line stays for 10 minutes after that.
+`drovr-install-hooks` installs and registers the hook.
+
 ### Collapsed sidebar: a project rail
 Collapsed, the sidebar becomes a 3-column rail: the needs-you counter, then one
 row per project (worst status + a 2-letter tag, e.g. `●TC`), with the project
@@ -157,6 +181,12 @@ links between documents (Backspace goes back), searches with `/`, and `q`
 closes the pane. Each
 workspace has at most one doc pane; opening another document switches it.
 
+The text sits in a centred reading column (at most 88 columns) with margins.
+Press `w` to switch to the full pane width, or set `doc_full_width = true`
+under `[ui]` to start that way. Code blocks get padding and a language label,
+and local PNG images show inline through Kitty graphics (in Ghostty, Kitty and
+other terminals that support it); other images show their alt text.
+
 Three ways to open a document:
 - **From an agent or a shell**: `drovr doc open <path> [--title <title>]`.
   The first call splits a pane to the right of the caller (45% of its width)
@@ -168,7 +198,8 @@ Three ways to open a document:
   underlines it. Quotes, backticks, brackets, trailing punctuation, a `:line`
   suffix and a `#anchor` are ignored; relative paths are taken from the
   pane's current directory. The doc pane opens next to the clicked pane and
-  takes focus. On this machine drovr runs `drovr doc open` itself; on a
+  takes focus; when the workspace's doc pane is in another tab, it moves to
+  the clicked pane's tab. On this machine drovr runs `drovr doc open` itself; on a
   remote machine it runs `drovr doc open` there over the machine's SSH
   connection, so drovr must be installed on that machine. When the SSH
   shell finds drovr neither on its PATH nor in `~/.local/bin`, drovr runs
@@ -197,6 +228,8 @@ workspace action (the newest recent document). The skill tells agents to
 open the plans and reports they write for you with `drovr doc open`.
 
 ### Small fixes
+- In Ghostty, every agent sound also rings the terminal bell, so Ghostty puts
+  a badge on its dock icon while it is in the background.
 - Workspaces are tracked by id, so two with the same name are independent and a
   rename keeps a workspace in its project.
 - **Go To** (`prefix+g`) opens ready to type; arrows and Enter still pick, Left/
@@ -213,7 +246,11 @@ open the plans and reports they write for you with `drovr doc open`.
 | `prefix+alt+h` | show / conceal hidden workspaces |
 
 ## Configuration
-Everything lives client-side in `~/.config/herdr/sidebar.toml`. The UI writes
+drovr reads its settings from `~/.config/drovr/config.toml` when that file
+exists, else from herdr's `~/.config/herdr/config.toml`. To give drovr its own
+settings, copy herdr's file there. `HERDR_CONFIG_PATH` still overrides both.
+
+The sidebar lives client-side in `~/.config/herdr/sidebar.toml`. The UI writes
 it, and hand edits reload within a second:
 
 ```toml
