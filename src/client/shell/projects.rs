@@ -22,7 +22,7 @@
 
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{OnceLock, RwLock},
     time::{Instant, SystemTime},
 };
@@ -132,26 +132,40 @@ fn path() -> PathBuf {
     crate::config::config_dir().join("sidebar.toml")
 }
 
-fn read_file() -> (ProjectLayout, Option<SystemTime>) {
-    // Unit tests must never see (or depend on) the developer's real layout.
-    if cfg!(test) {
-        return (ProjectLayout::default(), None);
-    }
-    let path = path();
-    let mtime = std::fs::metadata(&path)
+/// The layout in `path` and its mtime. A missing file is the default layout;
+/// `None` means the file exists but cannot be read or parsed, so it must be
+/// neither trusted nor overwritten.
+fn load_layout(path: &Path) -> Option<(ProjectLayout, Option<SystemTime>)> {
+    let mtime = std::fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok();
-    let layout = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| toml::from_str(&content).ok())
-        .unwrap_or_default();
-    (layout, mtime)
+    match std::fs::read_to_string(path) {
+        Ok(content) => match toml::from_str(&content) {
+            Ok(layout) => Some((layout, mtime)),
+            Err(err) => {
+                tracing::warn!(path = %path.display(), err = %err, "sidebar.toml does not parse; keeping the previous layout and leaving the file alone");
+                None
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Some((ProjectLayout::default(), None))
+        }
+        Err(_) => None,
+    }
+}
+
+fn read_file() -> Option<(ProjectLayout, Option<SystemTime>)> {
+    // Unit tests must never see (or depend on) the developer's real layout.
+    if cfg!(test) {
+        return Some((ProjectLayout::default(), None));
+    }
+    load_layout(&path())
 }
 
 fn store() -> &'static RwLock<Store> {
     static STORE: OnceLock<RwLock<Store>> = OnceLock::new();
     STORE.get_or_init(|| {
-        let (layout, mtime) = read_file();
+        let (layout, mtime) = read_file().unwrap_or_default();
         RwLock::new(Store {
             layout,
             mtime,
@@ -162,6 +176,8 @@ fn store() -> &'static RwLock<Store> {
 }
 
 /// Current layout; picks up hand edits to sidebar.toml at most once a second.
+/// A file that does not parse (a typo, a half-saved edit) is ignored and the
+/// previous layout stays.
 pub(super) fn layout() -> ProjectLayout {
     let store = store();
     {
@@ -180,37 +196,84 @@ pub(super) fn layout() -> ProjectLayout {
             .ok()
     };
     if mtime != guard.mtime {
-        let (layout, mtime) = read_file();
-        guard.layout = layout;
-        guard.mtime = mtime;
+        if let Some((layout, mtime)) = read_file() {
+            guard.layout = layout;
+            guard.mtime = mtime;
+        }
     }
     guard.layout.clone()
 }
 
-/// Apply a change and persist it.
+/// Write `content` to `path` through a per-process temporary file, so two
+/// clients saving at once never publish each other's half-written file.
+fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Read-modify-write of the layout file under an exclusive lock: re-reads the
+/// file into `layout` (another client may have changed it), applies `change`,
+/// and writes the result back. Returns the new mtime when the file was written.
+/// A file that does not parse is never overwritten: the change then applies to
+/// `layout` (the in-memory copy) only.
+fn persist_change(
+    path: &Path,
+    layout: &mut ProjectLayout,
+    change: impl FnOnce(&mut ProjectLayout),
+) -> Option<Option<SystemTime>> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    // Best effort: without the lock this is still the single-client behaviour.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PathBuf::from(lock_path))
+        .ok();
+    if let Some(lock) = &lock {
+        let _ = lock.lock();
+    }
+    let Some((current, _)) = load_layout(path) else {
+        change(layout);
+        return None;
+    };
+    *layout = current;
+    let before = layout.clone();
+    change(layout);
+    if *layout == before {
+        return None;
+    }
+    let content = toml::to_string_pretty(&*layout).ok()?;
+    let header = "# herdr (drovr fork) sidebar projects. Hand-editable; see projects.rs.\n";
+    write_atomic(path, format!("{header}{content}").as_bytes()).ok()?;
+    Some(
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok(),
+    )
+}
+
+/// Apply a change and persist it. The change is applied to the file as it is
+/// now, not to this client's possibly stale copy, so changes made by other
+/// drovr clients are kept.
 pub(super) fn update(change: impl FnOnce(&mut ProjectLayout)) {
-    let _ = layout();
     let store = store();
     let mut guard = store.write().unwrap_or_else(|e| e.into_inner());
-    let before = guard.layout.clone();
-    change(&mut guard.layout);
-    if guard.layout == before {
-        return;
-    }
     if cfg!(test) {
+        change(&mut guard.layout);
         return;
     }
-    let path = path();
-    if let Ok(content) = toml::to_string_pretty(&guard.layout) {
-        let header = "# herdr (drovr fork) sidebar projects. Hand-editable; see projects.rs.\n";
-        let tmp = path.with_extension("toml.tmp");
-        if std::fs::write(&tmp, format!("{header}{content}")).is_ok()
-            && std::fs::rename(&tmp, &path).is_ok()
-        {
-            guard.mtime = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok();
-        }
+    if let Some(mtime) = persist_change(&path(), &mut guard.layout, change) {
+        guard.mtime = mtime;
+        guard.checked = Instant::now();
     }
 }
 
@@ -704,6 +767,38 @@ struct Activity {
     primed: HashSet<String>,
 }
 
+/// A JSON store from `path`; missing means empty. A file that does not parse
+/// is moved aside (`<name>.bad-<unix secs>`) rather than overwritten later, so
+/// its history can still be recovered by hand.
+fn load_json<T: Default + serde::de::DeserializeOwned>(path: &Path) -> T {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return T::default();
+    };
+    match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(format!(".bad-{}", unix_now()));
+            let aside = PathBuf::from(aside);
+            tracing::warn!(path = %path.display(), aside = %aside.display(), err = %err, "drovr store does not parse; moved aside");
+            let _ = std::fs::rename(path, aside);
+            T::default()
+        }
+    }
+}
+
+impl Activity {
+    /// Add entries saved by other clients; on a clash the later change wins.
+    fn merge(&mut self, saved: Activity) {
+        for (key, (seq, at)) in saved.agents {
+            let entry = self.agents.entry(key).or_insert((seq, at));
+            if at > entry.1 {
+                *entry = (seq, at);
+            }
+        }
+    }
+}
+
 fn activity_path() -> PathBuf {
     crate::config::state_dir().join("drovr-activity.json")
 }
@@ -711,14 +806,11 @@ fn activity_path() -> PathBuf {
 fn activity() -> &'static std::sync::Mutex<Activity> {
     static ACTIVITY: OnceLock<std::sync::Mutex<Activity>> = OnceLock::new();
     ACTIVITY.get_or_init(|| {
-        let loaded = if cfg!(test) {
-            None
+        std::sync::Mutex::new(if cfg!(test) {
+            Activity::default()
         } else {
-            std::fs::read_to_string(activity_path())
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-        };
-        std::sync::Mutex::new(loaded.unwrap_or_default())
+            load_json(&activity_path())
+        })
     })
 }
 
@@ -776,17 +868,15 @@ pub(super) fn observe_activity(endpoint: &ClientShellEndpoint) {
         .saved
         .is_none_or(|saved| saved.elapsed().as_secs() >= 10);
     if store.dirty && due && !cfg!(test) {
+        let path = activity_path();
+        // Keep what other drovr clients recorded since this one loaded.
+        store.merge(load_json(&path));
         let month = 30 * 24 * 3600;
         store
             .agents
             .retain(|_, (_, at)| *at == 0 || now.saturating_sub(*at) < month);
         if let Ok(content) = serde_json::to_vec(&*store) {
-            let path = activity_path();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, content).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            if write_atomic(&path, &content).is_ok() {
                 store.dirty = false;
                 store.saved = Some(Instant::now());
             }
@@ -827,6 +917,25 @@ struct UsageStore {
     saved: Option<Instant>,
 }
 
+impl UsageStore {
+    /// Add sessions and days saved by other clients. Day totals only grow, so
+    /// on a clash the larger value of each field wins.
+    fn merge(&mut self, saved: UsageStore) {
+        for (session, record) in saved.sessions {
+            let Some(mine) = self.sessions.get_mut(&session) else {
+                self.sessions.insert(session, record);
+                continue;
+            };
+            for (day, totals) in record.days {
+                let slot = mine.days.entry(day).or_default();
+                for (value, other) in slot.iter_mut().zip(totals) {
+                    *value = (*value).max(other);
+                }
+            }
+        }
+    }
+}
+
 fn usage_path() -> PathBuf {
     crate::config::state_dir().join("drovr-usage.json")
 }
@@ -834,14 +943,11 @@ fn usage_path() -> PathBuf {
 fn usage_store() -> &'static std::sync::Mutex<UsageStore> {
     static USAGE: OnceLock<std::sync::Mutex<UsageStore>> = OnceLock::new();
     USAGE.get_or_init(|| {
-        let loaded = if cfg!(test) {
-            None
+        std::sync::Mutex::new(if cfg!(test) {
+            UsageStore::default()
         } else {
-            std::fs::read_to_string(usage_path())
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-        };
-        std::sync::Mutex::new(loaded.unwrap_or_default())
+            load_json(&usage_path())
+        })
     })
 }
 
@@ -853,14 +959,23 @@ fn agent_token<'a>(agent: &'a crate::protocol::ClientShellAgent, name: &str) -> 
         .map(|(_, value)| value.as_str())
 }
 
+/// A token from the Claude Code usage hook. Pane tokens outlive the agent, so
+/// they only apply while Claude is the pane's agent: a codex started in the
+/// same pane must not inherit the last Claude session's name or context.
+fn claude_token<'a>(agent: &'a crate::protocol::ClientShellAgent, name: &str) -> Option<&'a str> {
+    (agent.agent.as_deref() == Some("claude"))
+        .then(|| agent_token(agent, name))
+        .flatten()
+}
+
 /// Current context size of an agent, from the usage hook.
 pub(super) fn agent_context_tokens(agent: &crate::protocol::ClientShellAgent) -> Option<u64> {
-    agent_token(agent, "drovr_ctx")?.parse().ok()
+    claude_token(agent, "drovr_ctx")?.parse().ok()
 }
 
 /// The agent session's own name (Claude's custom or AI title), from the usage hook.
 pub(super) fn agent_session_name(agent: &crate::protocol::ClientShellAgent) -> Option<&str> {
-    agent_token(agent, "drovr_name")
+    claude_token(agent, "drovr_name")
         .map(str::trim)
         .filter(|name| !name.is_empty())
 }
@@ -922,10 +1037,11 @@ fn observe_usage(endpoint: &ClientShellEndpoint, snapshot: &crate::protocol::Cli
         .saved
         .is_none_or(|saved| saved.elapsed().as_secs() >= 30);
     if store.dirty && due && !cfg!(test) {
+        let path = usage_path();
+        // Keep what other drovr clients recorded since this one loaded.
+        store.merge(load_json(&path));
         if let Ok(content) = serde_json::to_vec(&*store) {
-            let path = usage_path();
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, content).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            if write_atomic(&path, &content).is_ok() {
                 store.dirty = false;
                 store.saved = Some(Instant::now());
             }
@@ -1105,6 +1221,7 @@ fn focus_queue() -> &'static std::sync::Mutex<Vec<(super::ClientEndpointId, Stri
     QUEUE.get_or_init(Default::default)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // clickable notifications are Linux-only
 pub(crate) fn request_focus(endpoint_id: super::ClientEndpointId, pane_id: String) {
     focus_queue()
         .lock()
@@ -1205,6 +1322,91 @@ pub(super) fn note_focused_agent(key: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "drovr-projects-{name}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn layout_changes_merge_with_the_file_and_never_overwrite_a_broken_one() {
+        let dir = temp_dir("layout");
+        let path = dir.join("sidebar.toml");
+        // Another client assigned a group since this one last read the file.
+        std::fs::write(&path, "[[group]]\nname = \"Billing\"\n").expect("write");
+        let mut memory = ProjectLayout::default();
+        let mtime = persist_change(&path, &mut memory, |layout| layout.show_hidden = true);
+        assert!(mtime.is_some());
+        let saved = load_layout(&path).expect("parses").0;
+        assert!(saved.show_hidden);
+        assert_eq!(saved.groups[0].name, "Billing");
+        assert_eq!(memory, saved);
+        // A typo: the file is left alone; the change still applies in memory.
+        let broken = "show_hidden = tru\n[[group]]\nname = \"Billing\"\n";
+        std::fs::write(&path, broken).expect("write");
+        assert!(load_layout(&path).is_none());
+        let mtime = persist_change(&path, &mut memory, |layout| layout.compact = true);
+        assert!(mtime.is_none());
+        assert!(memory.compact && memory.groups[0].name == "Billing");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), broken);
+        // A missing file is an empty layout, not a broken one.
+        assert_eq!(
+            load_layout(&dir.join("absent.toml")).map(|(layout, _)| layout),
+            Some(ProjectLayout::default())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn json_stores_merge_other_clients_and_move_broken_files_aside() {
+        let dir = temp_dir("json");
+        let path = dir.join("drovr-usage.json");
+        std::fs::write(&path, "{\"sessions\": {\"bad").expect("write");
+        let store: UsageStore = load_json(&path);
+        assert!(store.sessions.is_empty());
+        assert!(!path.exists());
+        let aside = std::fs::read_dir(&dir)
+            .expect("list")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".bad-"));
+        assert!(aside);
+
+        let record = |days: &[(&str, [u64; 5])]| UsageRecord {
+            days: days.iter().map(|(day, t)| ((*day).into(), *t)).collect(),
+            ..UsageRecord::default()
+        };
+        let mut mine = UsageStore::default();
+        mine.sessions
+            .insert("local/a".into(), record(&[("2026-10-01", [5, 1, 0, 0, 2])]));
+        let mut theirs = UsageStore::default();
+        theirs.sessions.insert(
+            "local/a".into(),
+            record(&[("2026-10-01", [3, 4, 0, 0, 1]), ("2026-09-30", [1; 5])]),
+        );
+        theirs
+            .sessions
+            .insert("mato/x".into(), record(&[("2026-10-01", [9; 5])]));
+        mine.merge(theirs);
+        assert_eq!(mine.sessions["local/a"].days["2026-10-01"], [5, 4, 0, 0, 2]);
+        assert_eq!(mine.sessions["local/a"].days["2026-09-30"], [1; 5]);
+        assert!(mine.sessions.contains_key("mato/x"));
+
+        let mut activity = Activity::default();
+        activity.agents.insert("local/p1".into(), (3, 100));
+        let mut saved = Activity::default();
+        saved.agents.insert("local/p1".into(), (2, 50));
+        saved.agents.insert("mato/p9".into(), (7, 70));
+        activity.merge(saved);
+        assert_eq!(activity.agents["local/p1"], (3, 100));
+        assert_eq!(activity.agents["mato/p9"], (7, 70));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn group(name: &str, members: &[&str], rules: &[&str]) -> ProjectGroup {
         ProjectGroup {
