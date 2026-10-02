@@ -57,6 +57,7 @@ pub(super) fn handle_shell_notification_effects(
     for effect in effects {
         match effect {
             shell::ClientShellNotificationEffect::Sound { sound, agent } => {
+                ring_ghostty_bell();
                 let agent = agent.as_deref().and_then(crate::detect::parse_agent_label);
                 if sound_config.allows(agent) {
                     crate::sound::play(sound, sound_config);
@@ -172,6 +173,7 @@ pub(super) fn handle_notify_with_notifiers(
                 );
                 return;
             };
+            ring_ghostty_bell();
             if sound_config.enabled {
                 crate::sound::play(sound, sound_config);
             }
@@ -194,6 +196,15 @@ pub(super) fn handle_notify_with_notifiers(
                 warn!(err = %err, "failed to emit system notification");
             }
         }
+    }
+}
+
+/// drovr fork: every agent sound also rings Ghostty's bell, which badges
+/// its dock icon while Ghostty is in the background. The bell rings even
+/// when the sound is muted, so the badge still marks unread events.
+fn ring_ghostty_bell() {
+    if let Err(err) = crate::terminal_notify::ring_ghostty_bell() {
+        warn!(err = %err, "failed to ring the terminal bell");
     }
 }
 

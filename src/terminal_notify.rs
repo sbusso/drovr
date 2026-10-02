@@ -55,6 +55,19 @@ pub fn show_notification(title: &str, body: Option<&str>) -> io::Result<bool> {
     Ok(true)
 }
 
+/// drovr fork: rings the bell of the outer terminal when it is Ghostty.
+/// Ghostty marks its dock icon with a badge for a bell that rings while it
+/// is in the background. Other terminals may beep, so they get nothing.
+pub fn ring_ghostty_bell() -> io::Result<bool> {
+    if detect_backend() != Some(TerminalNotificationBackend::Ghostty) {
+        return Ok(false);
+    }
+    let mut stdout = io::stdout();
+    stdout.write_all(b"\x07")?;
+    stdout.flush()?;
+    Ok(true)
+}
+
 pub fn split_message(message: &str) -> (&str, Option<&str>) {
     match message.split_once(": ") {
         Some((title, body)) if !title.is_empty() && !body.is_empty() => (title, Some(body)),
