@@ -704,18 +704,28 @@ const BANNER_MIN_WIDTH: u16 = 18;
 /// ...and must leave the rows list at least this many rows.
 const BANNER_MIN_BODY: u16 = 10;
 
-/// Version shown next to the wordmark: the release tag's version when
-/// drovr-release.yml set DROVR_RELEASE_TAG (drovr-v0.9.3-1 -> 0.9.3-1), else
-/// the crate version.
-fn banner_version() -> &'static str {
-    option_env!("DROVR_RELEASE_TAG")
-        .and_then(|tag| tag.strip_prefix("drovr-v"))
-        .unwrap_or(env!("CARGO_PKG_VERSION"))
+/// Versions to try next to the wordmark, widest first: the drovr version
+/// (build_info::DROVR_VERSION) without its `.dirty` mark, then without the
+/// `+N` commit count, then without the `-N` release suffix. A non-numeric
+/// build suffix (`+dev`) has no pixel glyphs and is dropped up front.
+fn banner_versions(version: &str) -> Vec<&str> {
+    let version = version.strip_suffix(".dirty").unwrap_or(version);
+    let release = version.split('+').next().unwrap_or(version);
+    let base = release.split('-').next().unwrap_or(release);
+    let build = &version[release.len()..];
+    let mut versions = Vec::with_capacity(3);
+    if build.len() > 1 && build[1..].bytes().all(|b| b.is_ascii_digit()) {
+        versions.push(version);
+    }
+    versions.push(release);
+    versions.push(base);
+    versions.dedup();
+    versions
 }
 
-/// 4x4-pixel glyphs (`#` = set) for the version's pixel font. Digits use
-/// three pixel columns plus one blank for spacing, so each is 2 cells wide;
-/// '.' and '-' are 1 cell wide.
+/// 4x4-pixel glyphs (`#` = set) for the version's pixel font. A glyph is
+/// as many cells as half its widest row, rounded up: digits and '+' use three
+/// pixel columns plus one blank for spacing (2 cells); '.' and '-' are 1 cell.
 fn pixel_bitmap(c: char) -> Option<[&'static str; 4]> {
     Some(match c {
         '0' => ["###", "#.#", "#.#", "###"],
@@ -730,6 +740,7 @@ fn pixel_bitmap(c: char) -> Option<[&'static str; 4]> {
         '9' => ["###", "#.#", "###", "..#"],
         '.' => ["", "", "", "#"],
         '-' => ["", "#", "", ""],
+        '+' => [".#.", "###", ".#.", ""],
         _ => return None,
     })
 }
@@ -740,7 +751,12 @@ fn pixel_glyph(c: char) -> Option<[String; 2]> {
         ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
     ];
     let bitmap = pixel_bitmap(c)?;
-    let cells = if c.is_ascii_digit() { 2 } else { 1 };
+    let cells = bitmap
+        .iter()
+        .map(|row| row.len())
+        .max()
+        .unwrap_or(0)
+        .div_ceil(2);
     let on = |row: usize, col: usize| bitmap[row].as_bytes().get(col) == Some(&b'#');
     Some([0, 1].map(|half| {
         (0..cells)
@@ -769,8 +785,9 @@ fn pixel_text(text: &str) -> [String; 2] {
 
 /// Draw the banner when it fits and return the rows it takes (2 + 1 blank):
 /// the wordmark in the text colour on the sidebar background, and the version
-/// in the pixel font two columns to its right, dimmer. The version drops its
-/// "-N" suffix, then disappears, when the sidebar is too narrow. No hit rect.
+/// in the pixel font two columns to its right, dimmer. When the sidebar is too
+/// narrow the version drops its "+N", then its "-N" suffix, then disappears
+/// (see banner_versions). No hit rect.
 fn render_banner(buffer: &mut Buffer, area: Rect, inner: Rect, palette: &Palette) -> u16 {
     let rows = BANNER.len() as u16 + 1;
     // Body height is what is left after the banner, toggles, blank and footer.
@@ -791,9 +808,7 @@ fn render_banner(buffer: &mut Buffer, area: Rect, inner: Rect, palette: &Palette
     }
     let version_x = x + display_width(BANNER[0]) + 2;
     let room = inner.right().saturating_sub(version_x);
-    let full = banner_version();
-    let short = full.split('-').next().unwrap_or(full);
-    if let Some(version) = [full, short]
+    if let Some(version) = banner_versions(crate::build_info::DROVR_VERSION)
         .into_iter()
         .map(pixel_text)
         .find(|version| display_width(&version[0]) <= room)
@@ -2682,7 +2697,12 @@ mod tests {
         let config = ClientShellConfig::from_config(&crate::config::Config::default());
         let palette = &config.palette;
         let (buffer, hits, _) = render_with_banner(Rect::new(0, 0, 34, 40), 0);
-        let version = pixel_text(banner_version());
+        // 34 columns leave 15 cells right of the wordmark.
+        let version = banner_versions(crate::build_info::DROVR_VERSION)
+            .into_iter()
+            .map(pixel_text)
+            .find(|version| display_width(&version[0]) <= 15)
+            .expect("the release version fits");
         for row in 0..2u16 {
             let expected = format!(
                 " {}  {}",
@@ -2777,7 +2797,26 @@ mod tests {
             assert!(glyph.iter().all(|row| row.chars().count() == 1));
         }
         assert_ne!(pixel_glyph('.'), pixel_glyph('-'));
+        assert_eq!(pixel_glyph('+'), Some(["▟▖".to_string(), "▝ ".to_string()]));
         assert_eq!(pixel_text("x"), [String::new(), String::new()]);
+    }
+
+    #[test]
+    fn banner_versions_drop_suffixes_widest_first() {
+        assert_eq!(
+            banner_versions("0.9.3-3+1.dirty"),
+            ["0.9.3-3+1", "0.9.3-3", "0.9.3"]
+        );
+        assert_eq!(
+            banner_versions("0.9.3-3+12"),
+            ["0.9.3-3+12", "0.9.3-3", "0.9.3"]
+        );
+        assert_eq!(banner_versions("0.9.3-3"), ["0.9.3-3", "0.9.3"]);
+        assert_eq!(banner_versions("0.9.3+dev"), ["0.9.3"]);
+        assert_eq!(banner_versions("0.9.3"), ["0.9.3"]);
+        // Each candidate renders with glyphs only: 15 cells for "0.9.3-3+1".
+        assert_eq!(pixel_text("0.9.3-3+1")[0].chars().count(), 15);
+        assert_eq!(pixel_text("0.9.3-3+1")[1].chars().count(), 15);
     }
 
     /// Renders the whole structured panel with the default config adjusted
