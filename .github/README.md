@@ -49,6 +49,10 @@ colour; the font must be installed. Without it, set `agent_icons = "letter"`
 (the vendor's first letter) or `"none"` (no mark) under `[ui.sidebar]` in
 herdr's `config.toml`.
 
+A two-row "drovr" banner sits above the sidebar's toggles when the sidebar
+is at least 18 columns wide and tall enough to keep 10 rows for the list.
+Turn it off with `banner = false` under `[ui.sidebar]`.
+
 The sidebar stays quiet: status and topic only. **Peek** (`prefix+space`)
 reveals, for ten seconds (press again to hide): idle age, context size
 (`ctx 581k`) and jump number per agent, today's time and tokens per project,

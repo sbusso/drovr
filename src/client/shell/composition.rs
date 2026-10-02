@@ -388,6 +388,7 @@ impl ClientShellState {
                 &mut scroll,
                 true,
                 self.host_appearance, // drovr fork
+                false,
                 &mut scratch,
             );
             let panel = FrameData::from_ratatui_buffer_with_hyperlinks(&panel, None, &[]);

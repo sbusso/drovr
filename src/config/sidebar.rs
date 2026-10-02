@@ -475,13 +475,26 @@ impl Default for SpacesSidebarConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
     /// drovr fork: vendor mark in the structured sidebar view.
     pub agent_icons: AgentIconsConfig,
+    /// drovr fork: the "drovr" banner above the combined sidebar's toggles.
+    pub banner: bool,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            agents: AgentsSidebarConfig::default(),
+            spaces: SpacesSidebarConfig::default(),
+            agent_icons: AgentIconsConfig::default(),
+            banner: true,
+        }
+    }
 }
 
 /// drovr fork: how the structured sidebar view marks an agent's vendor.

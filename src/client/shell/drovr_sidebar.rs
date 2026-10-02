@@ -527,11 +527,13 @@ pub(super) fn render(
         state.workspace_scroll,
         reveal_focused,
         state.host_appearance,
+        config.banner,
         hits,
     );
 }
 
-/// The full sidebar into `area` (also used for the peek over a collapsed rail).
+/// The full sidebar into `area` (also used, without the banner, for the peek
+/// over a collapsed rail).
 #[allow(clippy::too_many_arguments)] // one render pass; a struct would only shuffle these
 pub(super) fn render_panel(
     buffer: &mut Buffer,
@@ -542,6 +544,7 @@ pub(super) fn render_panel(
     workspace_scroll: &mut usize,
     reveal_focused: bool,
     host_appearance: Option<crate::terminal_theme::HostAppearance>,
+    banner: bool,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -566,8 +569,45 @@ pub(super) fn render_panel(
         workspace_scroll,
         reveal_focused,
         ground,
+        banner,
         hits,
     );
+}
+
+/// The "drovr" wordmark above the toggles, in quarter blocks.
+const BANNER: [&str; 2] = ["▛▀▖▛▀▖▞▀▖▌ ▌▛▀▖", "▙▄▘▌▚▖▝▄▘▝▞ ▌▚▖"];
+/// The banner needs this many sidebar columns...
+const BANNER_MIN_WIDTH: u16 = 18;
+/// ...and must leave the rows list at least this many rows.
+const BANNER_MIN_BODY: u16 = 10;
+
+/// Draw the banner when it fits and return the rows it takes (2 + 1 blank).
+/// The band is inverse text: light background, letters cut out in the
+/// sidebar's own background colour (REVERSED also covers a terminal-default
+/// background). It has no hit rect.
+fn render_banner(buffer: &mut Buffer, area: Rect, inner: Rect, palette: &Palette) -> u16 {
+    let rows = BANNER.len() as u16 + 1;
+    // Body height is what is left after the banner, toggles, blank and footer.
+    if area.width < BANNER_MIN_WIDTH || inner.height.saturating_sub(rows + 3) < BANNER_MIN_BODY {
+        return 0;
+    }
+    let style = Style::default()
+        .fg(palette.text)
+        .bg(palette.sidebar_bg)
+        .add_modifier(Modifier::REVERSED);
+    for (offset, line) in BANNER.iter().enumerate() {
+        let y = inner.y + offset as u16;
+        buffer.set_style(Rect::new(inner.x, y, inner.width, 1), style);
+        put_text(
+            buffer,
+            inner.x + 1,
+            y,
+            inner.width.saturating_sub(1),
+            line,
+            style,
+        );
+    }
+    rows
 }
 
 #[allow(clippy::too_many_arguments)] // one render pass; a struct would only shuffle these
@@ -581,10 +621,23 @@ fn render_panel_with(
     workspace_scroll: &mut usize,
     reveal_focused: bool,
     ground: radar::Ground,
+    banner: bool,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
-    let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let outer = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let banner_rows = if banner {
+        render_banner(buffer, area, outer, palette)
+    } else {
+        0
+    };
+    // Everything below the banner lays out as if the panel started there.
+    let inner = Rect::new(
+        outer.x,
+        outer.y + banner_rows,
+        outer.width,
+        outer.height - banner_rows,
+    );
 
     // Header: filter toggle (left) and view toggle (right).
     let filter = if layout.active_only {
@@ -2152,6 +2205,7 @@ mod tests {
                 &mut scroll,
                 true,
                 radar::Ground::Dark,
+                false,
                 &mut hits,
             );
             let view = (compact, structured);
@@ -2198,6 +2252,7 @@ mod tests {
             &mut 0,
             false,
             radar::Ground::Dark,
+            false,
             &mut hits,
         );
         let p2 = hits
@@ -2241,6 +2296,7 @@ mod tests {
             &mut 0,
             false,
             radar::Ground::Dark,
+            false,
             &mut hits,
         );
         projects::clear_press();
@@ -2249,5 +2305,116 @@ mod tests {
             .collect::<String>();
         assert!(line.starts_with("── gtm-rd ──"), "{line:?}");
         assert_eq!(buffer[(0, gap)].fg, config.palette.accent);
+    }
+
+    fn render_with_banner(area: Rect, scroll: usize) -> (Buffer, ShellHitMap, usize) {
+        let endpoints = fixture();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let mut buffer = Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        let mut scroll = scroll;
+        render_panel_with(
+            &mut buffer,
+            area,
+            &config,
+            &structured_layout(),
+            &endpoints,
+            &ClientEndpointId::Local,
+            &mut scroll,
+            false,
+            radar::Ground::Dark,
+            config.banner,
+            &mut hits,
+        );
+        (buffer, hits, scroll)
+    }
+
+    fn line(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn banner_shows_only_when_it_fits() {
+        assert!(crate::config::Config::default().ui.sidebar.banner);
+        let shown = |width, height| {
+            let (buffer, _, _) = render_with_banner(Rect::new(0, 0, width, height), 0);
+            line(&buffer, 0).contains(BANNER[0])
+        };
+        assert!(shown(18, 16));
+        assert!(shown(34, 40));
+        // Narrower than 18 columns, or fewer than 10 rows left for the list.
+        assert!(!shown(17, 40));
+        assert!(!shown(34, 15));
+    }
+
+    #[test]
+    fn banner_draws_inverse_and_shifts_everything_below_it() {
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let palette = &config.palette;
+        let (buffer, hits, _) = render_with_banner(Rect::new(0, 0, 34, 40), 0);
+        assert_eq!(line(&buffer, 0).trim_end(), format!(" {}", BANNER[0]));
+        assert_eq!(line(&buffer, 1).trim_end(), format!(" {}", BANNER[1]));
+        for (x, y) in [(0, 0), (1, 0), (32, 1)] {
+            let cell = &buffer[(x, y)];
+            assert_eq!((cell.fg, cell.bg), (palette.text, palette.sidebar_bg));
+            assert!(cell.modifier.contains(Modifier::REVERSED));
+        }
+        assert!(line(&buffer, 2)[..].trim_end_matches('│').trim().is_empty());
+        // Below the banner: the same sidebar, three rows lower.
+        let (_, plain, _) = {
+            let endpoints = fixture();
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 34, 37));
+            let mut hits = ShellHitMap::default();
+            let mut scroll = 0;
+            render_panel_with(
+                &mut buffer,
+                Rect::new(0, 0, 34, 37),
+                &config,
+                &structured_layout(),
+                &endpoints,
+                &ClientEndpointId::Local,
+                &mut scroll,
+                false,
+                radar::Ground::Dark,
+                false,
+                &mut hits,
+            );
+            (buffer, hits, scroll)
+        };
+        assert_eq!(hits.drovr_filter_toggle.y, 3);
+        assert_eq!(hits.drovr_view_toggle.y, 3);
+        assert_eq!(hits.workspace_body.y, plain.workspace_body.y + 3);
+        assert_eq!(hits.workspace_body.height, plain.workspace_body.height);
+        let ys = |hits: &ShellHitMap| {
+            hits.drovr_rows
+                .iter()
+                .map(|hit| hit.rect.y)
+                .chain(hits.projects.iter().map(|(rect, _)| rect.y))
+                .chain(hits.drovr_drops.iter().map(|slot| slot.rect.y))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ys(&hits),
+            ys(&plain).iter().map(|y| y + 3).collect::<Vec<_>>()
+        );
+        // Nothing on the banner rows is clickable or a drop target.
+        for y in 0..3 {
+            assert!(ys(&hits).iter().all(|row| *row >= 5), "{y}");
+            assert!(drop_slot_at(&hits.drovr_drops, (3, y)).is_none());
+        }
+        // Scrolling still counts rows of the list only: two rows down skips
+        // the GTM header and the gtm-rd workspace header.
+        let (_, scrolled, offset) = render_with_banner(Rect::new(0, 0, 34, 16), 2);
+        assert_eq!(offset, 2);
+        assert_eq!(scrolled.workspace_body, Rect::new(0, 5, 33, 10));
+        assert_eq!(
+            scrolled
+                .drovr_rows
+                .first()
+                .map(|hit| hit.pane_id.as_deref()),
+            Some(Some("p1"))
+        );
     }
 }
