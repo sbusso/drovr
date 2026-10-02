@@ -951,7 +951,10 @@ fn usage_store() -> &'static std::sync::Mutex<UsageStore> {
     })
 }
 
-fn agent_token<'a>(agent: &'a crate::protocol::ClientShellAgent, name: &str) -> Option<&'a str> {
+pub(super) fn agent_token<'a>(
+    agent: &'a crate::protocol::ClientShellAgent,
+    name: &str,
+) -> Option<&'a str> {
     agent
         .tokens
         .iter()

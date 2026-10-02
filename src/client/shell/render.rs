@@ -358,6 +358,7 @@ pub(super) fn render_shell(
         hits.drovr_view_toggle = Rect::default();
         hits.drovr_filter_toggle = Rect::default();
         hits.drovr_attention = Rect::default();
+        hits.drovr_inbox.clear();
         hits.drovr_rail.clear();
         hits.workspaces.clear();
         hits.agents.clear();

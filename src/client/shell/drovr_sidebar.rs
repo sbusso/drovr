@@ -12,6 +12,7 @@ mod radar;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::agent_signal::{self, AgentSignal, InboxFilter, ItemKind};
 use super::projects::{self, Presence, ProjectLayout, OTHER};
 use super::render::{display_width, put_right_text, put_text, ShellRenderState};
 use super::*;
@@ -125,11 +126,9 @@ enum Row {
         collapsed: bool,
         presence: Presence,
         count: usize,
-        /// Agents shown in the section, and how many of them need you (any
-        /// blocked); the structured header's right-hand counts.
-        agents: usize,
-        needs: usize,
-        blocked: bool,
+        /// Inbox items in the section, and whether one waits on a prompt.
+        items: usize,
+        waiting: bool,
         /// Today's active time and tokens ("37m · 1.2M"), shown while peeking.
         usage: Option<String>,
     },
@@ -151,6 +150,11 @@ enum Row {
         /// Agent id ("claude", "codex"), for the structured view's mark.
         vendor: Option<String>,
         tone: radar::Tone,
+        /// The agent's inbox item; the glyph shows on this row only in the
+        /// detailed view, which has no workspace rows.
+        item: Option<ItemKind>,
+        /// While working: the running tool and how long it has run.
+        doing: Option<(String, String)>,
     },
     Workspace {
         endpoint: usize,
@@ -166,6 +170,8 @@ enum Row {
         faded: bool,
         /// No agents (structured view dims these).
         empty: bool,
+        /// The first of its agents' inbox items in inbox order.
+        item: Option<ItemKind>,
     },
 }
 
@@ -196,6 +202,8 @@ struct AgentInfo {
     ctx: Option<String>,
     vendor: Option<String>,
     tone: radar::Tone,
+    item: Option<ItemKind>,
+    doing: Option<(String, String)>,
 }
 
 /// The first value that says something.
@@ -350,6 +358,7 @@ fn build_rows(
     // Agents in navigation order (the same list prefix+alt+N / prefix+# use).
     let mut agents: HashMap<(usize, String), Vec<AgentInfo>> = HashMap::new();
     let mut next_number = 0usize;
+    let now = agent_signal::unix_now();
     for row in super::aggregate_navigation::aggregate_agent_rows(
         endpoints,
         active_endpoint_id,
@@ -382,6 +391,22 @@ fn build_rows(
             .flatten();
         let recent = idle.is_some_and(|secs| secs < layout.recent_secs());
         let unknown = row.agent.agent_status == crate::api::schema::AgentStatus::Unknown;
+        let signal = AgentSignal::parse(row.agent);
+        // A prompt or finish marked inactive in the sidebar is seen.
+        let status = match (presence, row.agent.agent_status) {
+            (
+                Presence::Idle,
+                crate::api::schema::AgentStatus::Blocked | crate::api::schema::AgentStatus::Done,
+            ) => crate::api::schema::AgentStatus::Idle,
+            (_, status) => status,
+        };
+        let item = signal.item(status, now, agent_signal::DEFAULT_STUCK_SECS);
+        let doing = (presence == Presence::Working)
+            .then(|| {
+                let secs = signal.doing_secs(now)?;
+                Some((signal.doing?, agent_signal::format_elapsed(secs)))
+            })
+            .flatten();
         agents
             .entry((row.endpoint.endpoint_index, row.agent.workspace_id.clone()))
             .or_default()
@@ -399,6 +424,8 @@ fn build_rows(
                 number,
                 vendor: row.agent.agent.clone(),
                 tone: radar::tone(presence, unknown, idle),
+                item,
+                doing,
             });
     }
 
@@ -447,7 +474,7 @@ fn build_rows(
         let mut body = Vec::new();
         let mut presences = Vec::new();
         let mut count = 0usize;
-        let (mut agent_count, mut needs, mut blocked) = (0usize, 0usize, false);
+        let (mut items, mut waiting) = (0usize, false);
         for (endpoint_index, index, hidden) in members {
             if hidden && !layout.show_hidden {
                 continue;
@@ -482,15 +509,15 @@ fn build_rows(
             }
             presences.push(presence);
             count += 1;
+            let item = workspace_agents.iter().filter_map(|agent| agent.item).min();
+            // Like the global badge: only agents you can reach and see.
             for agent in workspace_agents
                 .iter()
-                .filter(|agent| !layout.active_only || agent.current)
+                .filter(|agent| !agent.stale && !hidden)
             {
-                agent_count += 1;
-                // Like the global badge: only agents you can reach and see.
-                if !agent.stale && !hidden {
-                    needs += usize::from(agent.presence.needs_attention());
-                    blocked |= agent.presence == Presence::Blocked;
+                if let Some(item) = agent.item {
+                    items += 1;
+                    waiting |= item.waiting();
                 }
             }
             let focused = workspace.focused && &endpoint.endpoint_id == active_endpoint_id;
@@ -512,6 +539,7 @@ fn build_rows(
                         .flatten(),
                     faded: !current,
                     empty: workspace_agents.is_empty(),
+                    item,
                 });
                 continue;
             }
@@ -536,6 +564,7 @@ fn build_rows(
                     age: None,
                     faded: !current,
                     empty: false,
+                    item,
                 });
             }
             for agent in workspace_agents {
@@ -564,6 +593,8 @@ fn build_rows(
                     ctx: agent.ctx,
                     vendor: agent.vendor,
                     tone: agent.tone,
+                    item: agent.item,
+                    doing: agent.doing,
                 });
             }
         }
@@ -585,9 +616,8 @@ fn build_rows(
             collapsed,
             presence: worst(presences),
             count,
-            agents: agent_count,
-            needs,
-            blocked,
+            items,
+            waiting,
             usage,
         });
         if !collapsed {
@@ -1179,8 +1209,9 @@ fn render_row(
             collapsed,
             presence,
             count,
+            items,
+            waiting,
             usage,
-            ..
         } => {
             let marker = if *collapsed { "▸" } else { "▾" };
             let pin = if *pinned { "★ " } else { "" };
@@ -1209,6 +1240,14 @@ fn render_row(
                         Style::default().fg(palette.overlay0),
                     );
                 }
+            } else if *items > 0 {
+                let text = format!("● {items} ");
+                put_right_text(buffer, rect, rect.y, &text, count_style(*waiting, palette));
+                let width = display_width(&text);
+                hits.drovr_inbox.push((
+                    Rect::new(rect.right().saturating_sub(width), rect.y, width, 1),
+                    InboxFilter::Project(key.clone()),
+                ));
             } else if *collapsed {
                 let (icon, color) = presence_icon(*presence, config);
                 put_right_text(
@@ -1236,6 +1275,8 @@ fn render_row(
             age,
             faded,
             ctx,
+            item,
+            doing,
             ..
         } => {
             let endpoint = &endpoints[*endpoint];
@@ -1243,12 +1284,13 @@ fn render_row(
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
             let (icon, color) = presence_icon(*presence, config);
-            let (slot, slot_style) = right_slot(*number, age, ctx);
+            let (slot, slot_style, glyph) =
+                signal_slot(right_slot(*number, age, ctx), *item, doing, palette);
             let number_width = display_width(&slot) + u16::from(!slot.is_empty());
-            let title = if *kept {
-                format!("⚑ {title}")
-            } else {
-                title.clone()
+            let title = match doing {
+                Some((doing, _)) => format!("▸ {doing}"),
+                None if *kept => format!("⚑ {title}"),
+                None => title.clone(),
             };
             put_text(
                 buffer,
@@ -1314,6 +1356,9 @@ fn render_row(
             if *stale || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
             }
+            if glyph {
+                push_glyph_hit(hits, rect, endpoint, workspace_id);
+            }
             hits.endpoint_agents
                 .push((rect, endpoint.endpoint_id.clone(), pane_id.clone()));
             hits.drovr_rows.push(RowHit {
@@ -1335,6 +1380,7 @@ fn render_row(
             number,
             age,
             faded,
+            item,
             ..
         } => {
             let endpoint = &endpoints[*endpoint];
@@ -1350,7 +1396,8 @@ fn render_row(
                 if *hidden { "⊘" } else { icon },
                 Style::default().fg(color),
             );
-            let (slot, slot_style) = right_slot(*number, age, &None);
+            let (slot, slot_style, glyph) =
+                signal_slot(right_slot(*number, age, &None), *item, &None, palette);
             let tag = match machine {
                 Some(machine) => format!("{machine} "),
                 None => String::new(),
@@ -1386,6 +1433,9 @@ fn render_row(
             );
             if *stale || *hidden || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            if glyph {
+                push_glyph_hit(hits, rect, endpoint, workspace_id);
             }
             hits.drovr_rows.push(RowHit {
                 rect,
@@ -1516,13 +1566,12 @@ fn render_structured_row(
             label,
             pinned,
             collapsed,
-            agents,
-            needs,
-            blocked,
+            items,
+            waiting,
             usage,
             ..
         } => {
-            render_structured_header(
+            let count = render_structured_header(
                 buffer,
                 rect,
                 StructuredHeader {
@@ -1532,13 +1581,16 @@ fn render_structured_row(
                         if *pinned { "★ " } else { "" }
                     ),
                     other: key == OTHER,
-                    agents: *agents,
-                    needs: *needs,
-                    blocked: *blocked,
+                    items: *items,
+                    waiting: *waiting,
                     usage: usage.as_deref().filter(|_| projects::peeking()),
                 },
                 palette,
             );
+            if let Some(count) = count {
+                hits.drovr_inbox
+                    .push((count, InboxFilter::Project(key.clone())));
+            }
             hits.projects.push((rect, key.clone()));
         }
         Row::Agent {
@@ -1555,13 +1607,16 @@ fn render_structured_row(
             ctx,
             vendor,
             tone,
+            doing,
             ..
         } => {
             let endpoint = &endpoints[*endpoint];
             if *focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
-            let (slot, slot_style) = right_slot(*number, age, ctx);
+            // The workspace header above carries the item glyph.
+            let (slot, slot_style, _) =
+                signal_slot(right_slot(*number, age, ctx), None, doing, palette);
             put_right_text(buffer, rect, rect.y, &slot, slot_style);
             let right = rect
                 .right()
@@ -1584,15 +1639,18 @@ fn render_structured_row(
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis());
-            let text = [
-                radar::lead(*tone, now_ms),
-                kept.then_some("⚑"),
-                Some(title.as_str()),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
+            let text = match doing {
+                Some((doing, _)) => format!("▸ {doing}"),
+                None => [
+                    radar::lead(*tone, now_ms),
+                    kept.then_some("⚑"),
+                    Some(title.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" "),
+            };
             let width = right.saturating_sub(x);
             put_text(buffer, x, rect.y, width, &radar::fit(&text, width), style);
             if *stale || (*faded && !*focused) {
@@ -1619,13 +1677,15 @@ fn render_structured_row(
             age,
             faded,
             empty,
+            item,
             ..
         } => {
             let endpoint = &endpoints[*endpoint];
             if *focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
-            let (slot, slot_style) = right_slot(*number, age, &None);
+            let (slot, slot_style, glyph) =
+                signal_slot(right_slot(*number, age, &None), *item, &None, palette);
             put_right_text(buffer, rect, rect.y, &slot, slot_style);
             let tag_rect = Rect::new(
                 rect.x,
@@ -1674,6 +1734,9 @@ fn render_structured_row(
             if *stale || *hidden || ((*faded || *empty) && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
             }
+            if glyph {
+                push_glyph_hit(hits, rect, endpoint, workspace_id);
+            }
             hits.drovr_rows.push(RowHit {
                 rect,
                 endpoint_id: endpoint.endpoint_id.clone(),
@@ -1689,45 +1752,33 @@ struct StructuredHeader<'a> {
     /// Marker, pin and name ("▾ ★ GTM").
     label: &'a str,
     other: bool,
-    agents: usize,
-    needs: usize,
-    blocked: bool,
-    /// Today's usage, shown instead of the counts while peeking.
+    /// Inbox items in the section, and whether one waits on a prompt.
+    items: usize,
+    waiting: bool,
+    /// Today's usage, shown instead of the count while peeking.
     usage: Option<&'a str>,
 }
 
-/// A structured section header: " ▾ GTM ───────── ● 1 · 3 ". The name in the
-/// section style, a dim rule to the counts, then the needs-you count (only
-/// when some agent needs you, in the needs-you colour) and the agent count.
+/// A structured section header: " ▾ GTM ─────────── ● 3 ". The name in the
+/// section style, a dim rule, then the count of inbox items (only when there
+/// are any; in the blocked colour when one waits on a prompt). Returns the
+/// count's rect, a click target that opens the inbox.
 fn render_structured_header(
     buffer: &mut Buffer,
     rect: Rect,
     header: StructuredHeader<'_>,
     palette: &Palette,
-) {
-    let dim = Style::default().fg(palette.overlay0);
-    let mut right: Vec<(String, Style)> = Vec::new();
-    if let Some(usage) = header.usage {
-        right.push((usage.to_owned(), dim));
-    } else {
-        if header.needs > 0 {
-            let color = if header.blocked {
-                status_color(crate::api::schema::AgentStatus::Blocked, palette)
-            } else {
-                Color::Yellow
-            };
-            right.push((
-                format!("● {}", header.needs),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-            right.push((" · ".to_owned(), dim));
-        }
-        right.push((header.agents.to_string(), dim));
-    }
-    let right_width = right
-        .iter()
-        .map(|(text, _)| display_width(text))
-        .sum::<u16>();
+) -> Option<Rect> {
+    let right = match header.usage {
+        Some(usage) => Some((usage.to_owned(), Style::default().fg(palette.overlay0))),
+        None => (header.items > 0).then(|| {
+            (
+                format!("● {}", header.items),
+                count_style(header.waiting, palette),
+            )
+        }),
+    };
+    let right_width = right.as_ref().map_or(0, |(text, _)| display_width(text));
     // One blank column at each edge and around the rule.
     let right_x = rect.right().saturating_sub(right_width + 1);
     let label_x = rect.x + 1;
@@ -1748,7 +1799,7 @@ fn render_structured_header(
             .add_modifier(Modifier::BOLD),
     );
     let rule_x = label_x + display_width(&label) + 1;
-    let rule_width = right_x.saturating_sub(rule_x + 1);
+    let rule_width = right_x.saturating_sub(rule_x + u16::from(right_width > 0));
     put_text(
         buffer,
         rule_x,
@@ -1757,11 +1808,69 @@ fn render_structured_header(
         &"─".repeat(usize::from(rule_width)),
         Style::default().fg(palette.surface_dim),
     );
-    let mut x = right_x;
-    for (text, style) in right {
-        put_text(buffer, x, rect.y, display_width(&text), &text, style);
-        x += display_width(&text);
+    let (text, style) = right?;
+    put_text(buffer, right_x, rect.y, right_width, &text, style);
+    (header.usage.is_none()).then(|| Rect::new(right_x, rect.y, right_width, 1))
+}
+
+/// Inbox count style: the blocked colour when an item waits on a prompt.
+fn count_style(waiting: bool, palette: &Palette) -> Style {
+    let color = if waiting {
+        status_color(crate::api::schema::AgentStatus::Blocked, palette)
+    } else {
+        Color::Yellow
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+/// A row's right slot. The jump number or peek text wins; else an inbox
+/// item's glyph ("! "), else a working agent's elapsed time ("30s "). The
+/// flag says the glyph is drawn, so the caller records its click target.
+fn signal_slot(
+    slot: (String, Style),
+    item: Option<ItemKind>,
+    doing: &Option<(String, String)>,
+    palette: &Palette,
+) -> (String, Style, bool) {
+    if !slot.0.is_empty() {
+        return (slot.0, slot.1, false);
     }
+    if let Some(item) = item {
+        let color = if item.waiting() {
+            status_color(crate::api::schema::AgentStatus::Blocked, palette)
+        } else if item == ItemKind::Finished {
+            status_color(crate::api::schema::AgentStatus::Done, palette)
+        } else {
+            Color::Yellow
+        };
+        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        return (format!("{} ", item.glyph()), style, true);
+    }
+    match doing {
+        Some((_, elapsed)) => (
+            format!("{elapsed} "),
+            Style::default().fg(palette.overlay0),
+            false,
+        ),
+        None => (slot.0, slot.1, false),
+    }
+}
+
+/// Records the glyph drawn by [`signal_slot`] at the right of `rect` as a
+/// click target that opens the inbox on the row's workspace.
+fn push_glyph_hit(
+    hits: &mut ShellHitMap,
+    rect: Rect,
+    endpoint: &ClientShellEndpoint,
+    workspace_id: &str,
+) {
+    hits.drovr_inbox.push((
+        Rect::new(rect.right().saturating_sub(2), rect.y, 2, 1),
+        InboxFilter::Workspace {
+            endpoint_id: endpoint.endpoint_id.clone(),
+            workspace_id: workspace_id.to_owned(),
+        },
+    ));
 }
 
 /// Agents that need you (blocked, finished-unseen, marked unread) on online
@@ -2848,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_section_header_draws_name_rule_and_counts() {
+    fn structured_section_header_draws_name_rule_and_inbox_count() {
         let mut endpoints = fixture();
         if let Some(snapshot) = endpoints[0].snapshot.as_deref_mut() {
             snapshot.agents[1].agent_status = AgentStatus::Blocked;
@@ -2872,24 +2981,24 @@ mod tests {
         };
         let (text, bullet, rule) = header_line(&layout);
         assert!(text.starts_with(" ▾ GTM ─"), "{text:?}");
-        assert!(text.ends_with("─ ● 1 · 3 "), "{text:?}");
+        assert!(text.ends_with("─ ● 1 "), "{text:?}");
         assert_eq!(rule, config.palette.surface_dim);
         assert_eq!(
             bullet,
             Some(status_color(AgentStatus::Blocked, &config.palette))
         );
-        // Collapsed: same counts.
+        // Collapsed: same count.
         layout.groups[0].collapsed = true;
         let (text, _, _) = header_line(&layout);
         assert!(text.starts_with(" ▸ GTM ─"), "{text:?}");
-        assert!(text.ends_with("─ ● 1 · 3 "), "{text:?}");
-        // Nobody needs you: only the agent count.
+        assert!(text.ends_with("─ ● 1 "), "{text:?}");
+        // Nothing in the inbox: no count.
         let rows = build_rows(&fixture(), &ClientEndpointId::Local, &layout, true);
         assert!(matches!(
             rows.first(),
             Some(Row::Header {
-                agents: 3,
-                needs: 0,
+                items: 0,
+                waiting: false,
                 ..
             })
         ));
@@ -2900,14 +3009,13 @@ mod tests {
             StructuredHeader {
                 label: "▾ GTM",
                 other: false,
-                agents: 3,
-                needs: 0,
-                blocked: false,
+                items: 0,
+                waiting: false,
                 usage: None,
             },
             &config.palette,
         );
-        assert_eq!(line(&buffer, 0), format!(" ▾ GTM {} 3 ", "─".repeat(20)));
+        assert_eq!(line(&buffer, 0), format!(" ▾ GTM {} ", "─".repeat(22)));
     }
 
     #[test]
@@ -3099,8 +3207,129 @@ mod tests {
         assert_eq!(defaults.agent_gap, 1);
     }
 
+    /// The fixture with hook tokens: p1 (claude, gtm-rd) runs a tool, p2
+    /// (codex, gtm-rd) waits on a dialog, p3 (claude, Code) finished with a
+    /// question.
+    fn signal_fixture() -> Vec<ClientShellEndpoint> {
+        let mut endpoints = fixture();
+        let started = agent_signal::unix_now() - 30;
+        let agents = &mut endpoints[0].snapshot.as_mut().expect("snapshot").agents;
+        agents[0].agent_status = AgentStatus::Working;
+        agents[0].tokens = vec![
+            ("drovr_state".into(), format!("working|{started}")),
+            ("drovr_doing".into(), "Bash cargo test".into()),
+        ];
+        agents[1].agent_status = AgentStatus::Blocked;
+        agents[2].agent_status = AgentStatus::Done;
+        agents[2].tokens = vec![("drovr_state".into(), format!("asks|{started}"))];
+        endpoints
+    }
+
+    /// The drawn line of the row for `pane` (an agent) or, with `None`, of
+    /// the workspace `workspace`'s own row.
+    fn row_text(
+        buffer: &Buffer,
+        hits: &ShellHitMap,
+        workspace: &str,
+        pane: Option<&str>,
+    ) -> String {
+        let hit = hits
+            .drovr_rows
+            .iter()
+            .find(|hit| hit.workspace_id == workspace && hit.pane_id.as_deref() == pane)
+            .expect("row");
+        line(buffer, hit.rect.y).trim_end().to_owned()
+    }
+
+    fn workspace_filter(workspace: &str) -> InboxFilter {
+        InboxFilter::Workspace {
+            endpoint_id: ClientEndpointId::Local,
+            workspace_id: workspace.into(),
+        }
+    }
+
     #[test]
-    fn header_needs_counts_skip_offline_machines_and_hidden_workspaces() {
+    fn structured_rows_show_the_running_tool_and_glyphs_on_workspaces() {
+        let endpoints = signal_fixture();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let (buffer, hits) = render_structured(&endpoints, &structured_layout(), |_| {});
+        // Working: the tool and its time instead of the title.
+        let working = row_text(&buffer, &hits, "w1", Some("p1"));
+        assert!(working.contains("▸ Bash cargo test"), "{working:?}");
+        assert!(!working.contains("Fix auth flow"), "{working:?}");
+        assert!(
+            working.ends_with("30s") || working.ends_with("31s"),
+            "{working:?}"
+        );
+        // Waiting and done: the glyph on the workspace row only.
+        assert!(row_text(&buffer, &hits, "w1", None).ends_with('◆'));
+        assert!(row_text(&buffer, &hits, "w2", None).ends_with('?'));
+        let waiting = row_text(&buffer, &hits, "w1", Some("p2"));
+        assert!(waiting.ends_with("Review PR 42"), "{waiting:?}");
+        assert!(row_text(&buffer, &hits, "w2", Some("p3")).ends_with("remote"));
+        // One count per section, in the blocked colour while one waits.
+        let header = hits.projects[0].0;
+        assert!(line(&buffer, header.y).trim_end().ends_with("─ ● 2"));
+        let (count, filter) = hits
+            .drovr_inbox
+            .iter()
+            .find(|(rect, _)| rect.y == header.y)
+            .expect("count target");
+        assert_eq!(filter, &InboxFilter::Project("GTM".into()));
+        assert_eq!(
+            buffer[(count.x, count.y)].fg,
+            status_color(AgentStatus::Blocked, &config.palette)
+        );
+        assert_eq!(buffer[(count.x, count.y)].symbol(), "●");
+        // Each glyph is a click target for its workspace.
+        let glyphs = hits
+            .drovr_inbox
+            .iter()
+            .filter(|(rect, _)| rect.y != header.y)
+            .collect::<Vec<_>>();
+        assert_eq!(glyphs.len(), 2);
+        for (rect, filter) in glyphs {
+            let InboxFilter::Workspace { workspace_id, .. } = filter else {
+                panic!("workspace filter");
+            };
+            let glyph = buffer[(rect.x, rect.y)].symbol();
+            assert_eq!(glyph, if workspace_id == "w1" { "◆" } else { "?" });
+        }
+    }
+
+    #[test]
+    fn detailed_rows_carry_glyphs_and_compact_rows_the_first_item() {
+        let endpoints = signal_fixture();
+        let detailed = ProjectLayout {
+            structured: false,
+            ..structured_layout()
+        };
+        let (buffer, hits) = render_structured(&endpoints, &detailed, |_| {});
+        assert!(row_text(&buffer, &hits, "w1", Some("p1")).contains("▸ Bash cargo test"));
+        assert!(row_text(&buffer, &hits, "w1", Some("p2")).ends_with('◆'));
+        assert!(row_text(&buffer, &hits, "w2", Some("p3")).ends_with('?'));
+        let filters = hits
+            .drovr_inbox
+            .iter()
+            .map(|(_, filter)| filter.clone())
+            .collect::<Vec<_>>();
+        assert!(filters.contains(&InboxFilter::Project("GTM".into())));
+        assert!(filters.contains(&workspace_filter("w1")));
+        assert!(filters.contains(&workspace_filter("w2")));
+
+        let compact = ProjectLayout {
+            compact: true,
+            ..structured_layout()
+        };
+        let (buffer, hits) = render_structured(&endpoints, &compact, |_| {});
+        // gtm-rd: the dialog (p2) sorts before nothing (p1 only works).
+        assert!(row_text(&buffer, &hits, "w1", None).ends_with('◆'));
+        assert!(row_text(&buffer, &hits, "w2", None).ends_with('?'));
+        assert!(!row_text(&buffer, &hits, "w9", None).contains('?'));
+    }
+
+    #[test]
+    fn header_inbox_counts_skip_offline_machines_and_hidden_workspaces() {
         let mut endpoints = fixture();
         for endpoint in &mut endpoints {
             if let Some(snapshot) = endpoint.snapshot.as_deref_mut() {
@@ -3115,10 +3344,10 @@ mod tests {
                 .filter_map(|row| match row {
                     Row::Header {
                         label,
-                        needs,
-                        blocked,
+                        items,
+                        waiting,
                         ..
-                    } => Some((label, needs, blocked)),
+                    } => Some((label, items, waiting)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

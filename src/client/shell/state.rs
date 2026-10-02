@@ -101,6 +101,8 @@ pub(super) struct ShellHitMap {
     pub(super) drovr_view_toggle: Rect,
     pub(super) drovr_filter_toggle: Rect,
     pub(super) drovr_attention: Rect,
+    /// Inbox item glyphs and section counts; a click opens the inbox.
+    pub(super) drovr_inbox: Vec<(Rect, super::agent_signal::InboxFilter)>,
     /// Collapsed rail rows (rect, project key).
     pub(super) drovr_rail: Vec<(Rect, String)>,
     pub(super) workspaces: Vec<WorkspaceHit>,

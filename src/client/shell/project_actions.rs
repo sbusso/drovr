@@ -573,6 +573,16 @@ impl ClientShellState {
             self.focus_next_attention_agent(outcome);
             return true;
         }
+        if let Some(filter) = self
+            .hits
+            .drovr_inbox
+            .iter()
+            .find(|(rect, _)| super::contains(*rect, point))
+            .map(|(_, filter)| filter.clone())
+        {
+            self.open_inbox(filter, outcome);
+            return true;
+        }
         if super::contains(self.hits.drovr_view_toggle, point) {
             projects::update(projects::ProjectLayout::cycle_view);
         } else if super::contains(self.hits.drovr_filter_toggle, point) {
@@ -591,6 +601,18 @@ impl ClientShellState {
         }
         outcome.repaint = true;
         true
+    }
+
+    /// Opens the inbox pane filtered to `filter` (a sidebar glyph or section
+    /// count was clicked). Stub: the inbox pane lands in build step 4 of
+    /// docs/design/inbox-pane.md; until then the click opens nothing.
+    pub(super) fn open_inbox(
+        &mut self,
+        filter: super::agent_signal::InboxFilter,
+        outcome: &mut ClientShellInput,
+    ) {
+        tracing::debug!(?filter, "inbox pane not built yet");
+        outcome.repaint = true;
     }
 
     /// prefix+u: focus the next agent (in sidebar order) that is blocked,

@@ -382,6 +382,19 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
    with `updatedPermissions`.
 3. **Sidebar split**: `AgentSignal` parsing and glyph rows. Unit and render
    tests.
+
+   Built in `src/client/shell/agent_signal.rs`: `AgentSignal::parse` reads
+   the drovr-state tokens of a Claude or Codex pane, and `AgentSignal::item`
+   gives the pane's item kind for the sidebar now and the inbox in step 4.
+   A prompt or finish marked inactive in the sidebar counts as seen. The
+   structured view draws the glyph on the workspace row, the detailed view
+   on the agent row, and the compact view on the workspace row; a working
+   agent's title becomes `▸ <drovr_doing>` with its elapsed time on the
+   right. The section count replaces the structured header's needs-you and
+   agent counts. Clicks on a glyph or count call `open_inbox`, a stub until
+   step 4. Two gaps: the stuck threshold is the 10-minute default until step
+   4 adds the setting, and the tokens do not name the model, so `limit` from
+   `drovr_ctx` assumes a 200k window, or 1M once the context passes 200k.
 4. **Inbox pane, read and jump**: `drovr inbox` process, `drovr_inbox` token,
    toggle and reuse, flat order, filters, server marks, per-workspace stuck
    threshold, focus-drop window. Tests: ordering, focus-drop window, narrow
