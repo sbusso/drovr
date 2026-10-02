@@ -484,6 +484,12 @@ pub struct SidebarConfig {
     pub agent_icons: AgentIconsConfig,
     /// drovr fork: the "drovr" banner above the combined sidebar's toggles.
     pub banner: bool,
+    /// drovr fork: show workspaces without agents in the structured view
+    /// (dimmed); false hides them.
+    pub show_empty_workspaces: bool,
+    /// drovr fork: blank rows between agent rows of one workspace in the
+    /// structured view, 0 or 1 (larger values count as 1).
+    pub agent_gap: u16,
 }
 
 impl Default for SidebarConfig {
@@ -493,6 +499,8 @@ impl Default for SidebarConfig {
             spaces: SpacesSidebarConfig::default(),
             agent_icons: AgentIconsConfig::default(),
             banner: true,
+            show_empty_workspaces: true,
+            agent_gap: 1,
         }
     }
 }

@@ -27,6 +27,10 @@ pub(crate) struct ClientShellConfig {
     pub(super) agent_icons: crate::config::AgentIconsConfig,
     /// drovr fork: show the "drovr" banner above the combined sidebar.
     pub(super) banner: bool,
+    /// drovr fork: structured view shows workspaces without agents.
+    pub(super) show_empty_workspaces: bool,
+    /// drovr fork: blank rows between a workspace's agents (structured view).
+    pub(super) agent_gap: u16,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
     pub(super) sound_enabled: bool,

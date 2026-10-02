@@ -858,6 +858,13 @@ pub(super) fn agent_context_tokens(agent: &crate::protocol::ClientShellAgent) ->
     agent_token(agent, "drovr_ctx")?.parse().ok()
 }
 
+/// The agent session's own name (Claude's custom or AI title), from the usage hook.
+pub(super) fn agent_session_name(agent: &crate::protocol::ClientShellAgent) -> Option<&str> {
+    agent_token(agent, "drovr_name")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 fn observe_usage(endpoint: &ClientShellEndpoint, snapshot: &crate::protocol::ClientShellSnapshot) {
     let mut store = usage_store().lock().unwrap_or_else(|e| e.into_inner());
     for agent in &snapshot.agents {

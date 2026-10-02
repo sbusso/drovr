@@ -125,6 +125,11 @@ enum Row {
         collapsed: bool,
         presence: Presence,
         count: usize,
+        /// Agents shown in the section, and how many of them need you (any
+        /// blocked); the structured header's right-hand counts.
+        agents: usize,
+        needs: usize,
+        blocked: bool,
         /// Today's active time and tokens ("37m · 1.2M"), shown while peeking.
         usage: Option<String>,
     },
@@ -159,6 +164,8 @@ enum Row {
         number: Option<usize>,
         age: Option<String>,
         faded: bool,
+        /// No agents (structured view dims these).
+        empty: bool,
     },
 }
 
@@ -191,20 +198,90 @@ struct AgentInfo {
     tone: radar::Tone,
 }
 
-fn agent_title(agent: &crate::protocol::ClientShellAgent) -> String {
-    [
+/// The first value that says something.
+fn said<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+/// Whether `title` only names the folder `cwd`: the path, `~/…` form, bare
+/// folder name, or a shell's `<path>: <job>` (radar's `locationOnly`). `~` is
+/// matched by suffix, since a remote machine's home is not known here.
+fn location_only(title: &str, cwd: &str) -> bool {
+    let names = |text: &str, basename: bool| {
+        text == cwd
+            || text
+                .strip_prefix('~')
+                .is_some_and(|tail| tail.starts_with('/') && cwd.ends_with(tail))
+            || (basename && cwd.rsplit('/').next() == Some(text))
+    };
+    !cwd.is_empty()
+        && (names(title, true)
+            || title
+                .split_once(": ")
+                .is_some_and(|(head, _)| !head.is_empty() && names(head, false)))
+}
+
+/// An agent row's title, first that applies:
+/// 1. the session's own name (`drovr_name`, reported by the usage hook);
+/// 2. the terminal title, unless it is only the vendor's product name
+///    ("Claude Code") or only the pane's folder;
+/// 3. the pane's label, its tab's custom name, or its folder's name;
+/// 4. the generic title (terminal title, else the agent's name or id).
+fn agent_title(
+    agent: &crate::protocol::ClientShellAgent,
+    pane: Option<&crate::protocol::ClientShellPane>,
+    tab: Option<&crate::protocol::ClientShellTab>,
+) -> String {
+    if let Some(name) = projects::agent_session_name(agent) {
+        return name.to_owned();
+    }
+    let terminal = said([
         agent.terminal_title_stripped.as_deref(),
         agent.title.as_deref(),
+        agent.terminal_title.as_deref(),
+    ]);
+    let product = agent.agent.as_deref().and_then(radar::display_name);
+    let vendor_names = [
         agent.display_agent.as_deref(),
-        agent.name.as_deref(),
         agent.agent.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|title| !title.is_empty())
-    .unwrap_or("agent")
-    .to_owned()
+        product,
+    ];
+    let cwd = pane
+        .and_then(|pane| said([pane.foreground_cwd.as_deref(), pane.cwd.as_deref()]))
+        .map(|cwd| cwd.trim_end_matches('/'))
+        .unwrap_or_default();
+    let topic = terminal.filter(|title| {
+        !vendor_names
+            .iter()
+            .flatten()
+            .any(|name| title.eq_ignore_ascii_case(name.trim()))
+            && !location_only(title, cwd)
+    });
+    let place = || {
+        said([
+            pane.and_then(|pane| pane.label.as_deref()),
+            tab.filter(|tab| tab.custom_label)
+                .map(|tab| tab.label.as_str()),
+            cwd.rsplit('/').next(),
+        ])
+    };
+    topic
+        .or_else(place)
+        .or(terminal)
+        .or_else(|| {
+            said([
+                agent.display_agent.as_deref(),
+                agent.name.as_deref(),
+                product,
+                agent.agent.as_deref(),
+            ])
+        })
+        .unwrap_or("agent")
+        .to_owned()
 }
 
 fn worst(presences: impl IntoIterator<Item = Presence>) -> Presence {
@@ -260,10 +337,13 @@ fn workspace_presence(
     )
 }
 
+/// Sidebar rows for `layout`. `show_empty` false drops workspaces without
+/// agents from the structured view (`[ui.sidebar] show_empty_workspaces`).
 fn build_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     layout: &ProjectLayout,
+    show_empty: bool,
 ) -> Vec<Row> {
     // Agents in navigation order (the same list prefix+alt+N / prefix+# use).
     let mut agents: HashMap<(usize, String), Vec<AgentInfo>> = HashMap::new();
@@ -274,6 +354,19 @@ fn build_rows(
         crate::config::AgentPanelSortConfig::Spaces,
     ) {
         let endpoint = &endpoints[row.endpoint.endpoint_index];
+        let snapshot = endpoint.snapshot.as_deref();
+        let pane = snapshot.and_then(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == row.agent.pane_id)
+        });
+        let tab = snapshot.and_then(|snapshot| {
+            snapshot
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == row.agent.tab_id)
+        });
         let stale = row.endpoint.stale();
         let number = (!stale).then(|| {
             next_number += 1;
@@ -300,7 +393,7 @@ fn build_rows(
                     .map(|tokens| format!("ctx {}", projects::format_tokens(tokens))),
                 focused: row.agent.focused && &endpoint.endpoint_id == active_endpoint_id,
                 stale,
-                title: agent_title(row.agent),
+                title: agent_title(row.agent, pane, tab),
                 number,
                 vendor: row.agent.agent.clone(),
                 tone: radar::tone(presence, unknown, idle),
@@ -352,6 +445,7 @@ fn build_rows(
         let mut body = Vec::new();
         let mut presences = Vec::new();
         let mut count = 0usize;
+        let (mut agent_count, mut needs, mut blocked) = (0usize, 0usize, false);
         for (endpoint_index, index, hidden) in members {
             if hidden && !layout.show_hidden {
                 continue;
@@ -381,8 +475,19 @@ fn build_rows(
             if layout.active_only && !current {
                 continue;
             }
+            if structured && workspace_agents.is_empty() && !show_empty {
+                continue;
+            }
             presences.push(presence);
             count += 1;
+            for agent in workspace_agents
+                .iter()
+                .filter(|agent| !layout.active_only || agent.current)
+            {
+                agent_count += 1;
+                needs += usize::from(agent.presence.needs_attention());
+                blocked |= agent.presence == Presence::Blocked;
+            }
             let focused = workspace.focused && &endpoint.endpoint_id == active_endpoint_id;
             if layout.compact || workspace_agents.is_empty() {
                 body.push(Row::Workspace {
@@ -401,6 +506,7 @@ fn build_rows(
                         .then(|| workspace_agents.first().and_then(|agent| agent.age.clone()))
                         .flatten(),
                     faded: !current,
+                    empty: workspace_agents.is_empty(),
                 });
                 continue;
             }
@@ -424,6 +530,7 @@ fn build_rows(
                     number: None,
                     age: None,
                     faded: !current,
+                    empty: false,
                 });
             }
             for agent in workspace_agents {
@@ -473,6 +580,9 @@ fn build_rows(
             collapsed,
             presence: worst(presences),
             count,
+            agents: agent_count,
+            needs,
+            blocked,
             usage,
         });
         if !collapsed {
@@ -495,7 +605,7 @@ pub(super) fn ordered_workspaces(
     for group in &mut layout.groups {
         group.collapsed = false;
     }
-    build_rows(endpoints, active_endpoint_id, &layout)
+    build_rows(endpoints, active_endpoint_id, &layout, true)
         .into_iter()
         .filter_map(|row| match row {
             Row::Workspace {
@@ -785,7 +895,12 @@ fn render_panel_with(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = build_rows(endpoints, active_endpoint_id, layout);
+    let rows = build_rows(
+        endpoints,
+        active_endpoint_id,
+        layout,
+        config.show_empty_workspaces,
+    );
     // One blank, inert line between the toggles and the first section.
     let body = Rect::new(
         inner.x,
@@ -795,7 +910,7 @@ fn render_panel_with(
     );
     hits.workspace_body = body;
     let row_heights = rows.iter().map(Row::height).collect::<Vec<_>>();
-    let gaps = row_gaps(&rows, layout, config.agents.row_gap);
+    let gaps = row_gaps(&rows, layout, config.agents.row_gap, config.agent_gap);
     if reveal_focused {
         if let Some(target) = rows.iter().position(|row| match row {
             Row::Agent { focused, .. } | Row::Workspace { focused, .. } => *focused,
@@ -941,9 +1056,10 @@ fn render_panel_with(
 
 /// Blank lines after each row. Every view leaves one before a project header;
 /// structured also leaves one after each workspace group (before the next
-/// workspace header), never two in a row; detailed spaces agents by `row_gap`.
+/// workspace header) and `agent_gap` (0 or 1) between a workspace's agents,
+/// never two in a row; detailed spaces agents by `row_gap`.
 /// Gaps are skipped space, so they get no hit rect.
-fn row_gaps(rows: &[Row], layout: &ProjectLayout, row_gap: u16) -> Vec<u16> {
+fn row_gaps(rows: &[Row], layout: &ProjectLayout, row_gap: u16, agent_gap: u16) -> Vec<u16> {
     let structured = layout.structured && !layout.compact;
     rows.iter()
         .enumerate()
@@ -954,6 +1070,8 @@ fn row_gaps(rows: &[Row], layout: &ProjectLayout, row_gap: u16) -> Vec<u16> {
             {
                 1
             }
+            // Structured agents follow their own workspace's header or agent.
+            (Row::Agent { .. }, Some(Row::Agent { .. })) if structured => agent_gap.min(1),
             (Row::Agent { .. }, Some(Row::Agent { .. }))
                 if !layout.compact && !layout.structured =>
             {
@@ -1012,7 +1130,7 @@ fn render_row(
                 (String::new(), Style::default())
             }
         };
-    if layout.structured && !layout.compact && !matches!(row, Row::Header { .. }) {
+    if layout.structured && !layout.compact {
         render_structured_row(
             buffer,
             rect,
@@ -1034,6 +1152,7 @@ fn render_row(
             presence,
             count,
             usage,
+            ..
         } => {
             let marker = if *collapsed { "▸" } else { "▾" };
             let pin = if *pinned { "★ " } else { "" };
@@ -1188,6 +1307,7 @@ fn render_row(
             number,
             age,
             faded,
+            ..
         } => {
             let endpoint = &endpoints[*endpoint];
             if *focused {
@@ -1363,7 +1483,36 @@ fn render_structured_row(
 ) {
     let palette = &config.palette;
     match row {
-        Row::Header { .. } => {}
+        Row::Header {
+            key,
+            label,
+            pinned,
+            collapsed,
+            agents,
+            needs,
+            blocked,
+            usage,
+            ..
+        } => {
+            render_structured_header(
+                buffer,
+                rect,
+                StructuredHeader {
+                    label: &format!(
+                        "{} {}{label}",
+                        if *collapsed { "▸" } else { "▾" },
+                        if *pinned { "★ " } else { "" }
+                    ),
+                    other: key == OTHER,
+                    agents: *agents,
+                    needs: *needs,
+                    blocked: *blocked,
+                    usage: usage.as_deref().filter(|_| projects::peeking()),
+                },
+                palette,
+            );
+            hits.projects.push((rect, key.clone()));
+        }
         Row::Agent {
             endpoint,
             workspace_id,
@@ -1441,6 +1590,7 @@ fn render_structured_row(
             number,
             age,
             faded,
+            empty,
             ..
         } => {
             let endpoint = &endpoints[*endpoint];
@@ -1493,7 +1643,7 @@ fn render_structured_row(
                     })
                     .add_modifier(Modifier::BOLD),
             );
-            if *stale || *hidden || (*faded && !*focused) {
+            if *stale || *hidden || ((*faded || *empty) && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
             }
             hits.drovr_rows.push(RowHit {
@@ -1503,6 +1653,86 @@ fn render_structured_row(
                 pane_id: None,
             });
         }
+    }
+}
+
+/// What a structured section header shows.
+struct StructuredHeader<'a> {
+    /// Marker, pin and name ("▾ ★ GTM").
+    label: &'a str,
+    other: bool,
+    agents: usize,
+    needs: usize,
+    blocked: bool,
+    /// Today's usage, shown instead of the counts while peeking.
+    usage: Option<&'a str>,
+}
+
+/// A structured section header: " ▾ GTM ───────── ● 1 · 3 ". The name in the
+/// section style, a dim rule to the counts, then the needs-you count (only
+/// when some agent needs you, in the needs-you colour) and the agent count.
+fn render_structured_header(
+    buffer: &mut Buffer,
+    rect: Rect,
+    header: StructuredHeader<'_>,
+    palette: &Palette,
+) {
+    let dim = Style::default().fg(palette.overlay0);
+    let mut right: Vec<(String, Style)> = Vec::new();
+    if let Some(usage) = header.usage {
+        right.push((usage.to_owned(), dim));
+    } else {
+        if header.needs > 0 {
+            let color = if header.blocked {
+                status_color(crate::api::schema::AgentStatus::Blocked, palette)
+            } else {
+                Color::Yellow
+            };
+            right.push((
+                format!("● {}", header.needs),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            right.push((" · ".to_owned(), dim));
+        }
+        right.push((header.agents.to_string(), dim));
+    }
+    let right_width = right
+        .iter()
+        .map(|(text, _)| display_width(text))
+        .sum::<u16>();
+    // One blank column at each edge and around the rule.
+    let right_x = rect.right().saturating_sub(right_width + 1);
+    let label_x = rect.x + 1;
+    let room = right_x.saturating_sub(label_x + 1);
+    let label = radar::fit(header.label, room);
+    put_text(
+        buffer,
+        label_x,
+        rect.y,
+        room,
+        &label,
+        Style::default()
+            .fg(if header.other {
+                palette.overlay0
+            } else {
+                palette.accent
+            })
+            .add_modifier(Modifier::BOLD),
+    );
+    let rule_x = label_x + display_width(&label) + 1;
+    let rule_width = right_x.saturating_sub(rule_x + 1);
+    put_text(
+        buffer,
+        rule_x,
+        rect.y,
+        rule_width,
+        &"─".repeat(usize::from(rule_width)),
+        Style::default().fg(palette.surface_dim),
+    );
+    let mut x = right_x;
+    for (text, style) in right {
+        put_text(buffer, x, rect.y, display_width(&text), &text, style);
+        x += display_width(&text);
     }
 }
 
@@ -1566,7 +1796,7 @@ fn rail_projects(
         group.collapsed = false;
     }
     let mut projects: Vec<RailProject> = Vec::new();
-    for row in build_rows(endpoints, active_endpoint_id, &view) {
+    for row in build_rows(endpoints, active_endpoint_id, &view, true) {
         match row {
             Row::Header {
                 key,
@@ -1736,7 +1966,7 @@ pub(super) fn project_target(
     };
     let mut in_project = false;
     let mut best: Option<(u8, ClientEndpointId, ClientEndpointFocusTarget)> = None;
-    for row in build_rows(endpoints, active_endpoint_id, &layout) {
+    for row in build_rows(endpoints, active_endpoint_id, &layout, true) {
         match row {
             Row::Header { key: header, .. } => in_project = header == key,
             Row::Agent {
@@ -1919,7 +2149,12 @@ mod tests {
     #[test]
     fn structured_rows_have_workspace_headers_and_one_line_per_agent() {
         let endpoints = fixture();
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &structured_layout());
+        let rows = build_rows(
+            &endpoints,
+            &ClientEndpointId::Local,
+            &structured_layout(),
+            true,
+        );
         assert_eq!(
             describe(&rows),
             vec![
@@ -1953,7 +2188,7 @@ mod tests {
         if let Some(snapshot) = local.snapshot.as_deref_mut() {
             snapshot.workspaces[0].focused = true;
         }
-        let rows = build_rows(&[local], &ClientEndpointId::Local, &layout);
+        let rows = build_rows(&[local], &ClientEndpointId::Local, &layout, true);
         assert!(describe(&rows)
             .iter()
             .all(|row| !row.starts_with("W gtm-rd")));
@@ -1967,8 +2202,8 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut hits = ShellHitMap::default();
         let layout = structured_layout();
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
-        let gaps = row_gaps(&rows, &layout, 0);
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
+        let gaps = row_gaps(&rows, &layout, 0, 0);
         // Same stacking as render_panel: each row, then its blank lines.
         let mut y = 0;
         let mut blanks = Vec::new();
@@ -2043,7 +2278,7 @@ mod tests {
         let endpoints = fixture();
         let config = ClientShellConfig::from_config(&crate::config::Config::default());
         let layout = structured_layout();
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
         let start = |row: &Row| {
             let area = Rect::new(0, 0, 34, 1);
             let mut buffer = Buffer::empty(area);
@@ -2080,10 +2315,10 @@ mod tests {
     fn structured_gaps_follow_each_workspace_group_once() {
         let endpoints = fixture();
         let layout = structured_layout();
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
         // H GTM, W gtm-rd, A, A | W Code, A | H Other, W scratch | W turfobet.fr, A
         assert_eq!(
-            row_gaps(&rows, &layout, 0),
+            row_gaps(&rows, &layout, 0, 0),
             vec![0, 0, 0, 1, 0, 1, 0, 1, 0, 0]
         );
         // Detailed and compact views keep only the gap before a header.
@@ -2091,8 +2326,8 @@ mod tests {
             let mut flat = layout.clone();
             flat.structured = false;
             flat.compact = compact;
-            let rows = build_rows(&endpoints, &ClientEndpointId::Local, &flat);
-            let gaps = row_gaps(&rows, &flat, 0);
+            let rows = build_rows(&endpoints, &ClientEndpointId::Local, &flat, true);
+            let gaps = row_gaps(&rows, &flat, 0, 1);
             for (index, gap) in gaps.iter().enumerate() {
                 let before_header = matches!(rows.get(index + 1), Some(Row::Header { .. }));
                 assert_eq!(*gap, u16::from(before_header));
@@ -2105,7 +2340,7 @@ mod tests {
         let endpoints = fixture();
         let mut layout = structured_layout();
         layout.groups[0].collapsed = true;
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
         assert_eq!(
             describe(&rows),
             vec![
@@ -2116,7 +2351,7 @@ mod tests {
                 "A claude Claude Code settings permissions h1",
             ]
         );
-        assert_eq!(row_gaps(&rows, &layout, 0), vec![1, 0, 1, 0, 0]);
+        assert_eq!(row_gaps(&rows, &layout, 0, 0), vec![1, 0, 1, 0, 0]);
     }
     #[test]
     fn redraw_is_requested_only_while_an_agent_works() {
@@ -2124,7 +2359,7 @@ mod tests {
         let layout = structured_layout();
         let draw = |endpoints: &[ClientShellEndpoint]| {
             let area = Rect::new(0, 0, 34, 1);
-            for row in build_rows(endpoints, &ClientEndpointId::Local, &layout)
+            for row in build_rows(endpoints, &ClientEndpointId::Local, &layout, true)
                 .iter()
                 .filter(|row| matches!(row, Row::Agent { .. }))
             {
@@ -2157,7 +2392,7 @@ mod tests {
         endpoints[1].label = "gpu-box-staging-eu".into();
         let config = ClientShellConfig::from_config(&crate::config::Config::default());
         let layout = structured_layout();
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
         let header = rows
             .iter()
             .find(|row| {
@@ -2530,5 +2765,313 @@ mod tests {
         }
         assert_ne!(pixel_glyph('.'), pixel_glyph('-'));
         assert_eq!(pixel_text("x"), [String::new(), String::new()]);
+    }
+
+    /// Renders the whole structured panel with the default config adjusted
+    /// by `tweak`; returns the buffer and hit map.
+    fn render_structured(
+        endpoints: &[ClientShellEndpoint],
+        layout: &ProjectLayout,
+        tweak: impl FnOnce(&mut ClientShellConfig),
+    ) -> (Buffer, ShellHitMap) {
+        let mut config = ClientShellConfig::from_config(&crate::config::Config::default());
+        tweak(&mut config);
+        let area = Rect::new(0, 0, 35, 30);
+        let mut buffer = Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        render_panel_with(
+            &mut buffer,
+            area,
+            &config,
+            layout,
+            endpoints,
+            &ClientEndpointId::Local,
+            &mut 0,
+            false,
+            radar::Ground::Dark,
+            false,
+            &mut hits,
+        );
+        (buffer, hits)
+    }
+
+    #[test]
+    fn structured_section_header_draws_name_rule_and_counts() {
+        let mut endpoints = fixture();
+        if let Some(snapshot) = endpoints[0].snapshot.as_deref_mut() {
+            snapshot.agents[1].agent_status = AgentStatus::Blocked;
+        }
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let mut layout = structured_layout();
+        let header_line = |layout: &ProjectLayout| {
+            let (buffer, hits) = render_structured(&endpoints, layout, |_| {});
+            let (rect, key) = hits.projects.first().cloned().expect("GTM header");
+            assert_eq!(key, "GTM");
+            // The header is still a click and drop target.
+            let slot = drop_slot_at(&hits.drovr_drops, (3, rect.y)).expect("drop slot");
+            assert!(slot.target.header && slot.target.section == "GTM");
+            let text = (rect.x..rect.right())
+                .map(|x| buffer[(x, rect.y)].symbol().to_owned())
+                .collect::<String>();
+            let bullet = (rect.x..rect.right())
+                .find(|x| buffer[(*x, rect.y)].symbol() == "●")
+                .map(|x| buffer[(x, rect.y)].fg);
+            (text, bullet, buffer[(rect.x + 7, rect.y)].fg)
+        };
+        let (text, bullet, rule) = header_line(&layout);
+        assert!(text.starts_with(" ▾ GTM ─"), "{text:?}");
+        assert!(text.ends_with("─ ● 1 · 3 "), "{text:?}");
+        assert_eq!(rule, config.palette.surface_dim);
+        assert_eq!(
+            bullet,
+            Some(status_color(AgentStatus::Blocked, &config.palette))
+        );
+        // Collapsed: same counts.
+        layout.groups[0].collapsed = true;
+        let (text, _, _) = header_line(&layout);
+        assert!(text.starts_with(" ▸ GTM ─"), "{text:?}");
+        assert!(text.ends_with("─ ● 1 · 3 "), "{text:?}");
+        // Nobody needs you: only the agent count.
+        let rows = build_rows(&fixture(), &ClientEndpointId::Local, &layout, true);
+        assert!(matches!(
+            rows.first(),
+            Some(Row::Header {
+                agents: 3,
+                needs: 0,
+                ..
+            })
+        ));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 1));
+        render_structured_header(
+            &mut buffer,
+            Rect::new(0, 0, 30, 1),
+            StructuredHeader {
+                label: "▾ GTM",
+                other: false,
+                agents: 3,
+                needs: 0,
+                blocked: false,
+                usage: None,
+            },
+            &config.palette,
+        );
+        assert_eq!(line(&buffer, 0), format!(" ▾ GTM {} 3 ", "─".repeat(20)));
+    }
+
+    #[test]
+    fn agent_titles_prefer_the_session_name_then_a_real_terminal_title() {
+        let pane = |cwd: &str, label: Option<&str>| ClientShellPane {
+            pane_id: "p1".into(),
+            workspace_id: "w1".into(),
+            tab_id: "tab_1".into(),
+            label: label.map(Into::into),
+            cwd: Some(cwd.into()),
+            foreground_cwd: None,
+            focused: false,
+            right_click_passthrough: false,
+        };
+        let mut tab = super::super::tests::snapshot()
+            .tabs
+            .first()
+            .cloned()
+            .expect("snapshot tab");
+        tab.label = "release".into();
+        let title = |terminal: &str,
+                     tokens: &[(&str, &str)],
+                     pane: &ClientShellPane,
+                     tab: Option<&crate::protocol::ClientShellTab>| {
+            let mut agent = agent("p1", "w1", "claude", "");
+            agent.title = None;
+            agent.terminal_title_stripped = Some(terminal.into());
+            agent.tokens = tokens
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect();
+            agent_title(&agent, Some(pane), tab)
+        };
+        let plain = pane("/Users/me/src/mlx-serve", None);
+        // 1. The hook's session name wins over anything the terminal says.
+        assert_eq!(
+            title(
+                "Fix the parser",
+                &[("drovr_name", "Access downgrade after renewal")],
+                &plain,
+                None
+            ),
+            "Access downgrade after renewal"
+        );
+        // 2. A real terminal title.
+        assert_eq!(title("Fix the parser", &[], &plain, None), "Fix the parser");
+        // 3. The vendor's product name or the folder alone give way to the
+        //    pane's label, its tab's custom name, else its folder's name.
+        assert_eq!(title("Claude Code", &[], &plain, None), "mlx-serve");
+        assert_eq!(title("~/src/mlx-serve", &[], &plain, None), "mlx-serve");
+        assert_eq!(
+            title("/Users/me/src/mlx-serve: zsh", &[], &plain, None),
+            "mlx-serve"
+        );
+        assert_eq!(
+            title("Claude Code", &[], &pane("/x", Some("api pane")), None),
+            "api pane"
+        );
+        tab.custom_label = true;
+        assert_eq!(title("claude code", &[], &plain, Some(&tab)), "release");
+        tab.custom_label = false;
+        assert_eq!(title("Claude Code", &[], &plain, Some(&tab)), "mlx-serve");
+        // A title that only starts with the folder's name is a real title.
+        assert_eq!(
+            title("mlx-serve: speed up", &[], &plain, None),
+            "mlx-serve: speed up"
+        );
+        // 4. Nothing better: the generic title, else the product name.
+        assert_eq!(
+            title("Claude Code", &[], &pane("", None), None),
+            "Claude Code"
+        );
+        assert_eq!(title(" ", &[], &pane("", None), None), "Claude Code");
+        // The rows use it in every view.
+        let mut endpoints = fixture();
+        if let Some(snapshot) = endpoints[0].snapshot.as_deref_mut() {
+            snapshot.agents[0].tokens = vec![("drovr_name".into(), "Named session".into())];
+        }
+        for (compact, structured) in [(false, false), (false, true)] {
+            let mut layout = structured_layout();
+            layout.compact = compact;
+            layout.structured = structured;
+            let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
+            assert!(describe(&rows)
+                .iter()
+                .any(|row| row.starts_with("A claude Named session")));
+        }
+    }
+
+    #[test]
+    fn empty_workspaces_are_dimmed_or_hidden_in_the_structured_view() {
+        let mut endpoints = fixture();
+        // Code's agent works, so Code is current (not faded).
+        if let Some(snapshot) = endpoints[0].snapshot.as_deref_mut() {
+            snapshot.agents[2].agent_status = AgentStatus::Working;
+        }
+        let layout = structured_layout();
+        let (buffer, hits) = render_structured(&endpoints, &layout, |_| {});
+        let scratch = hits
+            .drovr_rows
+            .iter()
+            .find(|hit| hit.workspace_id == "w3")
+            .expect("empty workspace row");
+        assert!(line(&buffer, scratch.rect.y).contains("scratch"));
+        assert!(buffer[(STRUCTURED_INDENT, scratch.rect.y)]
+            .modifier
+            .contains(Modifier::DIM));
+        // Dimmed for being empty, not only for being inactive.
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        for mut row in build_rows(&endpoints, &ClientEndpointId::Local, &layout, true) {
+            let Row::Workspace { faded, empty, .. } = &mut row else {
+                continue;
+            };
+            *faded = false;
+            let empty = *empty;
+            let area = Rect::new(0, 0, 34, 1);
+            let mut buffer = Buffer::empty(area);
+            render_row(
+                &mut buffer,
+                area,
+                &row,
+                &layout,
+                &endpoints,
+                &config,
+                radar::Ground::Dark,
+                &mut ShellHitMap::default(),
+            );
+            let dim = buffer[(STRUCTURED_INDENT, 0)]
+                .modifier
+                .contains(Modifier::DIM);
+            assert_eq!(dim, empty);
+        }
+        // Workspaces with agents stay undimmed.
+        let code = hits
+            .drovr_rows
+            .iter()
+            .find(|hit| hit.workspace_id == "w2" && hit.pane_id.is_none())
+            .expect("workspace header");
+        assert!(!buffer[(STRUCTURED_INDENT, code.rect.y)]
+            .modifier
+            .contains(Modifier::DIM));
+        // show_empty_workspaces = false: not drawn, no click or row target.
+        let (buffer, hits) = render_structured(&endpoints, &layout, |config| {
+            config.show_empty_workspaces = false;
+        });
+        assert!(hits.drovr_rows.iter().all(|hit| hit.workspace_id != "w3"));
+        assert!((0..30).all(|y| !line(&buffer, y).contains("scratch")));
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, false);
+        assert!(!describe(&rows).contains(&"W scratch -".to_owned()));
+        // Other views keep them.
+        let mut detailed = layout.clone();
+        detailed.structured = false;
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &detailed, false);
+        assert!(describe(&rows).contains(&"W scratch -".to_owned()));
+        let config: crate::config::Config =
+            toml::from_str("[ui.sidebar]\nshow_empty_workspaces = false\nagent_gap = 0\n")
+                .expect("valid config");
+        assert!(!config.ui.sidebar.show_empty_workspaces);
+        assert_eq!(config.ui.sidebar.agent_gap, 0);
+        let defaults = crate::config::Config::default().ui.sidebar;
+        assert!(defaults.show_empty_workspaces);
+        assert_eq!(defaults.agent_gap, 1);
+    }
+
+    #[test]
+    fn agent_gap_spaces_a_workspaces_agents_without_doubling_gaps() {
+        let endpoints = fixture();
+        let layout = structured_layout();
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
+        // H GTM, W gtm-rd, A p1 _ A p2 | W Code, A | H Other, W scratch | W turfobet.fr, A
+        assert_eq!(
+            row_gaps(&rows, &layout, 0, 1),
+            vec![0, 0, 1, 1, 0, 1, 0, 1, 0, 0]
+        );
+        // Values above one count as one; no row is followed by two blanks.
+        assert_eq!(
+            row_gaps(&rows, &layout, 0, 5),
+            row_gaps(&rows, &layout, 0, 1)
+        );
+        // Drawn: the blank between p1 and p2 is empty, not clickable, and
+        // drops before their workspace like the rows around it.
+        let (buffer, hits) = render_structured(&endpoints, &layout, |config| {
+            config.agent_gap = 1;
+        });
+        let y = |pane: &str| {
+            hits.drovr_rows
+                .iter()
+                .find(|hit| hit.pane_id.as_deref() == Some(pane))
+                .map(|hit| hit.rect.y)
+                .expect("agent row")
+        };
+        assert_eq!(y("p2"), y("p1") + 2);
+        let blank = y("p1") + 1;
+        assert!(line(&buffer, blank).trim_end_matches(['│', ' ']).is_empty());
+        let covers = |rect: Rect| rect.y <= blank && blank < rect.bottom();
+        assert!(hits.drovr_rows.iter().all(|hit| !covers(hit.rect)));
+        assert!(hits
+            .endpoint_agents
+            .iter()
+            .all(|(rect, _, _)| !covers(*rect)));
+        let slot = drop_slot_at(&hits.drovr_drops, (3, blank)).expect("drop slot");
+        assert_eq!(slot.target.before.as_deref(), Some("local/w1:gtm-rd"));
+        // Every hit sits on a row that shows its text.
+        for hit in &hits.drovr_rows {
+            assert!(!line(&buffer, hit.rect.y).trim().is_empty());
+        }
+        // agent_gap = 0: agents stack.
+        let (_, tight) = render_structured(&endpoints, &layout, |config| {
+            config.agent_gap = 0;
+        });
+        let rows_y = tight
+            .drovr_rows
+            .iter()
+            .filter(|hit| hit.workspace_id == "w1")
+            .map(|hit| hit.rect.y)
+            .collect::<Vec<_>>();
+        assert_eq!(rows_y, vec![rows_y[0], rows_y[0] + 1, rows_y[0] + 2]);
     }
 }

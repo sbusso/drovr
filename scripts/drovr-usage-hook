@@ -5,6 +5,9 @@ After each agent turn, read the new part of the session transcript and report
 to herdr, as pane metadata tokens (visible to every drovr client):
   drovr_ctx      current context size in tokens (last request's input side)
   drovr_session  Claude session id
+  drovr_name     the session's name, as the Claude desktop app and
+                 `claude --resume` show it: the latest custom title (/rename),
+                 else the latest AI-generated title, else the latest summary
   drovr_u_YYYYMMDD  one per local day (last 7): "input,output,cache_read,
                   cache_write,active_minutes" (herdr caps values at 80 chars,
                   hence one short token per day)
@@ -21,12 +24,49 @@ from datetime import datetime, timedelta
 
 CACHE_DIR = os.path.expanduser("~/.cache/drovr/usage")
 KEEP_DAYS = 7
+# Transcript line type -> field holding a session name, highest precedence first.
+TITLE_FIELDS = (("custom-title", "customTitle"), ("ai-title", "aiTitle"), ("summary", "summary"))
+TITLE_PREFIXES = tuple(f'{{"type":"{kind}"'.encode() for kind, _ in TITLE_FIELDS)
 
 
 def local_day_minute(timestamp):
     """ISO UTC timestamp -> (local 'YYYY-MM-DD', local 'HH:MM')."""
     when = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
     return when.strftime("%Y-%m-%d"), when.strftime("%H:%M")
+
+
+def note_title(titles, entry):
+    """Remember the latest name of each kind found in a transcript entry."""
+    for kind, field in TITLE_FIELDS:
+        value = entry.get(field) if entry.get("type") == kind else None
+        if isinstance(value, str) and value.strip():
+            titles[kind] = value
+
+
+def session_name(titles):
+    """The name to show: custom title, else AI title, else summary; one line,
+    at most 80 characters (herdr's token value cap)."""
+    for kind, _ in TITLE_FIELDS:
+        if titles.get(kind):
+            return " ".join(titles[kind].split())[:80]
+    return None
+
+
+def scan_titles(transcript, end):
+    """Title entries in the first `end` bytes; only lines that start like one
+    are parsed. Runs once, for a cache written before names were tracked."""
+    titles = {}
+    with open(transcript, "rb") as handle:
+        for raw in handle:
+            end -= len(raw)
+            if end < 0:
+                break
+            if raw.startswith(TITLE_PREFIXES):
+                try:
+                    note_title(titles, json.loads(raw))
+                except ValueError:
+                    pass
+    return titles
 
 
 def main():
@@ -46,6 +86,8 @@ def main():
         cache = {"offset": 0, "last_id": None, "ctx": 0, "days": {}}
     if os.path.getsize(transcript) < cache["offset"]:
         cache = {"offset": 0, "last_id": None, "ctx": 0, "days": {}}
+    if "titles" not in cache:
+        cache["titles"] = scan_titles(transcript, cache["offset"])
 
     with open(transcript, "rb") as handle:
         handle.seek(cache["offset"])
@@ -57,6 +99,7 @@ def main():
                 entry = json.loads(raw)
             except ValueError:
                 continue
+            note_title(cache["titles"], entry)
             message = entry.get("message") or {}
             usage = message.get("usage")
             if entry.get("type") != "assistant" or not usage or not entry.get("timestamp"):
@@ -90,6 +133,9 @@ def main():
         "--token", f"drovr_ctx={cache['ctx']}",
         "--token", f"drovr_session={session}",
     ]
+    name = session_name(cache["titles"])
+    # Cleared when unknown, so a new session in the pane drops the old name.
+    args += ["--token", f"drovr_name={name}"] if name else ["--clear-token", "drovr_name"]
     for day, t in sorted(cache["days"].items()):
         values = ",".join(str(v) for v in t[:4] + [len(t[4])])
         args += ["--token", f"drovr_u_{day.replace('-', '')}={values}"]

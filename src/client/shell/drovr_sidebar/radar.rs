@@ -166,6 +166,38 @@ pub(super) fn title_style(
     }
 }
 
+/// The vendor's product name (radar `DISPLAY`, `lib/logos.js`): what an agent
+/// that sets no topic puts in the terminal title.
+pub(super) fn display_name(vendor: &str) -> Option<&'static str> {
+    Some(match vendor {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "omp" => "Oh My Pi",
+        "cline" => "Cline",
+        "mastracode" => "Mastra",
+        "kimi" => "Kimi",
+        "kilo" => "Kilo",
+        "maki" => "Maki",
+        "pi" => "Pi",
+        "hermes" => "Hermes",
+        "cursor" => "Cursor",
+        "copilot" => "Copilot",
+        "deepseek" => "DeepSeek",
+        "gemini" => "Gemini",
+        "gpt" => "GPT",
+        "qwen" => "Qwen",
+        "grok" => "grok",
+        "agy" => "Antigravity",
+        "kiro" => "Kiro",
+        "amp" => "Amp",
+        "devin" => "Devin",
+        "qodercli" => "Qoder",
+        "glm" => "GLM",
+        _ => return None,
+    })
+}
+
 /// Radar icon font codepoint for a vendor (radar `PUA`).
 fn font_glyph(vendor: &str) -> Option<char> {
     Some(match vendor {

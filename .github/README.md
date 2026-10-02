@@ -49,6 +49,31 @@ colour; the font must be installed. Without it, set `agent_icons = "letter"`
 (the vendor's first letter) or `"none"` (no mark) under `[ui.sidebar]` in
 herdr's `config.toml`.
 
+```
+ ▾ GTM ──────────────── ● 1 · 3   ← section: needs you · agents
+   gtm-rd
+     ✓ Fix auth flow in gateway
+                                  ← agent_gap
+     ? Review PR 42
+
+   scratch                        ← no agents: dimmed
+```
+
+In the structured view a section header carries a thin rule and, on the
+right, how many of its agents need you (`● n`, only when some do) and how
+many agents it shows; a collapsed section keeps both counts. Agents of one
+workspace are one blank row apart (`agent_gap = 1`, set `0` to stack them),
+and workspaces without agents are dimmed (`show_empty_workspaces = false`
+hides them). Both go under `[ui.sidebar]` in herdr's `config.toml`.
+
+An agent row shows, in every view, the first of: the session's own name (the
+one the Claude desktop app and `claude --resume` show, reported by the usage
+hook below), the terminal title unless it is only the vendor's name ("Claude
+Code") or the pane's folder, the pane's label, its tab's custom name or its
+folder's name, then the generic title. The terminal title alone often reads
+"Claude Code": Claude sets its topic there only for some sessions, while the
+desktop app reads the name from the session transcript.
+
 A two-row "drovr" banner with the version in small pixel digits sits above
 the sidebar's toggles when the sidebar is at least 18 columns wide and tall
 enough to keep 10 rows for the list; the version hides first when it is
@@ -64,7 +89,9 @@ and each machine's latency.
 A small Claude Code hook (`scripts/drovr-usage-hook`, a Stop hook) reads each
 session's transcript incrementally after every turn and attaches the session's
 context size and per-day usage to its pane as herdr metadata, so it reaches the
-sidebar from any machine without syncing files. drovr keeps the history in
+sidebar from any machine without syncing files. It also reports the
+session's name (`drovr_name`): the latest custom title (`/rename`), else the
+latest AI-generated title, else the latest summary found in the transcript. drovr keeps the history in
 `~/.local/state/herdr/drovr-usage.json` and attributes it to projects with the
 same rules as the sidebar. Right-click a project for *Today* and *Last 7 days*
 (active time · input + output + cache-write tokens; cache reads are excluded).
