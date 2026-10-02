@@ -581,31 +581,110 @@ const BANNER_MIN_WIDTH: u16 = 18;
 /// ...and must leave the rows list at least this many rows.
 const BANNER_MIN_BODY: u16 = 10;
 
-/// Draw the banner when it fits and return the rows it takes (2 + 1 blank).
-/// The band is inverse text: light background, letters cut out in the
-/// sidebar's own background colour (REVERSED also covers a terminal-default
-/// background). It has no hit rect.
+/// Version shown next to the wordmark: the release tag's version when
+/// drovr-release.yml set DROVR_RELEASE_TAG (drovr-v0.9.3-1 -> 0.9.3-1), else
+/// the crate version.
+fn banner_version() -> &'static str {
+    option_env!("DROVR_RELEASE_TAG")
+        .and_then(|tag| tag.strip_prefix("drovr-v"))
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// 4x4-pixel glyphs (`#` = set) for the version's pixel font. Digits use
+/// three pixel columns plus one blank for spacing, so each is 2 cells wide;
+/// '.' and '-' are 1 cell wide.
+fn pixel_bitmap(c: char) -> Option<[&'static str; 4]> {
+    Some(match c {
+        '0' => ["###", "#.#", "#.#", "###"],
+        '1' => [".#.", "##.", ".#.", "###"],
+        '2' => ["##.", "..#", ".#.", "###"],
+        '3' => ["###", ".##", "..#", "###"],
+        '4' => ["#.#", "#.#", "###", "..#"],
+        '5' => ["###", "##.", "..#", "##."],
+        '6' => ["#..", "###", "#.#", "###"],
+        '7' => ["###", "..#", ".#.", ".#."],
+        '8' => ["###", "###", "#.#", "###"],
+        '9' => ["###", "#.#", "###", "..#"],
+        '.' => ["", "", "", "#"],
+        '-' => ["", "#", "", ""],
+        _ => return None,
+    })
+}
+
+/// One character of the pixel font as two rows of quadrant blocks.
+fn pixel_glyph(c: char) -> Option<[String; 2]> {
+    const QUADRANTS: [char; 16] = [
+        ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+    ];
+    let bitmap = pixel_bitmap(c)?;
+    let cells = if c.is_ascii_digit() { 2 } else { 1 };
+    let on = |row: usize, col: usize| bitmap[row].as_bytes().get(col) == Some(&b'#');
+    Some([0, 1].map(|half| {
+        (0..cells)
+            .map(|cell| {
+                let (row, col) = (half * 2, cell * 2);
+                let bits = usize::from(on(row, col))
+                    | usize::from(on(row, col + 1)) << 1
+                    | usize::from(on(row + 1, col)) << 2
+                    | usize::from(on(row + 1, col + 1)) << 3;
+                QUADRANTS[bits]
+            })
+            .collect()
+    }))
+}
+
+/// `text` in the pixel font (unknown characters are skipped).
+fn pixel_text(text: &str) -> [String; 2] {
+    let mut rows = [String::new(), String::new()];
+    for glyph in text.chars().filter_map(pixel_glyph) {
+        for (row, part) in rows.iter_mut().zip(glyph) {
+            row.push_str(&part);
+        }
+    }
+    rows
+}
+
+/// Draw the banner when it fits and return the rows it takes (2 + 1 blank):
+/// the wordmark in the text colour on the sidebar background, and the version
+/// in the pixel font two columns to its right, dimmer. The version drops its
+/// "-N" suffix, then disappears, when the sidebar is too narrow. No hit rect.
 fn render_banner(buffer: &mut Buffer, area: Rect, inner: Rect, palette: &Palette) -> u16 {
     let rows = BANNER.len() as u16 + 1;
     // Body height is what is left after the banner, toggles, blank and footer.
     if area.width < BANNER_MIN_WIDTH || inner.height.saturating_sub(rows + 3) < BANNER_MIN_BODY {
         return 0;
     }
-    let style = Style::default()
-        .fg(palette.text)
-        .bg(palette.sidebar_bg)
-        .add_modifier(Modifier::REVERSED);
+    let x = inner.x + 1;
+    let style = Style::default().fg(palette.text);
     for (offset, line) in BANNER.iter().enumerate() {
-        let y = inner.y + offset as u16;
-        buffer.set_style(Rect::new(inner.x, y, inner.width, 1), style);
         put_text(
             buffer,
-            inner.x + 1,
-            y,
+            x,
+            inner.y + offset as u16,
             inner.width.saturating_sub(1),
             line,
             style,
         );
+    }
+    let version_x = x + display_width(BANNER[0]) + 2;
+    let room = inner.right().saturating_sub(version_x);
+    let full = banner_version();
+    let short = full.split('-').next().unwrap_or(full);
+    if let Some(version) = [full, short]
+        .into_iter()
+        .map(pixel_text)
+        .find(|version| display_width(&version[0]) <= room)
+    {
+        for (offset, line) in version.iter().enumerate() {
+            put_text(
+                buffer,
+                version_x,
+                inner.y + offset as u16,
+                room,
+                line.trim_end(),
+                Style::default().fg(palette.overlay0),
+            );
+        }
     }
     rows
 }
@@ -2342,6 +2421,7 @@ mod tests {
             let (buffer, _, _) = render_with_banner(Rect::new(0, 0, width, height), 0);
             line(&buffer, 0).contains(BANNER[0])
         };
+        assert_eq!(pixel_text("0.9.3-1")[0].chars().count(), 11);
         assert!(shown(18, 16));
         assert!(shown(34, 40));
         // Narrower than 18 columns, or fewer than 10 rows left for the list.
@@ -2350,18 +2430,30 @@ mod tests {
     }
 
     #[test]
-    fn banner_draws_inverse_and_shifts_everything_below_it() {
+    fn banner_draws_letters_and_version_on_the_sidebar_background() {
         let config = ClientShellConfig::from_config(&crate::config::Config::default());
         let palette = &config.palette;
         let (buffer, hits, _) = render_with_banner(Rect::new(0, 0, 34, 40), 0);
-        assert_eq!(line(&buffer, 0).trim_end(), format!(" {}", BANNER[0]));
-        assert_eq!(line(&buffer, 1).trim_end(), format!(" {}", BANNER[1]));
-        for (x, y) in [(0, 0), (1, 0), (32, 1)] {
-            let cell = &buffer[(x, y)];
-            assert_eq!((cell.fg, cell.bg), (palette.text, palette.sidebar_bg));
-            assert!(cell.modifier.contains(Modifier::REVERSED));
+        let version = pixel_text(banner_version());
+        for row in 0..2u16 {
+            let expected = format!(
+                " {}  {}",
+                BANNER[usize::from(row)],
+                version[usize::from(row)].trim_end()
+            );
+            assert_eq!(line(&buffer, row).trim_end_matches(['│', ' ']), expected);
         }
-        assert!(line(&buffer, 2)[..].trim_end_matches('│').trim().is_empty());
+        let letter = &buffer[(1, 0)];
+        assert_eq!((letter.fg, letter.bg), (palette.text, palette.sidebar_bg));
+        assert!(!letter.modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(18, 0)].fg, palette.overlay0);
+        assert_eq!(buffer[(0, 0)].bg, palette.sidebar_bg);
+        // Too narrow for the version: the letters stay, the version goes.
+        let (narrow, _, _) = render_with_banner(Rect::new(0, 0, 19, 40), 0);
+        assert_eq!(
+            line(&narrow, 0).trim_end_matches(['│', ' ']),
+            format!(" {}", BANNER[0])
+        );
         // Below the banner: the same sidebar, three rows lower.
         let (_, plain, _) = {
             let endpoints = fixture();
@@ -2416,5 +2508,27 @@ mod tests {
                 .map(|hit| hit.pane_id.as_deref()),
             Some(Some("p1"))
         );
+    }
+
+    #[test]
+    fn pixel_digits_are_two_rows_two_cells_and_distinct() {
+        let digits = ('0'..='9')
+            .map(|digit| pixel_glyph(digit).expect("digit glyph"))
+            .collect::<Vec<_>>();
+        for glyph in &digits {
+            assert_eq!(glyph.len(), 2);
+            assert!(glyph.iter().all(|row| row.chars().count() == 2));
+        }
+        for (a, left) in digits.iter().enumerate() {
+            for right in &digits[a + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+        for mark in ['.', '-'] {
+            let glyph = pixel_glyph(mark).expect("mark glyph");
+            assert!(glyph.iter().all(|row| row.chars().count() == 1));
+        }
+        assert_ne!(pixel_glyph('.'), pixel_glyph('-'));
+        assert_eq!(pixel_text("x"), [String::new(), String::new()]);
     }
 }
