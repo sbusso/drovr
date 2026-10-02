@@ -86,9 +86,13 @@ the panes for a moment. Tags are derived from the name; set `short = "OP"` on a
 project to choose your own.
 
 ### Projects across machines
-- **Drag** any row onto a project header to move its workspace there. Drop it on
-  **Other** to take it out, or on another row to place it just above that row.
-  Right-click → `→ project` does the same without the mouse gesture.
+- **Drag** any row (a workspace header or one of its agents) to move its
+  workspace. Drop it on a project header to add it at the end of that project,
+  on a row or the blank line above it to place it just above that row's
+  workspace, or on the lower half of a project's last workspace to place it
+  last. Drop it on **Other** to take it out. An accent line shows where it will
+  land; release outside the sidebar or press Esc to cancel. Right-click →
+  `→ project` does the same without the mouse gesture.
 - **Auto-assign**: a project's match rules catch workspaces whose *name or
   folder* contains the rule (`storefront` catches `~/code/storefront-api` on
   every machine), so new agents land in the right place with no clicks.
