@@ -194,8 +194,9 @@ detail of a dialog comes from `pane.read` on selection.
 
 **drovr-state-hook.** Runs on SessionStart, UserPromptSubmit, PreToolUse,
 PostToolUse, PostToolUseFailure, PermissionRequest, PermissionDenied,
-Notification, Stop, StopFailure and SessionEnd, for Claude and for Codex
-(`~/.codex/hooks.json` PermissionRequest).
+Notification, Stop, StopFailure and SessionEnd for Claude, and on
+SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PermissionRequest,
+Stop and Interrupt for Codex (`~/.codex/hooks.json`).
 
 - `--seq` is `time.time_ns()` taken under the pane lock when the report is
   sent; herdr drops reports whose seq is not newer. (Draft 3 said "at hook
@@ -204,17 +205,34 @@ Notification, Stop, StopFailure and SessionEnd, for Claude and for Codex
   PermissionRequest hook's exit report would always be dropped.)
 - Per-pane state lives in `<state_dir>/drovr/state-hook/<pane>.json` under
   `flock`.
+- Nested sessions: an agent started from a tool in the pane (`claude -p` from
+  a Bash tool or a workflow script, `codex exec`) inherits `HERDR_PANE_ID` and
+  the user hooks, and its events are ignored. The pane state records its owner.
+  Claude events count only from the owning Claude process (`CLAUDE_PID` in the
+  hook environment, which a nested `claude` sets to its own pid) while that
+  process is alive; `/clear` keeps the pid, and a new Claude takes over after
+  the old one exits. Codex events are skipped when `CODEX_THREAD_ID` differs
+  from their `session_id` (herdr's own Codex hook does the same) or when their
+  inherited `CLAUDE_PID` is the owning Claude.
 - Claude's PermissionRequest input has no `tool_use_id` (section 11). The hook
   records each PreToolUse as (`tool_use_id`, hash of `tool_name` and
   `tool_input`); a PermissionRequest takes the oldest unclaimed PreToolUse with
-  the same hash. If none matches, the request has no tool id and is cleared
-  only by a turn boundary or its own hook exit.
+  the same hash. If none matches (for example another PreToolUse hook changed
+  the input with `updatedInput`), the request has no tool id; a PostToolUse
+  with the request's own hash, a turn boundary or its own hook exit clears it.
+  A PostToolUse whose tool was never claimed records the tool hash for the
+  turn: a PermissionRequest that matches no PreToolUse but matches such a hash
+  is not added, because its tool already ran (another PermissionRequest hook
+  allowed a fast tool before this hook took the pane lock).
 - Each PermissionRequest gets a random 8-character request id. Pending requests
   are a set: PostToolUse and PostToolUseFailure with the claimed tool id,
   PermissionDenied, and the request's own hook exit remove one;
-  UserPromptSubmit, Stop, SessionStart, SessionEnd and an idle Notification
-  (`notification_type` `idle_prompt`) clear the set. The idle Notification is
-  the only event after "No" or Esc in the terminal (section 11).
+  UserPromptSubmit, Stop, SessionStart, SessionEnd, Codex Interrupt (Esc,
+  which fires no Stop) and an idle Notification (`notification_type`
+  `idle_prompt`) clear the set. "No" or Esc on the dialog in the terminal
+  fires no tool event, but Claude ends the waiting hook with a signal, so the
+  request leaves with the hook's exit (section 11). `idle_prompt` does not
+  fire while a dialog is open.
 - AskUserQuestion with several questions, multi-select or more than 4
   options does not enter the set; the hook exits at once and herdr's blocked
   state makes it a dialog item.
@@ -224,9 +242,12 @@ Notification, Stop, StopFailure and SessionEnd, for Claude and for Codex
   PermissionRequest is kept and the item is labelled "subagent".
 - The hook skips a report when no value changed, and a PreToolUse report
   follows the previous PreToolUse report by at least 2 s; a held-back value
-  goes out with the next report. Ceiling: a long tool that starts within 2 s
-  of the previous one shows the previous tool in `drovr_doing` until the next
-  event; a trailing report would need a background process. No TTL: a TTL makes every report count as changed and pushes a
+  goes out with the next report. A PostToolUse that only clears `drovr_doing`
+  is held back the same way (one that removes a request is always sent), so a
+  quick tool followed by a long one never leaves `drovr_doing` empty. Ceiling:
+  a long tool that starts within 2 s of the previous one shows the previous
+  tool in `drovr_doing` until the next event; a trailing report would need a
+  background process. No TTL: a TTL makes every report count as changed and pushes a
   snapshot to every client.
 - On failure (for example `metadata_token_limit`) the hook appends stderr to
   `<state_dir>/drovr/state-hook/errors.log` and exits 0.
@@ -260,7 +281,7 @@ reordering existing entries (on mato, PermissionRequest already runs orca with
 a 10 s timeout and rosterd-hook). Claude runs all hooks of an event in
 parallel, so the waiting drovr hook does not delay the others; a decision from
 another hook (for example orca) closes the dialog first and the drovr hook's
-later output is ignored. The drovr PermissionRequest entry sets `timeout` to the
+later output is ignored (verified, section 11). The drovr PermissionRequest entry sets `timeout` to the
 wait limit plus 5 s. `--dry-run` prints the settings diff; run it against mato
 before installing.
 
@@ -299,7 +320,7 @@ Codex: its PermissionRequest hook decision format is not verified yet; Codex
 permissions use the key path below until it is. The hook publishes the Codex request and exits
 at once; Codex has no PostToolUseFailure, PermissionDenied, Notification,
 StopFailure or SessionEnd hooks, so its request is removed by the claimed
-tool's PostToolUse or a turn boundary.
+tool's PostToolUse or a turn boundary (UserPromptSubmit, Stop, Interrupt).
 
 ### Question and plan items: keys
 
@@ -394,7 +415,8 @@ Verified:
 - Answering "Yes" in the terminal while the hook waits runs the tool at once;
   the hook keeps running, and its later `deny` is ignored.
 - Answering "No" in the terminal fires no PostToolUse, PostToolUseFailure,
-  PermissionDenied or Stop; only Notification follows.
+  PermissionDenied or Stop; only Notification follows. A waiting
+  PermissionRequest hook is ended with a signal (step 2 review, below).
 - AskUserQuestion and ExitPlanMode: hook `deny` with a message closes the
   dialog and Claude receives the message (it revised the plan from it). Hook
   `allow`, including `updatedInput.answers` for the question, leaves the
@@ -413,6 +435,19 @@ Verified in build step 2 (same setup, hooks from drovr-state-hook):
   `curl *`, so `a` grants the exact command only. For a write redirect the
   suggestion was `addDirectories` for the session, and neither the hook nor
   the dialog's option 2 stopped the next prompt.
+
+Verified in the step 2 review (same setup):
+
+- Two PermissionRequest hooks, an immediate `allow` and a 60 s sleeper with no
+  output: the tool ran and PostToolUse fired about 1 s after the request,
+  while the sleeper still ran. A decision from another hook does not wait for
+  the drovr hook.
+- With the drovr hook waiting, "No" and Esc on the dialog end the hook with a
+  signal; its exit removes the request and clears `drovr_wait` at once.
+- `idle_prompt` did not fire while a permission dialog stayed open for 137 s.
+  After "No" and typing without submitting, it had not fired 70 s later.
+- Hooks get `CLAUDE_PID` (the Claude process) and `CLAUDE_CODE_SESSION_ID`;
+  a nested `claude -p` sets both to its own values.
 
 Documented, not verified: the 600 s default hook timeout; PermissionRequest
 does not fire in `-p` mode.

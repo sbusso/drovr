@@ -35,7 +35,7 @@ def load_hook():
 
 
 def clean_env(home):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERDR_", "DROVR_", "XDG_"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERDR_", "DROVR_", "XDG_", "CLAUDE", "CODEX_"))}
     env["HOME"] = str(home)
     return env
 
@@ -422,6 +422,20 @@ class StateHookTests(unittest.TestCase):
         name = "negotiated_remote_health_probe_expires_the_connection"
         self.assertEqual(hook.redact(name), name, "long identifiers without digits are kept")
         self.assertEqual(hook.redact("mysql -psecretpw db"), "mysql -p*** db")
+        self.assertEqual(hook.redact("curl -u admin:hunter2 https://api"), "curl -u admin:*** https://api")
+        self.assertEqual(hook.redact("curl --user=admin:hunter2 x"), "curl --user=admin:*** x")
+        self.assertEqual(hook.redact("X-Auth-Token: abc123"), "X-Auth-Token: ***")
+        self.assertEqual(hook.redact("export GITHUB_TOKEN=abc"), "export GITHUB_TOKEN=***")
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        for kept in (
+            "cargo nextest run client::auth::login",
+            "git log --author=bob",
+            "find . -print0",
+            "max_tokens=100",
+            f"git show {sha}",
+        ):
+            self.assertEqual(hook.redact(kept), kept)
+        self.assertEqual(hook.redact(f"echo {sha}"), "echo ***", "40-hex outside git is redacted")
 
         self.prompt()
         time.sleep(2.1)  # past the PreToolUse report gap
@@ -447,8 +461,96 @@ class StateHookTests(unittest.TestCase):
         # It is still recorded for permission matching, and sent with the next report.
         state = json.loads((self.state / "w1_p1.json").read_text())
         self.assertEqual([p[0] for p in state["pre"]], ["t1", "t2"])
-        self.run_hook(self.post("t9", "other"))
+        self.run_hook({"hook_event_name": "Stop", "last_assistant_message": "Done."})
         self.assertNotIn("drovr_doing", self.tokens())
+
+    def test_quick_tool_then_long_tool_keeps_doing(self):
+        self.prompt()
+        self.run_hook(self.pre("t1", "cat a"))
+        self.run_hook(self.post("t1", "cat a"))
+        self.run_hook(self.pre("t2", "cargo test"))
+        self.assertEqual(self.tokens()["drovr_doing"], "Bash cat a", "the clear is held back with the next tool")
+        time.sleep(2.1)
+        self.run_hook(self.post("t2", "cargo test"))
+        self.assertNotIn("drovr_doing", self.tokens())
+        self.run_hook(self.pre("t3", "cargo build"))
+        self.assertEqual(self.tokens()["drovr_doing"], "Bash cargo build", "a clear does not start the gap")
+
+    def test_request_without_tool_id_ends_with_its_tool(self):
+        # Another PreToolUse hook changed the input: no PreToolUse hash matches.
+        self.prompt()
+        self.run_hook(self.pre("t1", "git push"))
+        proc = self.start_hook(self.permission("git push --dry-run"))
+        self.assertIsNotNone(self.wait_req())
+        self.run_hook(self.post("t1", "git push --dry-run"))
+        self.assertEqual(self.finish(proc), "")
+        self.assertNotIn("drovr_wait", self.tokens())
+
+    def test_request_after_its_tool_finished_is_not_added(self):
+        # Another PermissionRequest hook allowed a fast tool before this hook
+        # took the pane lock.
+        self.prompt()
+        self.run_hook(self.pre("t1", "git push"))
+        self.run_hook(self.post("t1", "git push"))
+        start = time.monotonic()
+        self.assertEqual(self.run_hook(self.permission("git push")), "")
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(self.pending(), [])
+        # The next real request for the same command is published.
+        self.run_hook(self.pre("t2", "git push"))
+        proc = self.start_hook(self.permission("git push"))
+        self.assertIsNotNone(self.wait_req())
+        self.run_hook(self.post("t2", "git push"))
+        self.finish(proc)
+
+    def test_nested_claude_session_is_ignored(self):
+        owner = subprocess.Popen(["sleep", "60"])
+        self.procs.append(owner)
+        child = subprocess.Popen(["sleep", "60"])
+        self.procs.append(child)
+        parent_env = {"CLAUDE_PID": str(owner.pid)}
+        child_env = {"CLAUDE_PID": str(child.pid)}
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "go"}, **parent_env)
+        self.run_hook(self.pre("t1", "git push"), **parent_env)
+        proc = self.start_hook(self.permission("git push"), **parent_env)
+        req = self.wait_req()
+        for event in (
+            {"hook_event_name": "SessionStart", "session_id": "c1", "source": "startup"},
+            {"hook_event_name": "UserPromptSubmit", "session_id": "c1", "prompt": "child"},
+            {"hook_event_name": "Stop", "session_id": "c1", "last_assistant_message": "child done?"},
+            {"hook_event_name": "SessionEnd", "session_id": "c1", "reason": "other"},
+        ):
+            self.run_hook(event, **child_env)
+        # Codex started from the owner's Bash tool inherits its CLAUDE_PID.
+        self.run_hook({"hook_event_name": "Stop", "session_id": "x1"}, agent="codex", **parent_env)
+        self.assertIsNone(proc.poll(), "the parent's hook still waits")
+        tokens = self.tokens()
+        self.assertEqual(self.wait_req(), req)
+        self.assertTrue(tokens["drovr_state"].startswith("working|"))
+        self.assertNotIn("drovr_last", tokens)
+        self.decide(req, {"behavior": "allow"})
+        self.assertEqual(json.loads(self.finish(proc))["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+        # Once the owner is gone, a new Claude in the pane takes over.
+        owner.kill()
+        owner.wait()
+        self.run_hook({"hook_event_name": "SessionStart", "session_id": "c2", "source": "startup"}, **child_env)
+        self.assertTrue(self.tokens()["drovr_state"].startswith("idle|"))
+
+    def test_nested_codex_thread_is_ignored(self):
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "th1"}, agent="codex", CODEX_THREAD_ID="th1")
+        self.run_hook({"hook_event_name": "Stop", "session_id": "th2"}, agent="codex", CODEX_THREAD_ID="th1")
+        self.assertTrue(self.tokens()["drovr_state"].startswith("working|"))
+
+    def test_codex_interrupt_ends_the_turn(self):
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "th1"}, agent="codex")
+        self.run_hook(self.pre("c1", "cargo test"), agent="codex")
+        self.run_hook(self.permission("cargo test", tool_use_id="c1"), agent="codex")
+        self.assertIsNotNone(self.wait_req())
+        self.run_hook({"hook_event_name": "Interrupt", "session_id": "th1"}, agent="codex")
+        tokens = self.tokens()
+        self.assertNotIn("drovr_wait", tokens)
+        self.assertNotIn("drovr_doing", tokens)
+        self.assertTrue(tokens["drovr_state"].startswith("idle|"))
 
     def test_codex_request_is_published_without_waiting(self):
         self.prompt()
@@ -527,6 +629,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual([g["hooks"][0]["command"] for g in codex["hooks"]["PermissionRequest"]],
                          ["orca-hook", f"python3 {state} codex"])
         self.assertNotIn("Notification", codex["hooks"])
+        self.assertEqual(codex["hooks"]["Interrupt"][-1]["hooks"][0]["command"], f"python3 {state} codex")
         self.assertTrue((self.home / ".claude/settings.json.bak-pre-drovr").exists())
         # A second run changes nothing.
         self.assertIn("no change", self.install("--dry-run"))

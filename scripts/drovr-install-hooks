@@ -75,8 +75,10 @@ CLAUDE_STATE_EVENTS = (
     "Notification", "Stop", "StopFailure", "SessionEnd",
 )
 # Codex has no PostToolUseFailure, PermissionDenied, Notification,
-# StopFailure or SessionEnd hooks.
-CODEX_STATE_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop")
+# StopFailure or SessionEnd hooks; Interrupt (Esc) ends a turn without Stop.
+CODEX_STATE_EVENTS = (
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "Interrupt",
+)
 
 
 def load(path):

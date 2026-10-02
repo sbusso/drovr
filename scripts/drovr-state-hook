@@ -22,9 +22,19 @@ recorded as (tool_use_id, hash of tool_name and tool_input) and a
 PermissionRequest claims the oldest unclaimed record with the same hash.
 
 Pending requests are a set. PostToolUse and PostToolUseFailure with the
-claimed tool id, PermissionDenied and the request's own hook exit remove one;
-UserPromptSubmit, Stop, SessionStart, SessionEnd and an idle Notification clear
-the set. drovr_wait shows the oldest pending request.
+claimed tool id (or, for a request without one, the same tool hash),
+PermissionDenied and the request's own hook exit remove one; UserPromptSubmit,
+Stop, SessionStart, SessionEnd, Codex Interrupt and an idle Notification clear
+the set. drovr_wait shows the oldest pending request. A PermissionRequest whose
+tool already finished (another PermissionRequest hook allowed it and its
+PostToolUse came first) is not added.
+
+Nested sessions: an agent started from a tool in the pane (`claude -p`,
+`codex exec`) inherits HERDR_PANE_ID and the user hooks. Its events are
+ignored: Claude events count only from the pane's owning Claude process
+(CLAUDE_PID, while it is alive), and Codex events are skipped when
+CODEX_THREAD_ID differs from their session id (as herdr's Codex hook does) or
+when CLAUDE_PID is the pane's owning Claude.
 
 Claude PermissionRequest: after publishing, the hook waits for a decision file
 <state>/decide/<req8>.json (polled every 250 ms) and prints it as the hook
@@ -86,10 +96,12 @@ REDACTIONS = (
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S), "***"),
     (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
     (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1***@"),
+    # key=value and "Key: value". The key word must end there (`author`,
+    # `tokens` are kept), and `::` paths are not a separator.
     (
         re.compile(
-            r"(?i)([\w.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|auth|credential|private[_-]?key|access[_-]?key)[\w.-]*"
-            r"\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
+            r"(?i)((?<![\w.:-])[\w.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|auth(?:orization)?|credentials?"
+            r"|private[_-]?key|access[_-]?key)(?![a-z])[\w.-]*\s*(?:=|:(?!:))\s*)(\"[^\"]*\"|'[^']*'|\S+)"
         ),
         r"\1***",
     ),
@@ -97,7 +109,10 @@ REDACTIONS = (
         re.compile(r"(?i)(--?(?:token|password|passwd|secret|api-?key|auth|credentials?)\s+)(\"[^\"]*\"|'[^']*'|\S+)"),
         r"\1***",
     ),
-    (re.compile(r"(?i)(\s-p)(\S{4,})"), r"\1***"),
+    # curl/wget/http basic auth: -u user:pass, --user user:pass.
+    (re.compile(r"((?:^|\s)(?:-u|--user)(?:\s+|=)[^\s:]+:)\S+"), r"\1***"),
+    # mysql -p<password> (attached value); -p elsewhere is a plain option.
+    (re.compile(r"(?i)(\b(?:mysql\w*|mariadb\w*)\b[^\n]*?\s-p)(?=\S)(\S+)"), r"\1***"),
     (
         re.compile(
             r"\b(sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
@@ -105,16 +120,20 @@ REDACTIONS = (
         ),
         "***",
     ),
-    # Long opaque strings with letters and digits (keys, hashes); paths and
-    # long identifiers without digits are kept.
-    (re.compile(r"\b(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[A-Za-z])[A-Za-z0-9+_-]{32,}={0,2}"), "***"),
 )
+# Long opaque strings with letters and digits (keys, hashes); paths and long
+# identifiers without digits are kept, and so are git object ids in a git
+# command. Ceiling: a 40-hex secret on a git command line is kept too.
+OPAQUE = re.compile(r"\b(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[A-Za-z])[A-Za-z0-9+_-]{32,}={0,2}")
+GIT_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+GIT_COMMAND = re.compile(r"\bgit\s")
 
 
 def redact(text):
     for pattern, replacement in REDACTIONS:
         text = pattern.sub(replacement, text)
-    return text
+    keep_oids = bool(GIT_COMMAND.search(text))
+    return OPAQUE.sub(lambda m: m.group(0) if keep_oids and GIT_OID.fullmatch(m.group(0)) else "***", text)
 
 
 def text_enabled():
@@ -236,7 +255,9 @@ def new_state():
         "doing": "",
         "last": "",
         "pre": [],
+        "done": [],
         "pending": [],
+        "owner": None,
         "reported": {},
         "report_ns": 0,
         "pre_report_ns": 0,
@@ -305,8 +326,10 @@ def desired_tokens(state):
     return tokens
 
 
-def report(state, pane, throttle=False):
-    """Send the tokens that changed since the last successful report."""
+def report(state, pane, throttle=None):
+    """Send the tokens that changed since the last successful report.
+    throttle "pre" (PreToolUse) or "post" (PostToolUse) holds the report back
+    within PRE_TOOL_REPORT_GAP_NS of the last "pre" report."""
     tokens = desired_tokens(state)
     changed = {k: v for k, v in tokens.items() if state["reported"].get(k) != v}
     if not changed:
@@ -338,7 +361,7 @@ def report(state, pane, throttle=False):
         log_error(f"report-metadata exit {result.returncode}: {result.stderr.decode(errors='replace')}")
         return
     state["report_ns"] = seq
-    if throttle:
+    if throttle == "pre":
         state["pre_report_ns"] = seq
     state["reported"] = {k: v for k, v in tokens.items() if v}
 
@@ -355,7 +378,51 @@ def remove_request(state, predicate):
 def turn_boundary(state):
     state["pending"] = []
     state["pre"] = []
+    state["done"] = []
     state["doing"] = ""
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def env_pid(name):
+    try:
+        return int(os.environ.get(name, ""))
+    except ValueError:
+        return None
+
+
+def foreign_session(agent, hook, state):
+    """True for an event of an agent nested in the pane's owning agent (see
+    the module docstring); otherwise the event's agent becomes the owner."""
+    owner = state.get("owner") or {}
+    owner_pid = owner.get("pid") if owner.get("agent") == "claude" else None
+    owner_alive = bool(owner_pid) and pid_alive(owner_pid)
+    if agent == "codex":
+        session = hook.get("session_id") if isinstance(hook.get("session_id"), str) else ""
+        inherited = os.environ.get("CODEX_THREAD_ID")
+        if inherited and session and inherited != session:
+            return True
+        if owner_alive and env_pid("CLAUDE_PID") == owner_pid:
+            return True
+        state["owner"] = {"agent": "codex", "session": session}
+        return False
+    pid = env_pid("CLAUDE_PID")
+    if pid is None:
+        return False
+    if owner_alive and owner_pid != pid:
+        return True
+    if owner.get("agent") == "codex" and owner.get("session") and os.environ.get("CODEX_THREAD_ID") == owner["session"]:
+        return True
+    state["owner"] = {"agent": "claude", "pid": pid}
+    return False
 
 
 def last_message(hook):
@@ -398,7 +465,7 @@ def last_summary(message):
     return line
 
 
-def build_request(agent, hook, tool_id):
+def build_request(agent, hook, tool_id, digest):
     """The pending request for a PermissionRequest, or None for prompts the
     inbox cannot represent (they stay jump-only dialog items)."""
     tool = hook.get("tool_name") or ""
@@ -407,6 +474,7 @@ def build_request(agent, hook, tool_id):
     req = {
         "req": secrets.token_hex(4),
         "tool_use_id": tool_id,
+        "hash": digest,
         "sub": bool(hook.get("agent_id")),
         "agent": agent,
         "pid": os.getpid(),
@@ -435,8 +503,8 @@ def build_request(agent, hook, tool_id):
 
 def handle_event(agent, hook, pane, state, now_s):
     """Apply one hook event to the pane state. Returns (request, throttle):
-    the request this invocation added (PermissionRequest), and whether the
-    report may be throttled."""
+    the request this invocation added (PermissionRequest), and the report
+    throttle (see report)."""
     event = hook.get("hook_event_name") or ""
     sub = bool(hook.get("agent_id"))
     tool = hook.get("tool_name") or ""
@@ -460,32 +528,51 @@ def handle_event(agent, hook, pane, state, now_s):
             state["doing"] = tool_summary(tool, tool_input, cwd)
             state["kind"] = "working"
             state["ts"] = now_s
-            return None, True
+            return None, "pre"
     elif event in ("PostToolUse", "PostToolUseFailure"):
+        digest = tool_hash(tool, tool_input)
+        removed = False
         if tool_id:
+            claimed = any(p[0] == tool_id and p[2] for p in state["pre"])
             state["pre"] = [p for p in state["pre"] if p[0] != tool_id]
-            remove_request(state, lambda r: r.get("tool_use_id") == tool_id)
+            removed = remove_request(state, lambda r: r.get("tool_use_id") == tool_id)
+            if not claimed:
+                # A PermissionRequest for this tool may still be on its way
+                # (another hook allowed it and the tool was fast).
+                state["done"] = (state["done"] + [digest])[-PRE_KEEP:]
+        # A request without a tool id (its input changed after PreToolUse,
+        # for example by another hook's updatedInput) ends with its tool.
+        removed |= remove_request(state, lambda r: r.get("tool_use_id") is None and r.get("hash") == digest)
         if not sub:
             state["doing"] = ""
+        # The clear of drovr_doing is held back within 2 s of the last
+        # PreToolUse report, like PreToolUse itself, so a quick tool followed
+        # by a long one never leaves drovr_doing empty (it shows the quick
+        # tool at worst). A removed request is always reported.
+        return None, None if removed else "post"
     elif event == "PermissionRequest":
+        digest = tool_hash(tool, tool_input)
         if not tool_id:
-            digest = tool_hash(tool, tool_input)
             for record in state["pre"]:
                 if not record[2] and record[1] == digest:
                     record[2] = True
                     tool_id = record[0]
                     break
-        req = build_request(agent, hook, tool_id)
+            else:
+                if digest in state["done"]:
+                    # The tool already ran: its dialog is gone.
+                    state["done"].remove(digest)
+                    return None, None
+        req = build_request(agent, hook, tool_id, digest)
         if req:
             state["pending"].append(req)
-        return req, False
+        return req, None
     elif event == "PermissionDenied":
-        if tool_id:
-            remove_request(state, lambda r: r.get("tool_use_id") == tool_id)
-        else:
-            digest = tool_hash(tool, tool_input)
-            ids = {p[0] for p in state["pre"] if p[1] == digest}
-            remove_request(state, lambda r: r.get("tool_use_id") in ids)
+        digest = tool_hash(tool, tool_input)
+        ids = {tool_id} if tool_id else {p[0] for p in state["pre"] if p[1] == digest}
+        remove_request(
+            state, lambda r: r.get("tool_use_id") in ids or (r.get("tool_use_id") is None and r.get("hash") == digest)
+        )
         if not sub:
             state["doing"] = ""
             state["last"] = clean(f"denied: {tool_summary(tool, tool_input, cwd)}")
@@ -497,6 +584,10 @@ def handle_event(agent, hook, pane, state, now_s):
         message = str(hook.get("message") or "")
         if kind == "idle_prompt" or "waiting for your input" in message:
             turn_boundary(state)
+    elif event == "Interrupt":
+        # Codex: Esc ends the turn without Stop.
+        turn_boundary(state)
+        set_kind(state, "idle", now_s)
     elif event == "Stop":
         turn_boundary(state)
         message = last_message(hook)
@@ -521,7 +612,8 @@ def handle_event(agent, hook, pane, state, now_s):
             set_kind(state, "exited", now_s)
         else:
             state["kind"] = None
-    return None, False
+        state["owner"] = None
+    return None, None
 
 
 # ---------------------------------------------------------------- decisions
@@ -631,6 +723,8 @@ def main():
         return
     now_s = int(time.time())
     with PaneState(pane) as pane_state:
+        if foreign_session(agent, hook, pane_state.data):
+            return
         req, throttle = handle_event(agent, hook, pane, pane_state.data, now_s)
         report(pane_state.data, pane, throttle=throttle)
         pane_state.save()
