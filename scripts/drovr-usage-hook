@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""drovr usage hook for Claude Code (Stop hook).
+"""drovr usage hook for Claude Code (Stop, SessionStart and UserPromptSubmit).
 
-After each agent turn, read the new part of the session transcript and report
-to herdr, as pane metadata tokens (visible to every drovr client):
+When a session starts, a prompt is sent and a turn ends, read the new part of
+the session transcript and report to herdr, as pane metadata tokens (visible
+to every drovr client). Each report replaces the previous session's tokens in
+the pane, so a new session (/clear, a fresh `claude`) starts clean:
   drovr_ctx      current context size in tokens (last request's input side)
   drovr_session  Claude session id
   drovr_name     the session's name, as the Claude desktop app and
@@ -14,7 +16,7 @@ to herdr, as pane metadata tokens (visible to every drovr client):
 Incremental: a per-session cache remembers the read offset and totals, so a
 turn costs only the new lines. Never fails the agent: any error exits 0.
 
-Install: drovr-install-hooks (adds this as a Stop hook in ~/.claude/settings.json).
+Install: drovr-install-hooks (registers it for those events in ~/.claude/settings.json).
 """
 import json
 import os
@@ -74,8 +76,10 @@ def main():
     pane = os.environ.get("HERDR_PANE_ID")
     transcript = hook.get("transcript_path")
     session = hook.get("session_id")
-    if not (pane and transcript and session and os.path.exists(transcript)):
+    if not (pane and session):
         return
+    # A session that just started may have no transcript yet: report it empty.
+    transcript = transcript if transcript and os.path.exists(transcript) else None
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, f"{session}.json")
@@ -84,12 +88,12 @@ def main():
             cache = json.load(handle)
     except (OSError, ValueError):
         cache = {"offset": 0, "last_id": None, "ctx": 0, "days": {}}
-    if os.path.getsize(transcript) < cache["offset"]:
+    if transcript and os.path.getsize(transcript) < cache["offset"]:
         cache = {"offset": 0, "last_id": None, "ctx": 0, "days": {}}
     if "titles" not in cache:
-        cache["titles"] = scan_titles(transcript, cache["offset"])
+        cache["titles"] = scan_titles(transcript, cache["offset"]) if transcript else {}
 
-    with open(transcript, "rb") as handle:
+    with open(transcript or os.devnull, "rb") as handle:
         handle.seek(cache["offset"])
         for raw in handle:
             if not raw.endswith(b"\n"):
@@ -129,18 +133,22 @@ def main():
         json.dump(cache, handle)
     os.replace(tmp, cache_path)
 
-    args = [
-        "--token", f"drovr_ctx={cache['ctx']}",
-        "--token", f"drovr_session={session}",
-    ]
+    args = ["--token", f"drovr_session={session}"]
+    # Cleared when unknown, so a new session in the pane drops the old values.
+    args += ["--token", f"drovr_ctx={cache['ctx']}"] if cache["ctx"] else ["--clear-token", "drovr_ctx"]
     name = session_name(cache["titles"])
-    # Cleared when unknown, so a new session in the pane drops the old name.
     args += ["--token", f"drovr_name={name}"] if name else ["--clear-token", "drovr_name"]
+    reported = set()
     for day, t in sorted(cache["days"].items()):
         values = ",".join(str(v) for v in t[:4] + [len(t[4])])
+        reported.add(day.replace("-", ""))
         args += ["--token", f"drovr_u_{day.replace('-', '')}={values}"]
-    expired = (datetime.now() - timedelta(days=KEEP_DAYS)).strftime("%Y%m%d")
-    args += ["--clear-token", f"drovr_u_{expired}"]
+    # Clear every other day of the window (and the one that just expired), so
+    # an earlier session's days in this pane are not credited to this one.
+    for back in range(KEEP_DAYS + 1):
+        day = (datetime.now() - timedelta(days=back)).strftime("%Y%m%d")
+        if day not in reported:
+            args += ["--clear-token", f"drovr_u_{day}"]
     herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
     subprocess.run(
         [herdr, "pane", "report-metadata", pane, "--source", "drovr", *args],

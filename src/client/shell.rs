@@ -286,6 +286,7 @@ fn blit_pane_surface(target: &mut FrameData, source: &FrameData, area: Rect) {
 mod tests;
 
 /// drovr fork: queue an agent to focus (from a notification click).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // clickable notifications are Linux-only
 pub(crate) fn request_agent_focus(endpoint_id: ClientEndpointId, pane_id: String) {
     projects::request_focus(endpoint_id, pane_id);
 }

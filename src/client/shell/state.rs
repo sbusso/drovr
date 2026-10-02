@@ -815,6 +815,8 @@ pub(crate) enum ClientShellNotificationEffect {
         target: Option<ClientSystemNotificationTarget>,
         /// drovr fork: the agent to jump to when it is clicked.
         #[cfg(not(windows))]
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        // clickable notifications are Linux-only
         click: Option<(ClientEndpointId, String)>,
     },
 }

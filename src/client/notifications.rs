@@ -68,8 +68,9 @@ pub(super) fn handle_shell_notification_effects(
                     warn!(err = %err, "failed to emit terminal notification");
                 }
             }
-            // drovr fork: clickable notify-send notification.
-            #[cfg(not(windows))]
+            // drovr fork: clickable notify-send notification (Linux only:
+            // macOS with XQuartz also sets DISPLAY but has no notify-send).
+            #[cfg(target_os = "linux")]
             shell::ClientShellNotificationEffect::System {
                 title,
                 body,
@@ -206,15 +207,16 @@ pub(super) fn sound_from_notify_message(message: &str) -> Option<crate::sound::S
 
 /// drovr fork: clickable notifications need an X11/Wayland display;
 /// without one the effect falls back to a plain notification.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn drovr_has_display() -> bool {
     std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// drovr fork: a desktop notification you can click. notify-send
 /// waits (on its own thread) for the click; clicking raises the terminal running
-/// drovr and focuses the agent. Falls back to a plain notification.
-#[cfg(not(windows))]
+/// drovr and focuses the agent. Falls back to a plain notification when
+/// notify-send is missing or fails (no notification daemon).
+#[cfg(target_os = "linux")]
 fn drovr_clickable_notification(
     title: String,
     body: Option<String>,
@@ -233,12 +235,20 @@ fn drovr_clickable_notification(
         if let Some(body) = body.as_deref().filter(|body| !body.is_empty()) {
             command.arg(body);
         }
-        let Ok(output) = command
+        let output = match command
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
-        else {
-            return;
+        {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                if let Err(err) =
+                    crate::platform::show_desktop_notification(&title, body.as_deref())
+                {
+                    warn!(err = %err, "failed to emit system notification");
+                }
+                return;
+            }
         };
         if String::from_utf8_lossy(&output.stdout).trim() == "default" {
             raise_own_terminal();
@@ -247,7 +257,7 @@ fn drovr_clickable_notification(
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 /// Focus the terminal window this client runs in (Hyprland): walk up our
 /// process tree until a pid matches a Hyprland client window.
 fn raise_own_terminal() {
