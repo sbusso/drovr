@@ -574,12 +574,21 @@ fn main() -> io::Result<()> {
 
     // drovr fork: `drovr update` installs the latest drovr
     // release; herdr's own updater would replace drovr with stock herdr.
+    // The installer comes from the release this binary was built for
+    // (DROVR_RELEASE_TAG, set by drovr-release.yml), not from a branch;
+    // local builds use the installer of the latest release.
     if args.get(1).map(|s| s.as_str()) == Some("update") {
+        let installer = match option_env!("DROVR_RELEASE_TAG") {
+            Some(tag) => {
+                format!("https://github.com/sbusso/drovr/releases/download/{tag}/drovr-install")
+            }
+            None => "https://github.com/sbusso/drovr/releases/latest/download/drovr-install".into(),
+        };
         let status = std::process::Command::new("bash")
             .arg("-c")
-            .arg(
-                "curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-install | bash",
-            )
+            .arg("set -o pipefail; curl -fsSL \"$1\" | bash")
+            .arg("drovr-update")
+            .arg(installer)
             .status();
         match status {
             Ok(status) if status.success() => {

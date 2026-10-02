@@ -2,13 +2,13 @@
 # Install drovr's Claude Code usage hook on this machine (run on every machine
 # where agents run). Copies the hook to ~/.local/bin and registers it as a Stop
 # hook in ~/.claude/settings.json (backup kept; existing hooks untouched).
+# The hook always comes from sbusso/drovr (main), never from the current
+# directory: under `curl ... | bash` there is no script directory to resolve.
 set -euo pipefail
-src="$(cd "$(dirname "$0")" && pwd)/drovr-usage-hook"
-if [ ! -f "$src" ]; then
-  src="$(mktemp)"
-  curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-usage-hook -o "$src"
-fi
-mkdir -p "$HOME/.local/bin"
+src="$(mktemp)"
+trap 'rm -f "$src"' EXIT
+curl -fsSL https://raw.githubusercontent.com/sbusso/drovr/main/scripts/drovr-usage-hook -o "$src"
+mkdir -p "$HOME/.local/bin" "$HOME/.claude"
 install -m 0755 "$src" "$HOME/.local/bin/drovr-usage-hook"
 settings="$HOME/.claude/settings.json"
 [ -f "$settings" ] || echo '{}' > "$settings"

@@ -1,20 +1,60 @@
 #!/usr/bin/env bash
 # Install/update drovr (client-side herdr fork) from GitHub releases.
 # Usage: drovr-install [tag]   (default: latest drovr-v* release)
+# Supports macOS and Linux on x86_64 and arm64.
 # Installs ~/.local/share/drovr/drovr and a ~/.local/bin/drovr symlink.
 # Leaves any existing herdr install untouched.
+# DROVR_INSTALL_DRY_RUN=1 prints the platform and download URL, then exits.
 set -euo pipefail
 repo=sbusso/drovr
-tag=${1:-$(curl -fsSL "https://api.github.com/repos/$repo/releases" | grep -o '"tag_name": *"drovr-v[^"]*"' | head -1 | sed 's/.*"\(drovr-v[^"]*\)"/\1/')}
-[ -n "$tag" ] || { echo "no drovr-v* release found" >&2; exit 1; }
+
+kernel=$(uname -s)
+machine=$(uname -m)
+case "$kernel" in
+  Darwin) os=macos ;;
+  Linux) os=linux ;;
+  *) echo "drovr: unsupported OS '$kernel'; release builds exist for macOS and Linux" >&2; exit 1 ;;
+esac
+# A shell running under Rosetta reports x86_64 on Apple silicon; use the native build.
+if [ "$os" = macos ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
+  machine=arm64
+fi
+case "$machine" in
+  x86_64 | amd64) arch=x86_64 ;;
+  arm64 | aarch64) arch=arm64 ;;
+  *) echo "drovr: unsupported architecture '$machine' on $kernel; release builds exist for x86_64 and arm64" >&2; exit 1 ;;
+esac
+asset="drovr-$os-$arch"
+
+tag=${1:-}
+if [ -z "$tag" ] && [ -z "${DROVR_INSTALL_DRY_RUN:-}" ]; then
+  tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases" | grep -o '"tag_name": *"drovr-v[^"]*"' | head -1 | sed 's/.*"\(drovr-v[^"]*\)"/\1/')
+  [ -n "$tag" ] || { echo "drovr: no drovr-v* release found in $repo" >&2; exit 1; }
+fi
+base="https://github.com/$repo/releases/download/${tag:-<latest>}"
+if [ -n "${DROVR_INSTALL_DRY_RUN:-}" ]; then
+  echo "platform: $kernel $machine -> $asset"
+  echo "url: $base/$asset"
+  exit 0
+fi
+case "$tag" in
+  drovr-v*) ;;
+  *) echo "drovr: '$tag' is not a drovr release tag (drovr-v...)" >&2; exit 1 ;;
+esac
+
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'
+}
+
 dir="$HOME/.local/share/drovr"
 mkdir -p "$dir" "$HOME/.local/bin"
-base="https://github.com/$repo/releases/download/$tag"
-curl -fsSL "$base/drovr-linux-x86_64" -o "$dir/drovr.new"
-expected=$(curl -fsSL "$base/drovr-linux-x86_64.sha256" | awk '{print $1}')
-actual=$(sha256sum "$dir/drovr.new" | awk '{print $1}')
-[ "$expected" = "$actual" ] || { echo "checksum mismatch" >&2; rm -f "$dir/drovr.new"; exit 1; }
-chmod +x "$dir/drovr.new" && mv "$dir/drovr.new" "$dir/drovr"
+tmp="$dir/drovr.new"
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL "$base/$asset" -o "$tmp" || { echo "drovr: release $tag has no $asset build" >&2; exit 1; }
+expected=$(curl -fsSL "$base/$asset.sha256" | awk '{print $1}')
+actual=$(sha256 "$tmp")
+[ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "drovr: checksum mismatch for $asset" >&2; exit 1; }
+chmod +x "$tmp" && mv "$tmp" "$dir/drovr"
 ln -sfn "$dir/drovr" "$HOME/.local/bin/drovr"
 echo "$tag" > "$dir/VERSION"
-echo "installed drovr $tag -> $dir/drovr"
+echo "installed drovr $tag ($asset) -> $dir/drovr"
