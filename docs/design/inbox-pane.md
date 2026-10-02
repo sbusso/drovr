@@ -60,26 +60,22 @@ waiting kinds), `z` (snooze), `m` (mute workspace).
 
 ## 3. Placement
 
-The inbox is its own pane, like the doc pane: a herdr pane that runs
-`drovr inbox` and reports the `drovr_inbox` metadata token so drovr can find it.
+The inbox is a panel that the drovr client draws on the right side of the
+screen, the same way it draws the sidebar. It looks and behaves like a pane,
+but it is not a herdr pane and runs no process on any server. The client
+already holds every endpoint's snapshot and SSH bridge, so the inbox works the
+same whether the current workspace is local or on a remote machine.
 
-- `prefix i` toggles it. If the current workspace has an inbox pane, `prefix i`
-  focuses it, or closes it when it already has focus. Otherwise drovr splits
-  one off the right side of the focused pane and focuses it.
-- Clicking a sidebar glyph or a section count opens the same pane, filtered to
-  that workspace or project (section 4).
-- One inbox pane per workspace at most; opening it again reuses it, as the doc
-  pane does.
-- The split gives the inbox 40% of the focused pane's width, at least 48
-  columns. When that would leave the focused pane fewer than 32 columns, drovr
-  splits downward instead, giving the inbox 40% of the height. The user
-  resizes it with herdr's normal pane resizing
-  (border drag or keys); drovr does not save a width.
-
-The `drovr inbox` process runs on the client machine, because it needs the
-client's endpoint list and SSH bridges to see every machine. In a workspace on
-the local server that is a normal split. For a workspace on a remote server,
-see open question 1.
+- `prefix i` toggles it. When it is open, `prefix i` focuses it, or closes it
+  when it already has focus.
+- Clicking a sidebar glyph or a section count opens it, filtered to that
+  workspace or project (section 4).
+- Its width is a share of the screen: 40% by default, at least 48 columns.
+  The user resizes it by dragging its left border; drovr saves the width in
+  `sidebar.toml`. When the panes area would keep fewer than 32 columns, the
+  inbox opens over the panes area instead of beside it, and closes on Esc.
+- The panes area shrinks while the inbox is open; herdr's pane layout is
+  recomputed for the narrower area, as it is when the sidebar width changes.
 
 ## 4. Layout
 
@@ -391,8 +387,10 @@ hook timeout; PermissionRequest does not fire in `-p` mode.
 
 ## Decisions
 
-- The inbox is its own pane, toggled by `prefix i` and opened by sidebar
-  clicks. The sidebar-swap, popup and docked-column placements are dropped.
+- The inbox is a client-drawn right panel, toggled by `prefix i` and opened by
+  sidebar clicks (user decision, 2026-10-02): a herdr pane would run on the
+  workspace's server and could not see every machine. The sidebar-swap and
+  popup placements are dropped.
 - No workspace (gtm) server: drovr owns the inbox. Live state stays in herdr
   pane metadata; durable task records come later in a drovr-owned per-project
   file.
@@ -412,11 +410,8 @@ hook timeout; PermissionRequest does not fire in `-p` mode.
 
 ## Open questions
 
-1. Where does the inbox pane go when the current workspace is on a remote
-   server? The `drovr inbox` process runs on the client machine, and a herdr
-   pane runs its process on the server that hosts it. Options: open the inbox
-   in a local workspace and switch to it, or install drovr on each server and
-   run the inbox there with its own SSH bridges.
+1. Answered: the inbox is drawn by the client (section 3), so it is the same
+   on local and remote workspaces.
 2. Does `allow` with `updatedPermissions` from `permission_suggestions` behave
    like the dialog's "always" option? Verify in build step 2.
 3. What is Codex's PermissionRequest decision format, and does Codex keep its
