@@ -77,6 +77,15 @@ pub(super) fn dispatch_client_shell_actions(
                     .and_then(|shell| shell.drovr_events.clone());
                 shell::run_inbox_request(route, request, reply, events);
             }
+            shell::ClientShellAction::InboxTask { route, task, reply } => {
+                let events = shell
+                    .as_deref()
+                    .and_then(|shell| shell.drovr_events.clone());
+                shell::run_inbox_task(route, task, reply, events);
+            }
+            shell::ClientShellAction::OpenLocalEditor { pane_id, path } => {
+                shell::open_local_editor(pane_id, path);
+            }
             shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
             shell::ClientShellAction::Keybind(action) => {
                 debug!(

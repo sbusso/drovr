@@ -307,6 +307,25 @@ class StateHookTests(unittest.TestCase):
         self.assertEqual(json.loads(self.finish(proc))["hookSpecificOutput"]["decision"], {"behavior": "allow"})
         self.assertTrue((self.state / "decide" / "deadbeef.json").exists(), "only the own file is read")
 
+    def test_late_decision_for_a_finished_request_answers_nothing(self):
+        # The inbox wrote its decision after the request ended (answered in
+        # the terminal, new prompt): a later request with the same command
+        # gets a new id and keeps waiting.
+        self.prompt()
+        first = self.start_hook(self.permission("git push"))
+        req1 = self.wait_req()
+        self.prompt()
+        self.assertEqual(self.finish(first), "")
+        self.decide(req1, {"behavior": "allow"})
+        second = self.start_hook(self.permission("git push"))
+        req2 = self.wait_req()
+        self.assertNotEqual(req1, req2)
+        time.sleep(0.6)
+        self.assertIsNone(second.poll(), "the stale decision does not answer the new request")
+        self.decide(req2, {"behavior": "deny", "message": "not now"})
+        decision = json.loads(self.finish(second))["hookSpecificOutput"]["decision"]
+        self.assertEqual(decision, {"behavior": "deny", "message": "not now"})
+
     def test_wait_limit_exits_silently_and_drops_the_item(self):
         self.prompt()
         proc = self.start_hook(self.permission("git push"), DROVR_DECIDE_WAIT_S="0.5")

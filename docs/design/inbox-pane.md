@@ -446,6 +446,58 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
    plan fetch. Tests: a fake endpoint where each check fails and nothing is
    sent; a stale decision file for a finished request is ignored.
 
+   Built in `src/client/shell/inbox_answer.rs` (routes, checks, label
+   mapping, scripts) and `src/client/shell/inbox_editor.rs` (the editor),
+   wired in `inbox.rs`. Every answer runs on a background thread through
+   one `Machine` (the local socket and `/bin/sh`, or the endpoint bridge's
+   API and shell channels), so the checks are the same on every machine.
+
+   - Routes: Claude permissions (`y`, `a`, `n`, `r`), question `o` and plan
+     `r` write a decision file; question options and plan `y` send keys;
+     Codex permissions send keys (`y`, `a`, `n` by label; no `r`, since a
+     Codex note has no verified route). Replies refuse a working or blocked
+     agent. The decision script also checks that the hook's pane state
+     still lists the request (grep for `"req": "<id>"`, the hook's JSON
+     separators), so a late answer leaves no file; the hook ignores a stale
+     file in any case.
+   - Label mapping: the options are the last run of numbered lines `1. …`,
+     `2. …` at the bottom of the screen, so a plan's own numbered steps are
+     not options. Question keys match the `drovr_oN` label (prefix match
+     only when the token was cut at 80 characters); plan `y` matches
+     "manually approve"; Codex `y`/`a`/`n` match "Yes" without, "Yes" with,
+     and "No" with a grant word. Exactly one option must match. A grant
+     label ("always", "don't ask again", "auto-accept") and `a` need a
+     second press of the same key.
+   - Screen reads use the detection source (the bottom of the screen, which
+     scrolling does not move). The inbox reads the screen when a waiting
+     item is selected, and again every 2 s while no key-path option is
+     confirmed (the dialog can be drawn after the hook publishes). An item
+     with no text (`DROVR_STATE_TEXT=0`) never answers by keys. A failed
+     check, or a send that reports a changed prompt, removes the item's
+     answer keys and shows "Changed in the terminal. Jump to see it." until
+     its state or request changes; a transport error shows a notice and
+     the item returns with its keys. Editor text that was sent comes back
+     as the item's draft when the answer fails.
+   - Editor: `ctrl+e` writes the draft to
+     `<state dir>/drovr-inbox/note-<pane>.md` and opens `$EDITOR` on it in a
+     pane split below the focused pane of the local server; the inbox
+     reloads the file whenever it changes. Ceiling: with a remote workspace
+     on screen there is no local pane to split, so `ctrl+e` asks for a local
+     workspace. A note longer than 4000 bytes (the hook's limit) is not
+     sent.
+   - Plan: `p` and the expanded detail (first 20 lines) read the plan file
+     through the shell channel with python3 (the hook's own interpreter).
+     A local agent's plan opens beside it. A remote agent's plan opens from
+     a copy in `<state dir>/drovr-inbox/` in the local workspace on screen.
+     Deviation: while a remote workspace is on screen, a local doc pane
+     would not be visible, so the plan opens beside the agent on its
+     machine instead (the remote Ctrl+click route, which needs drovr or the
+     drovr.docs plugin there).
+   - Not verified live: that a digit on Claude's AskUserQuestion and
+     ExitPlanMode dialogs, and on Codex's approval dialog, picks and
+     submits that option, and Codex's exact labels. The label checks fail
+     closed: no matching option, no keys.
+
 ## 11. Experiments (Claude Code 2.1.287, macOS)
 
 Setup: a temporary git project with a project-local `.claude/settings.json`

@@ -92,6 +92,54 @@ pub(crate) fn open_local_document(
     });
 }
 
+/// Opens `$EDITOR` on `path` in a pane split below `pane_id` on the local
+/// server; the pane closes when the editor exits. The path reaches the
+/// editor through the pane's environment, never as typed shell text.
+pub(crate) fn open_local_editor(pane_id: String, path: std::path::PathBuf) {
+    const PATH_ENV: &str = "DROVR_INBOX_NOTE";
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let socket = crate::api::socket_path();
+    std::thread::spawn(move || {
+        let run = |args: &[&str]| {
+            std::process::Command::new(&exe)
+                .args(args)
+                .env(crate::api::SOCKET_PATH_ENV_VAR, &socket)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+        };
+        let env = format!("{PATH_ENV}={}", path.display());
+        let split = run(&[
+            "pane",
+            "split",
+            &pane_id,
+            "--direction",
+            "down",
+            "--focus",
+            "--env",
+            &env,
+        ]);
+        let new_pane = split
+            .ok()
+            .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+            .and_then(|value| {
+                value["result"]["pane"]["pane_id"]
+                    .as_str()
+                    .map(String::from)
+            });
+        let Some(new_pane) = new_pane else {
+            tracing::warn!("cannot open a pane for $EDITOR");
+            return;
+        };
+        let command = format!("${{EDITOR:-vi}} \"${PATH_ENV}\"; exit");
+        if let Err(err) = run(&["pane", "run", &new_pane, &command]) {
+            tracing::warn!(err = %err, "cannot run $EDITOR");
+        }
+    });
+}
+
 /// Read-only usage lines for a project's menu (from the drovr usage hook).
 fn usage_items(name: &str) -> Vec<ClientContextMenuItem> {
     let layout = projects::layout();
@@ -1181,6 +1229,7 @@ impl ClientShellState {
             outcome.repaint = true;
         }
         outcome.repaint |= projects::expire_peek();
+        self.tick_inbox(outcome);
         // Advance the structured view's spinner while an agent works.
         outcome.repaint |= super::drovr_sidebar::take_spinning();
         outcome.repaint |= super::drovr_sidebar::take_clock_tick();

@@ -301,6 +301,19 @@ pub(crate) enum ClientShellAction {
         request: Box<crate::api::schema::Request>,
         reply: super::inbox::InboxReply,
     },
+    /// drovr fork: an inbox answer or plan read on a machine, run on a
+    /// background thread.
+    InboxTask {
+        route: super::inbox::ApiRoute,
+        task: super::inbox_answer::Task,
+        reply: super::inbox::InboxReply,
+    },
+    /// drovr fork: `$EDITOR` on `path` in a pane split from `pane_id` on
+    /// the local server.
+    OpenLocalEditor {
+        pane_id: String,
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Default)]

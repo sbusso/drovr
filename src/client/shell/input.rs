@@ -204,7 +204,10 @@ impl ClientShellState {
                             &mut outcome,
                         );
                     } else if !self.popup_pending {
-                        if self.insert_overlay_text(&text) {
+                        // drovr fork: text and pastes go to the inbox editor.
+                        if (self.overlay.is_none() && self.insert_inbox_text(&text))
+                            || self.insert_overlay_text(&text)
+                        {
                             outcome.repaint = true;
                         } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
                             self.push_focused_pane_event(
@@ -237,7 +240,10 @@ impl ClientShellState {
                             &mut outcome,
                         );
                     } else if !self.popup_pending {
-                        if self.insert_overlay_text(&text) {
+                        // drovr fork: text and pastes go to the inbox editor.
+                        if (self.overlay.is_none() && self.insert_inbox_text(&text))
+                            || self.insert_overlay_text(&text)
+                        {
                             outcome.repaint = true;
                         } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
                             self.push_focused_pane_event(

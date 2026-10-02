@@ -8,8 +8,10 @@
 //! server, so every client shows the same inbox; mutes, the stuck threshold,
 //! grouping and the panel width are client preferences in `sidebar.toml`.
 //!
-//! Read and jump only: answers (hook decisions, option keys, replies) land in
-//! build step 5.
+//! Answers (section 9) go through `inbox_answer`: hook decisions for Claude
+//! permissions and notes, option keys after screen checks for questions,
+//! plan approval and Codex permissions, and `agent.prompt` replies. Notes and
+//! replies use the multi-line editor in `inbox_editor`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -19,6 +21,8 @@ use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEven
 use serde::{Deserialize, Serialize};
 
 use super::agent_signal::{self, AgentSignal, InboxFilter, ItemKind};
+use super::inbox_answer::{self as answer, Action, Choice, Decision};
+use super::inbox_editor::{EditorKey, NoteEditor};
 use super::projects::{self, ProjectLayout, OTHER};
 use super::render::{display_width, put_text};
 use super::*;
@@ -48,6 +52,11 @@ const PENDING_MARK_TTL: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Screen lines kept from `pane.read` for an expanded item.
 const SCREEN_LINES: usize = 30;
+/// Plan lines shown in an expanded plan item.
+const PLAN_LINES: usize = 20;
+/// A screen read that confirmed no answer is read again after this long
+/// (the dialog may be drawn after the hook published the request).
+const SCREEN_RETRY: Duration = Duration::from_secs(2);
 
 /// `[inbox]` in `sidebar.toml`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -334,6 +343,7 @@ pub(super) struct Item {
     pub(super) seq: u64,
     wait_id: String,
     pub(super) workspace_id: String,
+    tab_id: String,
     pub(super) workspace: String,
     workspace_key: String,
     /// Section key: a project name or [`OTHER`].
@@ -343,7 +353,11 @@ pub(super) struct Item {
     machine: String,
     /// The agent, when it is not claude.
     vendor: Option<String>,
+    /// Claude: the drovr-state-hook waits for a decision file.
+    decides: bool,
     pub(super) summary: String,
+    /// The request text in `drovr_wait` (cut at 80 characters).
+    wait_text: String,
     /// Question option labels (`drovr_o1`-`drovr_o4`).
     options: Vec<String>,
     /// Token facts for the expanded detail.
@@ -529,6 +543,7 @@ pub(super) fn collect(
                 seq: agent.state_change_seq,
                 wait_id: wait_id(agent).to_owned(),
                 workspace_id: workspace.workspace_id.clone(),
+                tab_id: agent.tab_id.clone(),
                 workspace: workspace.label.clone(),
                 workspace_key,
                 project: if project == OTHER {
@@ -539,6 +554,11 @@ pub(super) fn collect(
                 project_rank,
                 machine: endpoint.label.clone(),
                 vendor: agent.agent.clone().filter(|vendor| vendor != "claude"),
+                decides: agent.agent.as_deref() == Some("claude"),
+                wait_text: token(agent, "drovr_wait")
+                    .and_then(|wait| wait.splitn(4, '|').nth(3))
+                    .unwrap_or_default()
+                    .to_owned(),
                 options,
                 facts,
                 age,
@@ -592,13 +612,78 @@ impl InboxTab {
     }
 }
 
-/// Screen text read for the expanded item; shown, never stored.
+/// The item a read or an answer belongs to: a pane, its state and request.
+type ItemAt = (ItemKey, u64, String);
+
+fn item_at(item: &Item) -> ItemAt {
+    (item.key.clone(), item.seq, item.wait_id.clone())
+}
+
+/// Screen text read for the selected waiting item, for the answer checks
+/// that decide which keys it shows and for its detail; shown, never stored.
 #[derive(Clone, Debug)]
 struct ScreenRead {
-    key: ItemKey,
+    at: ItemAt,
+    text: Result<String, String>,
+}
+
+/// The plan file of a plan item, read on the agent's machine.
+#[derive(Clone, Debug)]
+struct PlanRead {
+    at: ItemAt,
+    /// `None` while the read runs; then `(path, text)` or the error.
+    result: Option<Result<(String, String), String>>,
+    /// `p`: open it in the doc pane once read.
+    open: bool,
+}
+
+/// An answer sent and not yet replaced by a new state: its item is hidden.
+#[derive(Clone, Debug)]
+struct Answering {
     seq: u64,
     wait_id: String,
-    lines: Result<Vec<String>, String>,
+    /// When the machine confirmed it; the item may show again after
+    /// [`PENDING_MARK_TTL`] if the snapshot never changes.
+    done_at: Option<Instant>,
+}
+
+/// What the editor's text becomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// A hook `deny` with the text as its message: `r` on a permission or a
+    /// plan, `o` on a question.
+    Note,
+    /// `agent.prompt`: `r` on a finished, asks or denied item.
+    Reply,
+}
+
+/// The editor open in an item.
+#[derive(Debug)]
+struct Compose {
+    at: ItemAt,
+    purpose: Purpose,
+    editor: NoteEditor,
+    /// `ctrl+e`: the temporary file `$EDITOR` edits, and its last seen
+    /// modification time; the editor reloads it when it changes.
+    external: Option<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+}
+
+/// What an answer key does.
+#[derive(Clone, Debug, PartialEq)]
+enum KeyAct {
+    Send(Action),
+    Compose(Purpose),
+    ReadPlan,
+}
+
+/// One answer key of an item: `key`, its label, what it does, and whether
+/// it grants a lasting permission (a second press confirms it).
+#[derive(Clone, Debug, PartialEq)]
+struct AnswerKey {
+    key: char,
+    label: String,
+    act: KeyAct,
+    grant: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -612,6 +697,8 @@ pub(super) struct InboxHits {
     rows: Vec<(Rect, ItemKey)>,
     jumps: Vec<(Rect, ItemKey)>,
     closes: Vec<(Rect, ItemKey)>,
+    /// Answer key labels: a click acts as the key.
+    keys: Vec<(Rect, ItemKey, char)>,
     /// Screen width and the columns right of the sidebar, for dragging.
     cols: u16,
     main: (u16, u16),
@@ -644,8 +731,23 @@ pub(crate) struct InboxState {
     /// scrolls it.
     follow: bool,
     screen: Option<ScreenRead>,
+    /// The last screen read requested, and when.
+    screen_asked: Option<(ItemAt, Instant)>,
+    plan: Option<PlanRead>,
     show_keys: bool,
     hits: InboxHits,
+    /// `prefix a` opened the inbox: an answer gives focus back to the panes.
+    return_focus: bool,
+    /// One answer at a time per pane.
+    answering: HashMap<ItemKey, Answering>,
+    /// Items whose answer failed a check: their answer keys are removed
+    /// until the state or request changes.
+    stale: HashMap<ItemKey, (u64, String)>,
+    /// A grant key pressed once; the same key again sends it.
+    confirm: Option<(ItemAt, char)>,
+    compose: Option<Compose>,
+    /// Editor text kept per item after `esc` or a failed send.
+    drafts: HashMap<ItemKey, String>,
 }
 
 impl InboxState {
@@ -689,7 +791,33 @@ impl InboxState {
                 .is_none_or(|at| now.saturating_duration_since(at) >= FOCUS_DROP)
     }
 
+    /// An answer for this exact item is in flight or just landed.
+    fn answered(&self, item: &Item) -> bool {
+        self.answering
+            .get(&item.key)
+            .is_some_and(|answer| answer.seq == item.seq && answer.wait_id == item.wait_id)
+    }
+
+    fn is_stale(&self, item: &Item) -> bool {
+        self.stale.get(&item.key) == Some(&(item.seq, item.wait_id.clone()))
+    }
+
+    /// The screen read for exactly this item, if it arrived.
+    fn screen_of(&self, item: &Item) -> Option<&Result<String, String>> {
+        self.screen
+            .as_ref()
+            .filter(|screen| screen.at == item_at(item))
+            .map(|screen| &screen.text)
+    }
+
+    fn plan_of(&self, item: &Item) -> Option<&PlanRead> {
+        self.plan.as_ref().filter(|plan| plan.at == item_at(item))
+    }
+
     fn admits(&self, item: &Item) -> bool {
+        if self.answered(item) {
+            return false;
+        }
         if !self.tab.admits(item.kind) && self.sticky.as_ref() != Some(&item.key) {
             return false;
         }
@@ -710,9 +838,139 @@ impl InboxState {
             self.detail = false;
             self.detail_for = None;
             self.screen = None;
+            self.screen_asked = None;
             self.sticky = None;
             self.snooze_step = 0;
+            self.confirm = None;
+            if self
+                .compose
+                .as_ref()
+                .is_some_and(|compose| Some(&compose.at.0) != self.selected.as_ref())
+            {
+                self.close_compose();
+            }
         }
+    }
+
+    /// Closes the editor, keeping its text as the item's draft.
+    fn close_compose(&mut self) {
+        if let Some(compose) = self.compose.take() {
+            if let Some((path, _)) = &compose.external {
+                let _ = std::fs::remove_file(path);
+            }
+            let text = compose.editor.text();
+            if text.trim().is_empty() {
+                self.drafts.remove(&compose.at.0);
+            } else {
+                self.drafts.insert(compose.at.0, text);
+            }
+        }
+    }
+}
+
+/// The text the screen must show before a key answers `item`: the question
+/// or plan title, or, for a permission, the command without the tool name.
+fn screen_text(item: &Item) -> String {
+    match item.kind {
+        ItemKind::Permission => item
+            .wait_text
+            .split_once(' ')
+            .map_or(String::new(), |(_, arg)| arg.to_owned()),
+        _ => item.wait_text.clone(),
+    }
+}
+
+/// The answer keys `item` offers now (section 2). Keys that send screen keys
+/// appear only once a screen read confirmed their label; none appear while
+/// an answer failed a check for this state.
+fn answer_keys(item: &Item, state: &InboxState) -> Vec<AnswerKey> {
+    if state.is_stale(item) {
+        return Vec::new();
+    }
+    let key = |key: char, label: &str, act: KeyAct| AnswerKey {
+        key,
+        label: label.to_owned(),
+        act,
+        grant: false,
+    };
+    let screen = state
+        .screen_of(item)
+        .and_then(|screen| screen.as_ref().ok());
+    let text = screen_text(item);
+    let on_screen = |choice: &Choice| {
+        screen.is_some_and(|screen| answer::confirm(screen, &text, choice).is_some())
+    };
+    let send_keys = |choice: Choice| {
+        KeyAct::Send(Action::Keys {
+            text: text.clone(),
+            choice,
+        })
+    };
+    let decide = |decision: Decision| KeyAct::Send(Action::Decide { decision });
+    let mut keys = Vec::new();
+    match item.kind {
+        ItemKind::Permission if item.decides => {
+            keys.push(key('y', "yes", decide(Decision::Allow)));
+            keys.push(AnswerKey {
+                grant: true,
+                ..key('a', "always", decide(Decision::Always))
+            });
+            keys.push(key('n', "no", decide(Decision::Deny(String::new()))));
+            keys.push(key('r', "note", KeyAct::Compose(Purpose::Note)));
+        }
+        ItemKind::Permission => {
+            // Codex: its hook decision format is not verified, so keys.
+            for (ch, label, choice) in [
+                ('y', "yes", Choice::Yes),
+                ('a', "always", Choice::Always),
+                ('n', "no", Choice::No),
+            ] {
+                if on_screen(&choice) {
+                    keys.push(AnswerKey {
+                        grant: choice == Choice::Always,
+                        ..key(ch, label, send_keys(choice))
+                    });
+                }
+            }
+        }
+        ItemKind::Question => {
+            for (index, label) in item.options.iter().enumerate().take(4) {
+                let choice = Choice::Label(label.clone());
+                if on_screen(&choice) {
+                    let digit = char::from(b'1' + index as u8);
+                    keys.push(AnswerKey {
+                        grant: answer::grants(label),
+                        ..key(digit, label, send_keys(choice))
+                    });
+                }
+            }
+            if item.decides {
+                keys.push(key('o', "other", KeyAct::Compose(Purpose::Note)));
+            }
+        }
+        ItemKind::Plan => {
+            if on_screen(&Choice::ApprovePlan) {
+                keys.push(key('y', "approve", send_keys(Choice::ApprovePlan)));
+            }
+            if item.decides {
+                keys.push(key('r', "keep planning", KeyAct::Compose(Purpose::Note)));
+                keys.push(key('p', "read plan", KeyAct::ReadPlan));
+            }
+        }
+        ItemKind::Asks | ItemKind::Finished | ItemKind::Denied => {
+            keys.push(key('r', "reply", KeyAct::Compose(Purpose::Reply)));
+        }
+        ItemKind::Dialog | ItemKind::Stuck | ItemKind::Limit | ItemKind::Exited => {}
+    }
+    keys
+}
+
+/// Keys that need a screen read before they can show.
+fn needs_screen(item: &Item) -> bool {
+    match item.kind {
+        ItemKind::Question | ItemKind::Plan => true,
+        ItemKind::Permission => !item.decides,
+        _ => false,
     }
 }
 
@@ -733,6 +991,19 @@ pub(crate) enum InboxReply {
         value: String,
     },
     Screen {
+        key: ItemKey,
+        seq: u64,
+        wait_id: String,
+    },
+    /// An answer; `draft` is the editor text it sent, kept again when it
+    /// fails.
+    Answer {
+        key: ItemKey,
+        seq: u64,
+        wait_id: String,
+        draft: Option<String>,
+    },
+    Plan {
         key: ItemKey,
         seq: u64,
         wait_id: String,
@@ -896,6 +1167,7 @@ impl ClientShellState {
     /// Focus goes back to the panes (the herdr pane focus never moved),
     /// and to copy mode when the focused pane is in it.
     pub(super) fn blur_inbox(&mut self) -> bool {
+        self.inbox.return_focus = false;
         let was = std::mem::replace(&mut self.inbox.focused, false);
         if was && self.mode == ClientShellMode::Terminal {
             self.mode = self.copy_or_terminal_mode();
@@ -940,6 +1212,7 @@ impl ClientShellState {
         self.inbox.select(oldest);
         self.open_inbox_panel(outcome);
         self.ensure_inbox_selection();
+        self.inbox.return_focus = true;
     }
 
     /// Keep the selection on a listed item (the first when it left).
@@ -1120,32 +1393,91 @@ impl ClientShellState {
             .map(|item| item.key.clone())
     }
 
+    /// `space`: the detail. Its screen text comes from the read the tick
+    /// makes on selection ([`Self::tick_inbox`]).
     fn toggle_inbox_detail(&mut self, item: &Item, outcome: &mut ClientShellInput) {
         self.inbox.detail = !self.inbox.detail;
         self.inbox.detail_for = self.inbox.detail.then(|| (item.seq, item.wait_id.clone()));
         outcome.repaint = true;
-        if !self.inbox.detail
-            || !matches!(
-                item.kind,
-                ItemKind::Permission | ItemKind::Question | ItemKind::Plan | ItemKind::Dialog
-            )
-        {
+    }
+
+    /// Periodic inbox work, from the client loop's 100 ms timer: the screen
+    /// read of the selected waiting item (again every [`SCREEN_RETRY`] while
+    /// it confirms no answer key), the plan text of an expanded plan, a
+    /// requested plan open, `$EDITOR` reloads and answered items expiring.
+    pub(crate) fn tick_inbox(&mut self, outcome: &mut ClientShellInput) {
+        if !self.inbox.open {
             return;
         }
+        let now = Instant::now();
+        self.inbox.answering.retain(|_, answer| {
+            answer
+                .done_at
+                .is_none_or(|at| now.saturating_duration_since(at) < PENDING_MARK_TTL)
+        });
+        self.reload_external_editor(outcome);
+        let Some(item) = self.selected_inbox_item() else {
+            return;
+        };
+        let at = item_at(&item);
+        if matches!(
+            item.kind,
+            ItemKind::Permission | ItemKind::Question | ItemKind::Plan | ItemKind::Dialog
+        ) {
+            let due = match &self.inbox.screen_asked {
+                Some((asked, when)) if *asked == at => {
+                    needs_screen(&item)
+                        && !self.inbox.is_stale(&item)
+                        && self.inbox.screen_of(&item).is_some()
+                        && now.saturating_duration_since(*when) >= SCREEN_RETRY
+                        && !answer_keys(&item, &self.inbox)
+                            .iter()
+                            .any(|key| matches!(key.act, KeyAct::Send(Action::Keys { .. })))
+                }
+                _ => true,
+            };
+            if due {
+                self.request_screen(&item, outcome);
+            }
+        }
+        if item.kind == ItemKind::Plan {
+            match self
+                .inbox
+                .plan_of(&item)
+                .map(|plan| (plan.open, plan.result.clone()))
+            {
+                None if self.inbox.detail => self.fetch_plan(&item, false, outcome),
+                Some((true, Some(result))) => {
+                    if let Some(plan) = self.inbox.plan.as_mut() {
+                        plan.open = false;
+                    }
+                    match result {
+                        Ok((path, text)) => self.open_plan(&item, &path, &text, outcome),
+                        Err(error) => {
+                            outcome.repaint |= self.push_endpoint_notice(
+                                ClientEndpointNoticeKind::Rejected,
+                                "drovr.inbox.plan",
+                                "Plan not read",
+                                format!("{}: {error}", item.machine),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn request_screen(&mut self, item: &Item, outcome: &mut ClientShellInput) {
         let Some(route) = self.api_route(&item.key.endpoint_id) else {
             return;
         };
-        self.inbox.screen = None;
+        self.inbox.screen_asked = Some((item_at(item), Instant::now()));
         let request = crate::api::schema::Request {
             id: format!("drovr:inbox:{}", self.next_request_id),
-            method: crate::api::schema::Method::PaneRead(crate::api::schema::PaneReadParams {
-                pane_id: item.key.pane_id.clone(),
-                source: crate::api::schema::ReadSource::Visible,
-                lines: None,
-                format: crate::api::schema::ReadFormat::Text,
-                strip_ansi: true,
-                intent: crate::api::schema::ReadIntent::Passive,
-            }),
+            method: crate::api::schema::Method::PaneRead(answer::screen_read_params(
+                &item.key.pane_id,
+            )),
         };
         self.next_request_id = self.next_request_id.saturating_add(1);
         outcome.actions.push(ClientShellAction::InboxRequest {
@@ -1157,6 +1489,334 @@ impl ClientShellState {
                 wait_id: item.wait_id.clone(),
             },
         });
+    }
+
+    fn fetch_plan(&mut self, item: &Item, open: bool, outcome: &mut ClientShellInput) {
+        let Some(route) = self.api_route(&item.key.endpoint_id) else {
+            return;
+        };
+        self.inbox.plan = Some(PlanRead {
+            at: item_at(item),
+            result: None,
+            open,
+        });
+        outcome.actions.push(ClientShellAction::InboxTask {
+            route,
+            task: answer::Task::FetchPlan {
+                pane_id: item.key.pane_id.clone(),
+                req: item.wait_id.clone(),
+            },
+            reply: InboxReply::Plan {
+                key: item.key.clone(),
+                seq: item.seq,
+                wait_id: item.wait_id.clone(),
+            },
+        });
+    }
+
+    /// `p`: the plan in a doc pane, once read.
+    fn read_plan(&mut self, item: &Item, outcome: &mut ClientShellInput) {
+        match self.inbox.plan_of(item).map(|plan| plan.result.clone()) {
+            Some(Some(Ok((path, text)))) => self.open_plan(item, &path, &text, outcome),
+            Some(None) => {
+                if let Some(plan) = self.inbox.plan.as_mut() {
+                    plan.open = true;
+                }
+            }
+            _ => self.fetch_plan(item, true, outcome),
+        }
+    }
+
+    /// Opens a plan read from `path` on the item's machine. A local agent's
+    /// plan opens beside it. A remote agent's plan opens from a local copy in
+    /// the local workspace on screen; while a remote workspace is on screen,
+    /// it opens beside the agent on its machine instead (the Ctrl+click
+    /// route, which needs drovr or the drovr.docs plugin there), since a
+    /// local doc pane would not be visible.
+    fn open_plan(&mut self, item: &Item, path: &str, text: &str, outcome: &mut ClientShellInput) {
+        if item.key.endpoint_id.is_local() {
+            outcome.actions.push(ClientShellAction::OpenLocalDocument {
+                workspace_id: item.workspace_id.clone(),
+                pane_id: item.key.pane_id.clone(),
+                path: path.to_owned(),
+            });
+            return;
+        }
+        if self.active_endpoint_id.is_local() {
+            let snapshot = self.snapshot.as_deref();
+            let workspace = snapshot.and_then(|snapshot| snapshot.focused_workspace_id.clone());
+            let pane = snapshot.and_then(|snapshot| snapshot.focused_pane_id.clone());
+            let copy =
+                write_inbox_file(&format!("plan-{}-{}", item.machine, file_name(path)), text);
+            match (workspace, pane, copy) {
+                (Some(workspace_id), Some(pane_id), Ok(copy)) => {
+                    outcome.actions.push(ClientShellAction::OpenLocalDocument {
+                        workspace_id,
+                        pane_id,
+                        path: copy.to_string_lossy().into_owned(),
+                    });
+                }
+                (_, _, Err(error)) => {
+                    outcome.repaint |= self.push_endpoint_notice(
+                        ClientEndpointNoticeKind::Rejected,
+                        "drovr.inbox.plan",
+                        "Plan not saved",
+                        error.to_string(),
+                    );
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(bridge) = self
+            .endpoint_by_id(&item.key.endpoint_id)
+            .and_then(|endpoint| endpoint.bridge.clone())
+        else {
+            return;
+        };
+        outcome.actions.push(ClientShellAction::OpenRemoteDocument {
+            bridge,
+            doc: crate::remote::RemoteDocOpen {
+                workspace_id: item.workspace_id.clone(),
+                tab_id: item.tab_id.clone(),
+                pane_id: item.key.pane_id.clone(),
+                cwd: None,
+                path: path.to_owned(),
+            },
+        });
+    }
+
+    /// The listed waiting item after `key` (wrapping), else its neighbour:
+    /// where the cursor goes after an answer.
+    fn next_after_answer(&self, key: &ItemKey) -> Option<ItemKey> {
+        let items = self.visible_inbox_items();
+        let index = items.iter().position(|item| &item.key == key).unwrap_or(0);
+        items
+            .iter()
+            .skip(index + 1)
+            .chain(items.iter().take(index))
+            .find(|item| item.kind.waiting() && &item.key != key)
+            .map(|item| item.key.clone())
+            .or_else(|| self.inbox_neighbour(key))
+    }
+
+    /// Sends an answer for the item at `at`; its item hides until the
+    /// machine confirms it, and comes back if it fails.
+    fn submit_answer(&mut self, at: ItemAt, action: Action, outcome: &mut ClientShellInput) {
+        let (key, seq, wait_id) = at;
+        if self
+            .inbox
+            .answering
+            .get(&key)
+            .is_some_and(|answer| answer.done_at.is_none())
+        {
+            return;
+        }
+        let Some(route) = self.api_route(&key.endpoint_id) else {
+            return;
+        };
+        let draft = match &action {
+            Action::Decide {
+                decision: Decision::Deny(text),
+            }
+            | Action::Prompt(text)
+                if !text.is_empty() =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        };
+        let next = self.next_after_answer(&key);
+        self.inbox.answering.insert(
+            key.clone(),
+            Answering {
+                seq,
+                wait_id: wait_id.clone(),
+                done_at: None,
+            },
+        );
+        self.inbox.confirm = None;
+        outcome.actions.push(ClientShellAction::InboxTask {
+            route,
+            task: answer::Task::Answer(answer::Answer {
+                pane_id: key.pane_id.clone(),
+                seq,
+                wait_id: wait_id.clone(),
+                action,
+            }),
+            reply: InboxReply::Answer {
+                key,
+                seq,
+                wait_id,
+                draft,
+            },
+        });
+        self.inbox.select(next);
+        if self.inbox.return_focus {
+            self.blur_inbox();
+        }
+        outcome.repaint = true;
+    }
+
+    /// An answer key (or a click on its label) on `item`; false when `ch`
+    /// is not one of its keys. A grant key needs a second press: `pending`
+    /// is the press before this one.
+    fn inbox_answer_key(
+        &mut self,
+        item: &Item,
+        ch: char,
+        pending: Option<(ItemAt, char)>,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some(entry) = answer_keys(item, &self.inbox)
+            .into_iter()
+            .find(|key| key.key == ch)
+        else {
+            return false;
+        };
+        let at = item_at(item);
+        outcome.repaint = true;
+        if entry.grant && pending.as_ref() != Some(&(at.clone(), ch)) {
+            self.inbox.confirm = Some((at, ch));
+            return true;
+        }
+        match entry.act {
+            KeyAct::Send(action) => self.submit_answer(at, action, outcome),
+            KeyAct::Compose(purpose) => {
+                self.inbox.close_compose();
+                let text = self.inbox.drafts.remove(&at.0).unwrap_or_default();
+                self.inbox.compose = Some(Compose {
+                    at,
+                    purpose,
+                    editor: NoteEditor::new(&text),
+                    external: None,
+                });
+            }
+            KeyAct::ReadPlan => self.read_plan(item, outcome),
+        }
+        true
+    }
+
+    /// Keys while the editor is open: they all go to it.
+    fn handle_compose_key(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        outcome: &mut ClientShellInput,
+    ) {
+        let Some(compose) = self.inbox.compose.as_mut() else {
+            return;
+        };
+        outcome.repaint = true;
+        match compose.editor.handle_key(key) {
+            EditorKey::Edited | EditorKey::Ignored => {}
+            EditorKey::Cancel => self.inbox.close_compose(),
+            EditorKey::External => self.open_external_editor(outcome),
+            EditorKey::Send => {
+                let text = compose.editor.text().trim().to_owned();
+                if text.is_empty() {
+                    return;
+                }
+                if compose.purpose == Purpose::Note && text.len() > answer::NOTE_MAX_BYTES {
+                    self.push_endpoint_notice(
+                        ClientEndpointNoticeKind::Rejected,
+                        "drovr.inbox.note",
+                        "Note too long",
+                        format!("A note is at most {} bytes.", answer::NOTE_MAX_BYTES),
+                    );
+                    return;
+                }
+                let Some(compose) = self.inbox.compose.take() else {
+                    return;
+                };
+                if let Some((path, _)) = &compose.external {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.inbox.drafts.remove(&compose.at.0);
+                let action = match compose.purpose {
+                    Purpose::Note => Action::Decide {
+                        decision: Decision::Deny(text),
+                    },
+                    Purpose::Reply => Action::Prompt(text),
+                };
+                self.submit_answer(compose.at, action, outcome);
+            }
+        }
+    }
+
+    /// Text and pastes while the editor is open; false when it is not.
+    pub(super) fn insert_inbox_text(&mut self, text: &str) -> bool {
+        if !(self.inbox.open && self.inbox.focused) {
+            return false;
+        }
+        match self.inbox.compose.as_mut() {
+            Some(compose) => {
+                compose.editor.insert(text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `ctrl+e`: the draft in `$EDITOR`, in a pane split from the focused
+    /// pane of the local workspace on screen. The editor reloads the file
+    /// whenever it changes. Ceiling: a remote workspace on screen has no
+    /// local pane to split, so `ctrl+e` asks for a local one.
+    fn open_external_editor(&mut self, outcome: &mut ClientShellInput) {
+        if !self.active_endpoint_id.is_local() {
+            outcome.repaint |= self.push_endpoint_notice(
+                ClientEndpointNoticeKind::Rejected,
+                "drovr.inbox.editor",
+                "$EDITOR runs on this machine",
+                "Switch to a workspace on this machine to edit the note in $EDITOR.",
+            );
+            return;
+        }
+        let Some(pane_id) = self.focused_pane_id() else {
+            return;
+        };
+        let Some(compose) = self.inbox.compose.as_mut() else {
+            return;
+        };
+        let name = format!("note-{}.md", file_name(&compose.at.0.pane_id));
+        match write_inbox_file(&name, &compose.editor.text()) {
+            Ok(path) => {
+                let modified = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok();
+                compose.external = Some((path.clone(), modified));
+                outcome
+                    .actions
+                    .push(ClientShellAction::OpenLocalEditor { pane_id, path });
+                self.blur_inbox();
+            }
+            Err(error) => {
+                outcome.repaint |= self.push_endpoint_notice(
+                    ClientEndpointNoticeKind::Rejected,
+                    "drovr.inbox.editor",
+                    "Note not saved",
+                    error.to_string(),
+                );
+            }
+        }
+    }
+
+    fn reload_external_editor(&mut self, outcome: &mut ClientShellInput) {
+        let Some(compose) = self.inbox.compose.as_mut() else {
+            return;
+        };
+        let Some((path, seen)) = compose.external.as_mut() else {
+            return;
+        };
+        let modified = std::fs::metadata(&*path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if modified.is_some() && modified != *seen {
+            *seen = modified;
+            if let Ok(text) = std::fs::read_to_string(&*path) {
+                compose.editor.set_text(text.trim_end_matches('\n'));
+                outcome.repaint = true;
+            }
+        }
     }
 
     /// An inbox request answered; true when the frame changed.
@@ -1194,31 +1854,62 @@ impl ClientShellState {
                 }
             },
             InboxReply::Screen { key, seq, wait_id } => {
-                if self.inbox.selected.as_ref() != Some(&key)
-                    || !self.inbox.detail
-                    || self.inbox.detail_for.as_ref() != Some(&(seq, wait_id.clone()))
-                {
+                let at = (key, seq, wait_id);
+                if self.inbox.screen_asked.as_ref().map(|(asked, _)| asked) != Some(&at) {
                     return false;
                 }
-                let lines = result.map(|value| {
-                    let text = value["result"]["read"]["text"].as_str().unwrap_or_default();
-                    let lines = text.lines().map(str::trim_end).collect::<Vec<_>>();
-                    let end = lines
-                        .iter()
-                        .rposition(|line| !line.is_empty())
-                        .map_or(0, |i| i + 1);
-                    let start = end.saturating_sub(SCREEN_LINES);
-                    lines[start..end]
-                        .iter()
-                        .map(|line| (*line).to_owned())
-                        .collect()
+                let text = result.map(|value| {
+                    value["result"]["read"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
                 });
-                self.inbox.screen = Some(ScreenRead {
-                    key,
-                    seq,
-                    wait_id,
-                    lines,
-                });
+                self.inbox.screen = Some(ScreenRead { at, text });
+                true
+            }
+            InboxReply::Answer {
+                key,
+                seq,
+                wait_id,
+                draft,
+            } => match result {
+                Ok(_) => {
+                    if let Some(answer) = self.inbox.answering.get_mut(&key) {
+                        answer.done_at = Some(Instant::now());
+                    }
+                    false
+                }
+                Err(error) => {
+                    // The item comes back, with the text that was sent.
+                    self.inbox.answering.remove(&key);
+                    if let Some(draft) = draft {
+                        self.inbox.drafts.insert(key.clone(), draft);
+                    }
+                    if error == answer::CHANGED {
+                        self.inbox.stale.insert(key, (seq, wait_id));
+                        true
+                    } else {
+                        self.push_endpoint_notice(
+                            ClientEndpointNoticeKind::Rejected,
+                            "drovr.inbox.answer",
+                            "Answer not sent",
+                            error,
+                        );
+                        true
+                    }
+                }
+            },
+            InboxReply::Plan { key, seq, wait_id } => {
+                let at = (key, seq, wait_id);
+                let Some(plan) = self.inbox.plan.as_mut().filter(|plan| plan.at == at) else {
+                    return false;
+                };
+                plan.result = Some(result.map(|value| {
+                    (
+                        value["path"].as_str().unwrap_or_default().to_owned(),
+                        value["text"].as_str().unwrap_or_default().to_owned(),
+                    )
+                }));
                 true
             }
         }
@@ -1234,12 +1925,18 @@ impl ClientShellState {
         if !self.inbox.accepts_key(Instant::now()) {
             return;
         }
+        if self.inbox.compose.is_some() {
+            self.handle_compose_key(key, outcome);
+            return;
+        }
         let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
         let plain = modifiers.difference(KeyModifiers::SHIFT).is_empty();
         if !plain {
             return;
         }
         outcome.repaint = true;
+        // Any key but the second press of a grant key cancels it.
+        let pending = self.inbox.confirm.take();
         let selected = self.selected_inbox_item();
         match code {
             KeyCode::Char('j') | KeyCode::Down => self.move_inbox_selection(1),
@@ -1288,6 +1985,11 @@ impl ClientShellState {
                 let Some(item) = selected else {
                     return;
                 };
+                if let KeyCode::Char(ch) = code {
+                    if self.inbox_answer_key(&item, ch, pending, outcome) {
+                        return;
+                    }
+                }
                 match code {
                     KeyCode::Enter => self.inbox_jump(&item.key, outcome),
                     KeyCode::Char(' ' | 'l') => self.toggle_inbox_detail(&item, outcome),
@@ -1381,6 +2083,17 @@ impl ClientShellState {
                 } else if super::contains(hits.chip, point) {
                     self.inbox.filter = None;
                     self.ensure_inbox_selection();
+                } else if let Some((_, key, ch)) = hits
+                    .keys
+                    .iter()
+                    .find(|(rect, _, _)| super::contains(*rect, point))
+                {
+                    // A click on an answer label: the same checks as the key.
+                    let pending = self.inbox.confirm.take();
+                    if let Some(item) = self.inbox_items().into_iter().find(|item| &item.key == key)
+                    {
+                        self.inbox_answer_key(&item, *ch, pending, outcome);
+                    }
                 } else if let Some((_, key)) = hits
                     .closes
                     .iter()
@@ -1461,6 +2174,33 @@ impl ClientShellState {
     }
 }
 
+/// The last part of `path`, with characters other than letters, digits,
+/// `.`, `-` and `_` replaced: a safe file name.
+fn file_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Writes `text` to `<state dir>/drovr-inbox/<name>` (a plan copy or a note
+/// for `$EDITOR`) and returns the path.
+fn write_inbox_file(name: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = crate::config::state_dir().join("drovr-inbox");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(file_name(name));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
 /// Draws the panel into `buffer` (the whole screen) at `area`. A free
 /// function over the inbox state, so composition can call it while it holds
 /// the active snapshot.
@@ -1506,11 +2246,11 @@ pub(super) fn render(
     }
     let waiting = items
         .iter()
-        .filter(|item| item.kind.waiting() && !item.marked)
+        .filter(|item| item.kind.waiting() && !item.marked && !inbox.answered(item))
         .count();
     let done = items
         .iter()
-        .filter(|item| !item.kind.waiting() && !item.marked)
+        .filter(|item| !item.kind.waiting() && !item.marked && !inbox.answered(item))
         .count();
     let view = View {
         items: &visible,
@@ -1555,6 +2295,8 @@ enum Line {
     Main(usize),
     Meta(usize),
     Options(usize),
+    /// A row of the open editor.
+    Editor(usize, usize),
     Detail(usize, String),
     Actions(usize),
 }
@@ -1586,41 +2328,67 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
             lines.push(Line::Meta(index));
         }
         if view.state.selected.as_ref() == Some(&item.key) {
-            if !item.options.is_empty() {
+            if item.kind == ItemKind::Question {
                 lines.push(Line::Options(index));
+            }
+            if let Some(compose) = view
+                .state
+                .compose
+                .as_ref()
+                .filter(|compose| compose.at.0 == item.key)
+            {
+                for row in 0..compose.editor.rows() {
+                    lines.push(Line::Editor(index, row));
+                }
+                lines.push(Line::Detail(
+                    index,
+                    "ctrl+s send  enter new line  ctrl+e $EDITOR  esc keep draft".into(),
+                ));
             }
             if view.state.detail {
                 for fact in &item.facts {
                     lines.push(Line::Detail(index, fact.clone()));
                 }
-                match view.state.screen.as_ref() {
-                    Some(screen)
-                        if screen.key == item.key
-                            && screen.seq == item.seq
-                            && screen.wait_id == item.wait_id =>
-                    {
-                        match &screen.lines {
-                            Ok(screen) => {
-                                for line in screen {
-                                    lines.push(Line::Detail(index, line.clone()));
-                                }
-                            }
-                            Err(error) => {
-                                lines.push(Line::Detail(index, format!("screen not read: {error}")))
+                let plan = (item.kind == ItemKind::Plan)
+                    .then(|| view.state.plan_of(item))
+                    .flatten();
+                match (plan, view.state.screen_of(item)) {
+                    (Some(plan), _) => match &plan.result {
+                        Some(Ok((_, text))) => {
+                            for line in text.lines().take(PLAN_LINES) {
+                                lines.push(Line::Detail(index, line.trim_end().to_owned()));
                             }
                         }
+                        Some(Err(error)) => {
+                            lines.push(Line::Detail(index, format!("plan not read: {error}")))
+                        }
+                        None => lines.push(Line::Detail(index, "reading the plan…".into())),
+                    },
+                    (None, Some(Ok(text))) => {
+                        let screen = text.lines().map(str::trim_end).collect::<Vec<_>>();
+                        let end = screen
+                            .iter()
+                            .rposition(|line| !line.is_empty())
+                            .map_or(0, |i| i + 1);
+                        for line in &screen[end.saturating_sub(SCREEN_LINES)..end] {
+                            lines.push(Line::Detail(index, (*line).to_owned()));
+                        }
                     }
-                    _ if matches!(
-                        item.kind,
-                        ItemKind::Permission
-                            | ItemKind::Question
-                            | ItemKind::Plan
-                            | ItemKind::Dialog
-                    ) =>
+                    (None, Some(Err(error))) => {
+                        lines.push(Line::Detail(index, format!("screen not read: {error}")))
+                    }
+                    (None, None)
+                        if matches!(
+                            item.kind,
+                            ItemKind::Permission
+                                | ItemKind::Question
+                                | ItemKind::Plan
+                                | ItemKind::Dialog
+                        ) =>
                     {
                         lines.push(Line::Detail(index, "reading the screen…".into()))
                     }
-                    _ => {}
+                    (None, None) => {}
                 }
             }
             lines.push(Line::Actions(index));
@@ -1735,16 +2503,35 @@ fn draw(buffer: &mut Buffer, area: Rect, view: &View) -> (InboxHits, usize) {
         .items
         .iter()
         .find(|item| state.selected.as_ref() == Some(&item.key));
-    let mut footer = vec!["enter jump", "space more"];
-    if selected.is_some_and(|item| !item.kind.waiting()) {
-        footer.push("d dismiss");
+    let mut footer: Vec<String> = if state.compose.is_some() {
+        vec!["ctrl+s send".into(), "esc keep draft".into()]
+    } else {
+        selected
+            .map(|item| {
+                answer_keys(item, state)
+                    .into_iter()
+                    .filter(|key| !key.key.is_ascii_digit())
+                    .map(|key| format!("{} {}", key.key, key.label))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if state.compose.is_none() {
+        footer.extend(["enter jump".into(), "space more".into()]);
+        if selected.is_some_and(|item| !item.kind.waiting()) {
+            footer.push("d dismiss".into());
+        }
+        footer.extend(["z snooze".into(), "m mute".into(), "? keys".into()]);
     }
-    footer.extend(["z snooze", "m mute", "? keys"]);
     let mut footers = vec![footer.join("  ")];
     if state.show_keys {
         footers.insert(
             0,
             "j/k move  tab filter  g group  D dismiss done  esc back".to_owned(),
+        );
+        footers.insert(
+            1,
+            "1-4 option  y yes  a always  n no  r reply or note  o other  p plan".to_owned(),
         );
     }
     let footer_top = area.bottom().saturating_sub(footers.len() as u16);
@@ -1803,6 +2590,7 @@ fn line_item(line: &Line) -> Option<usize> {
         Line::Main(index)
         | Line::Meta(index)
         | Line::Options(index)
+        | Line::Editor(index, _)
         | Line::Actions(index)
         | Line::Detail(index, _) => Some(*index),
     }
@@ -1957,15 +2745,37 @@ fn draw_line(
             put(buffer, text + 2, y, right, &chip_and_age(), dim);
         }
         Line::Options(_) => {
-            let options = item
-                .options
-                .iter()
-                .enumerate()
-                .map(|(n, label)| format!("{} {label}", n + 1))
-                .chain(std::iter::once("o other".to_owned()))
-                .collect::<Vec<_>>()
-                .join("   ");
-            put(buffer, text + 2, y, right, &options, base);
+            // Options appear only once the screen shows them (section 9).
+            let keys = answer_keys(item, view.state);
+            let options: Vec<_> = keys.iter().filter(|key| key.key.is_ascii_digit()).collect();
+            let changed = Style::default().fg(palette.yellow).bg(row_bg);
+            if view.state.is_stale(item) {
+                put(buffer, text + 2, y, right, answer::CHANGED, changed);
+            } else if options.is_empty() {
+                let (note, style) = match view.state.screen_of(item) {
+                    None => ("reading the screen…".to_owned(), dim),
+                    Some(Err(error)) => (format!("screen not read: {error}"), dim),
+                    Some(Ok(_)) => (answer::CHANGED.to_owned(), changed),
+                };
+                put(buffer, text + 2, y, right, &note, style);
+            } else {
+                let mut x = text + 2;
+                for option in options {
+                    x = put_key(buffer, x, y, right, option, view, item, row_bg, hits);
+                    x = put(buffer, x, y, right, "   ", base);
+                }
+            }
+        }
+        Line::Editor(_, row) => {
+            if let Some(compose) = view.state.compose.as_ref() {
+                let style = Style::default().fg(palette.text).bg(palette.surface0);
+                let x = text + 2;
+                let width = right.saturating_sub(x);
+                buffer.set_style(Rect::new(x, y, width, 1), style);
+                compose
+                    .editor
+                    .render_row(buffer, (x, y), width, *row, style);
+            }
         }
         Line::Detail(_, detail) => {
             put(buffer, text + 2, y, right, detail, dim);
@@ -1976,14 +2786,33 @@ fn draw_line(
             } else {
                 "space more"
             };
-            let x = put(
-                buffer,
-                text + 2,
-                y,
-                right,
-                &format!("enter jump  {more}  "),
-                dim,
-            );
+            let mut x = text + 2;
+            let confirm = view
+                .state
+                .confirm
+                .as_ref()
+                .filter(|(at, _)| *at == item_at(item))
+                .map(|(_, ch)| *ch);
+            let keys = answer_keys(item, view.state);
+            if item.kind.waiting() && view.state.is_stale(item) {
+                let changed = Style::default().fg(palette.yellow).bg(row_bg);
+                x = put(buffer, x, y, right, answer::CHANGED, changed);
+                x = put(buffer, x, y, right, "  ", dim);
+            } else if let Some(key) = confirm.and_then(|ch| keys.iter().find(|key| key.key == ch)) {
+                let style = Style::default()
+                    .fg(palette.accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD);
+                let text = format!("press {} again: {}", key.key, key.label);
+                x = put(buffer, x, y, right, &text, style);
+                x = put(buffer, x, y, right, "  ", dim);
+            } else if view.state.compose.is_none() {
+                for key in keys.iter().filter(|key| !key.key.is_ascii_digit()) {
+                    x = put_key(buffer, x, y, right, key, view, item, row_bg, hits);
+                    x = put(buffer, x, y, right, "  ", dim);
+                }
+            }
+            let x = put(buffer, x, y, right, &format!("enter jump  {more}  "), dim);
             let end = put(
                 buffer,
                 x,
@@ -1997,6 +2826,39 @@ fn draw_line(
         }
         Line::Group(_) => {}
     }
+}
+
+/// Draws an answer key as `<key> <label>`, the key in the accent colour,
+/// and records it as a click target; returns the end column.
+#[allow(clippy::too_many_arguments)]
+fn put_key(
+    buffer: &mut Buffer,
+    x: u16,
+    y: u16,
+    right: u16,
+    key: &AnswerKey,
+    view: &View,
+    item: &Item,
+    bg: ratatui::style::Color,
+    hits: &mut InboxHits,
+) -> u16 {
+    let palette = view.palette;
+    let accent = Style::default()
+        .fg(palette.accent)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(palette.text).bg(bg);
+    let start = x;
+    let x = put(buffer, x, y, right, &key.key.to_string(), accent);
+    let end = put(buffer, x, y, right, &format!(" {}", key.label), base);
+    if end > start {
+        hits.keys.push((
+            Rect::new(start, y, end - start, 1),
+            item.key.clone(),
+            key.key,
+        ));
+    }
+    end
 }
 
 /// Writes `text` from `x`, clipped at `right`; returns the end column.
@@ -2062,13 +2924,16 @@ mod tests {
             seq: 1,
             wait_id: String::new(),
             workspace_id: "w1".into(),
+            tab_id: "tab_1".into(),
             workspace: pane.into(),
             workspace_key: format!("local/w1:{pane}"),
             project: format!("p{project}"),
             project_rank: project,
             machine: "Local".into(),
             vendor: None,
+            decides: true,
             summary: String::new(),
+            wait_text: String::new(),
             options: Vec::new(),
             facts: Vec::new(),
             age,
@@ -2371,6 +3236,177 @@ mod tests {
         assert!(!state.inbox.focused);
         assert!(state.copy_mode.is_some());
         assert_eq!(state.mode, ClientShellMode::Copy);
+    }
+
+    fn press(
+        state: &mut ClientShellState,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> ClientShellInput {
+        let mut outcome = ClientShellInput::default();
+        state.handle_inbox_key(
+            &crate::input::TerminalKey::new(code, modifiers),
+            &mut outcome,
+        );
+        outcome
+    }
+
+    fn tasks(outcome: &ClientShellInput) -> Vec<answer::Answer> {
+        outcome
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ClientShellAction::InboxTask {
+                    task: answer::Task::Answer(answer),
+                    ..
+                } => Some(answer.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn answer_keys_confirm_grants_wait_for_the_screen_and_keep_drafts() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let mut snapshot = super::super::tests::snapshot();
+        let in_ws = |mut agent: ClientShellAgent| {
+            agent.workspace_id = "ws_1".into();
+            agent
+        };
+        snapshot.agents = vec![
+            in_ws(agent(
+                "pane_1",
+                AgentStatus::Blocked,
+                &[("drovr_wait", "permission|ab12cd34||Bash git push".into())],
+            )),
+            in_ws(agent(
+                "pane_2",
+                AgentStatus::Blocked,
+                &[
+                    (
+                        "drovr_wait",
+                        "question|cd34ef56||Which layout for the inbox?".into(),
+                    ),
+                    ("drovr_o1", "one pane".into()),
+                    ("drovr_o2", "two panes".into()),
+                ],
+            )),
+        ];
+        state.set_snapshot(Box::new(snapshot));
+        state.inbox.open = true;
+        state.inbox.focused = true;
+        state.ensure_inbox_selection();
+        let selected =
+            |state: &ClientShellState| state.inbox.selected.clone().map(|key| key.pane_id);
+        assert_eq!(selected(&state).as_deref(), Some("pane_1"));
+
+        // `a` grants a lasting permission: the first press only asks.
+        assert!(tasks(&press(&mut state, KeyCode::Char('a'), KeyModifiers::NONE)).is_empty());
+        assert!(state.inbox.confirm.is_some());
+        let sent = tasks(&press(&mut state, KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(
+            sent,
+            [answer::Answer {
+                pane_id: "pane_1".into(),
+                seq: 7,
+                wait_id: "ab12cd34".into(),
+                action: Action::Decide {
+                    decision: Decision::Always
+                },
+            }]
+        );
+        // The answered item hides and the cursor moves to the next waiting
+        // item; focus stays in the inbox.
+        assert_eq!(selected(&state).as_deref(), Some("pane_2"));
+        assert!(state.inbox.focused);
+        assert!(state
+            .visible_inbox_items()
+            .iter()
+            .all(|item| item.key.pane_id != "pane_1"));
+
+        // Question options wait for the screen read the tick asks for.
+        assert!(tasks(&press(&mut state, KeyCode::Char('1'), KeyModifiers::NONE)).is_empty());
+        let mut outcome = ClientShellInput::default();
+        state.tick_inbox(&mut outcome);
+        let Some(ClientShellAction::InboxRequest { reply, .. }) = outcome.actions.first() else {
+            panic!("expected a screen read");
+        };
+        let screen =
+            "Which layout for the inbox?\n❯ 1. two panes\n  2. one pane\n  3. Type something.\n";
+        assert!(state.receive_inbox_reply(
+            reply.clone(),
+            Ok(serde_json::json!({ "result": { "read": { "text": screen } } }))
+        ));
+        // Option 1 is "one pane", which the screen numbers 2: the check
+        // carries the label, and the machine sends the on-screen number.
+        let sent = tasks(&press(&mut state, KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(
+            sent[0].action,
+            Action::Keys {
+                text: "Which layout for the inbox?".into(),
+                choice: Choice::Label("one pane".into()),
+            }
+        );
+        // A transport failure brings the item back with its keys.
+        let reply = InboxReply::Answer {
+            key: state
+                .inbox_items()
+                .into_iter()
+                .find(|item| item.key.pane_id == "pane_2")
+                .expect("question item")
+                .key,
+            seq: 7,
+            wait_id: "cd34ef56".into(),
+            draft: None,
+        };
+        state.receive_inbox_reply(reply.clone(), Err("connection refused".into()));
+        state.ensure_inbox_selection();
+        assert_eq!(selected(&state).as_deref(), Some("pane_2"));
+
+        // `o`: a note in the editor; enter adds a line, ctrl+s sends it as a
+        // hook decision.
+        press(&mut state, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(state.inbox.compose.is_some());
+        for ch in "a grid".chars() {
+            press(&mut state, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.insert_inbox_text("please"));
+        let sent = tasks(&press(
+            &mut state,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(
+            sent[0].action,
+            Action::Decide {
+                decision: Decision::Deny("a grid\nplease".into())
+            }
+        );
+        // The prompt changed in the terminal: the item comes back without
+        // answer keys, and the note is kept as its draft.
+        let InboxReply::Answer { key, .. } = &reply else {
+            unreachable!()
+        };
+        state.receive_inbox_reply(
+            InboxReply::Answer {
+                key: key.clone(),
+                seq: 7,
+                wait_id: "cd34ef56".into(),
+                draft: Some("a grid\nplease".into()),
+            },
+            Err(answer::CHANGED.into()),
+        );
+        let item = state
+            .visible_inbox_items()
+            .into_iter()
+            .find(|item| &item.key == key)
+            .expect("item is back");
+        assert!(answer_keys(&item, &state.inbox).is_empty());
+        assert_eq!(
+            state.inbox.drafts.get(key).map(String::as_str),
+            Some("a grid\nplease")
+        );
     }
 
     #[test]
