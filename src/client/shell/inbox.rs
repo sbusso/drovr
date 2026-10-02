@@ -619,7 +619,7 @@ fn item_at(item: &Item) -> ItemAt {
     (item.key.clone(), item.seq, item.wait_id.clone())
 }
 
-/// Screen text read for the selected waiting item, for the answer checks
+/// Screen text read for a waiting item, for the answer checks
 /// that decide which keys it shows and for its detail; shown, never stored.
 #[derive(Clone, Debug)]
 struct ScreenRead {
@@ -699,6 +699,8 @@ pub(super) struct InboxHits {
     closes: Vec<(Rect, ItemKey)>,
     /// Answer key labels: a click acts as the key.
     keys: Vec<(Rect, ItemKey, char)>,
+    /// "more" / "less" labels: a click shows or hides the detail.
+    details: Vec<(Rect, ItemKey)>,
     /// Screen width and the columns right of the sidebar, for dragging.
     cols: u16,
     main: (u16, u16),
@@ -730,9 +732,10 @@ pub(crate) struct InboxState {
     /// The list scrolls to keep the selection in view, until the wheel
     /// scrolls it.
     follow: bool,
-    screen: Option<ScreenRead>,
-    /// The last screen read requested, and when.
-    screen_asked: Option<(ItemAt, Instant)>,
+    /// Screen reads of the waiting items, so each shows its answers.
+    screen: HashMap<ItemKey, ScreenRead>,
+    /// The last screen read requested per item, and when.
+    screen_asked: HashMap<ItemKey, (ItemAt, Instant)>,
     plan: Option<PlanRead>,
     show_keys: bool,
     hits: InboxHits,
@@ -808,7 +811,7 @@ impl InboxState {
     /// The screen read for exactly this item, if it arrived.
     fn screen_of(&self, item: &Item) -> Option<&Result<String, String>> {
         self.screen
-            .as_ref()
+            .get(&item.key)
             .filter(|screen| screen.at == item_at(item))
             .map(|screen| &screen.text)
     }
@@ -840,8 +843,6 @@ impl InboxState {
             self.selected = key;
             self.detail = false;
             self.detail_for = None;
-            self.screen = None;
-            self.screen_asked = None;
             self.sticky = None;
             self.snooze_step = 0;
             self.confirm = None;
@@ -1422,30 +1423,46 @@ impl ClientShellState {
                 .is_none_or(|at| now.saturating_duration_since(at) < PENDING_MARK_TTL)
         });
         self.reload_external_editor(outcome);
-        let Some(item) = self.selected_inbox_item() else {
-            return;
-        };
-        let at = item_at(&item);
-        if matches!(
-            item.kind,
-            ItemKind::Permission | ItemKind::Question | ItemKind::Plan | ItemKind::Dialog
-        ) {
-            let due = match &self.inbox.screen_asked {
+        // Every listed waiting item reads its screen, so its answers show
+        // without selecting it first.
+        let items = self.inbox_items();
+        self.inbox
+            .screen
+            .retain(|key, _| items.iter().any(|item| &item.key == key));
+        self.inbox
+            .screen_asked
+            .retain(|key, _| items.iter().any(|item| &item.key == key));
+        let waiting: Vec<&Item> = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    ItemKind::Permission | ItemKind::Question | ItemKind::Plan | ItemKind::Dialog
+                ) && !item.marked
+                    && self.inbox.admits(item)
+            })
+            .collect();
+        for item in waiting {
+            let at = item_at(item);
+            let due = match self.inbox.screen_asked.get(&item.key) {
                 Some((asked, when)) if *asked == at => {
-                    needs_screen(&item)
-                        && !self.inbox.is_stale(&item)
-                        && self.inbox.screen_of(&item).is_some()
+                    needs_screen(item)
+                        && !self.inbox.is_stale(item)
+                        && self.inbox.screen_of(item).is_some()
                         && now.saturating_duration_since(*when) >= SCREEN_RETRY
-                        && !answer_keys(&item, &self.inbox)
+                        && !answer_keys(item, &self.inbox)
                             .iter()
                             .any(|key| matches!(key.act, KeyAct::Send(Action::Keys { .. })))
                 }
                 _ => true,
             };
             if due {
-                self.request_screen(&item, outcome);
+                self.request_screen(item, outcome);
             }
         }
+        let Some(item) = self.selected_inbox_item() else {
+            return;
+        };
         if item.kind == ItemKind::Plan {
             match self
                 .inbox
@@ -1478,7 +1495,9 @@ impl ClientShellState {
         let Some(route) = self.api_route(&item.key.endpoint_id) else {
             return;
         };
-        self.inbox.screen_asked = Some((item_at(item), Instant::now()));
+        self.inbox
+            .screen_asked
+            .insert(item.key.clone(), (item_at(item), Instant::now()));
         let request = crate::api::schema::Request {
             id: format!("drovr:inbox:{}", self.next_request_id),
             method: crate::api::schema::Method::PaneRead(answer::screen_read_params(
@@ -1876,8 +1895,8 @@ impl ClientShellState {
                 }
             },
             InboxReply::Screen { key, seq, wait_id } => {
-                let at = (key, seq, wait_id);
-                if self.inbox.screen_asked.as_ref().map(|(asked, _)| asked) != Some(&at) {
+                let at = (key.clone(), seq, wait_id);
+                if self.inbox.screen_asked.get(&key).map(|(asked, _)| asked) != Some(&at) {
                     return false;
                 }
                 let text = result.map(|value| {
@@ -1890,9 +1909,9 @@ impl ClientShellState {
                 let changed = self
                     .inbox
                     .screen
-                    .as_ref()
+                    .get(&key)
                     .is_none_or(|screen| screen.at != at || screen.text != text);
-                self.inbox.screen = Some(ScreenRead { at, text });
+                self.inbox.screen.insert(key, ScreenRead { at, text });
                 changed
             }
             InboxReply::Answer {
@@ -2149,14 +2168,20 @@ impl ClientShellState {
                 {
                     let key = key.clone();
                     self.inbox_jump(&key, outcome);
-                } else if let Some(key) = row {
-                    if self.inbox.selected.as_ref() == Some(&key) {
-                        if let Some(item) = self.selected_inbox_item() {
-                            self.toggle_inbox_detail(&item, outcome);
-                        }
-                    } else {
-                        self.inbox.select(Some(key));
+                } else if let Some((_, key)) = hits
+                    .details
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                {
+                    self.inbox.select(Some(key.clone()));
+                    if let Some(item) = self.selected_inbox_item() {
+                        self.toggle_inbox_detail(&item, outcome);
                     }
+                } else if let Some(key) = row {
+                    // A row click only selects: the detail opens from its
+                    // "more" label, so a slightly missed answer click does
+                    // not unfold the agent's screen.
+                    self.inbox.select(Some(key));
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
@@ -2281,7 +2306,6 @@ pub(super) fn render(
     {
         inbox.detail = false;
         inbox.detail_for = None;
-        inbox.screen = None;
     }
     let waiting = items
         .iter()
@@ -2368,8 +2392,11 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
         if narrow {
             lines.push(Line::Meta(index));
         }
-        if view.state.selected.as_ref() == Some(&item.key) {
-            if item.kind == ItemKind::Question {
+        let selected = view.state.selected.as_ref() == Some(&item.key);
+        // A waiting item always shows its answers: one click answers it.
+        let answers = selected || item.kind.waiting();
+        if answers && item.kind == ItemKind::Question {
+            {
                 let options = answer_keys(item, view.state)
                     .iter()
                     .filter(|key| key.key.is_ascii_digit())
@@ -2381,6 +2408,8 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
                     lines.push(Line::Options(index, Some(option)));
                 }
             }
+        }
+        if selected {
             if let Some(compose) = view
                 .state
                 .compose
@@ -2441,6 +2470,8 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
                     (None, None) => {}
                 }
             }
+        }
+        if answers {
             lines.push(Line::Actions(index));
         }
     }
@@ -2678,7 +2709,9 @@ fn draw_line(
     };
     let item = &view.items[index];
     let selected = view.state.selected.as_ref() == Some(&item.key);
-    let row_bg = bg(selected);
+    // Only the selected item's first line is shaded; the frame marks the
+    // rest, so an unfolded item is not one large block of colour.
+    let row_bg = bg(selected && matches!(line, Line::Main(_)));
     let base = Style::default().fg(palette.text).bg(row_bg);
     let dim = Style::default().fg(palette.overlay0).bg(row_bg);
     let row = Rect::new(left.saturating_sub(1), y, right.saturating_sub(left) + 2, 1);
@@ -2868,7 +2901,18 @@ fn draw_line(
                     x = put(buffer, x, y, right, "  ", dim);
                 }
             }
-            let x = put(buffer, x, y, right, &format!("enter jump  {more}  "), dim);
+            let x = if selected {
+                let x = put(buffer, x, y, right, "enter jump  ", dim);
+                let start = x;
+                let x = put(buffer, x, y, right, more, dim);
+                if x > start {
+                    hits.details
+                        .push((Rect::new(start, y, x - start, 1), item.key.clone()));
+                }
+                put(buffer, x, y, right, "  ", dim)
+            } else {
+                x
+            };
             let end = put(
                 buffer,
                 x,
@@ -3134,10 +3178,13 @@ mod tests {
         let items = [question.clone()];
         let digit = |(_, _, ch): &&(Rect, ItemKey, char)| ch.is_ascii_digit();
         assert!(!draw_with(&items, &state).keys.iter().any(|key| digit(&key)));
-        state.screen = Some(ScreenRead {
-            at: item_at(&question),
-            text: Ok(screen.into()),
-        });
+        state.screen.insert(
+            question.key.clone(),
+            ScreenRead {
+                at: item_at(&question),
+                text: Ok(screen.into()),
+            },
+        );
         let hits = draw_with(&items, &state);
         let digits: Vec<_> = hits
             .keys
@@ -3147,6 +3194,12 @@ mod tests {
             .collect();
         assert_eq!(digits.len(), 3, "{digits:?}");
         assert!(digits.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        // Unselected, a waiting item still shows its answers: one click
+        // answers it.
+        state.selected = None;
+        let hits = draw_with(&items, &state);
+        assert_eq!(hits.keys.iter().filter(digit).count(), 3);
+        assert!(hits.details.is_empty(), "hints only on the selected item");
 
         // `a` pressed once on a permission: the prompt is the second click.
         let items = [permission.clone()];
