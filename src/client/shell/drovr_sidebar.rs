@@ -1578,7 +1578,26 @@ static SPINNING: AtomicBool = AtomicBool::new(false);
 /// 100 ms timer repaints while this holds; the repaint sets it again for as
 /// long as an agent works, so nothing repaints once none does.
 pub(super) fn take_spinning() -> bool {
-    SPINNING.swap(false, Ordering::Relaxed)
+    if !SPINNING.load(Ordering::Relaxed) {
+        return false;
+    }
+    // Repaint only when the frame changes: every repaint hides and shows the
+    // host cursor, which flickers it in the focused agent pane.
+    let frame = radar::spin_index(now_ms());
+    if SPIN_FRAME.swap(frame, Ordering::Relaxed) == frame {
+        return false;
+    }
+    SPINNING.store(false, Ordering::Relaxed);
+    true
+}
+
+/// The spinner frame of the last spinner repaint.
+static SPIN_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
 }
 
 /// Set when a render shows an agent whose elapsed time or stuck check
@@ -1698,12 +1717,11 @@ fn render_structured_row(
             if bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            if *tone == radar::Tone::Working {
+            // A working agent showing what it does has no spinner to animate.
+            if *tone == radar::Tone::Working && doing.is_none() {
                 SPINNING.store(true, Ordering::Relaxed);
             }
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_millis());
+            let now_ms = now_ms();
             let text = match doing {
                 Some((doing, _)) => format!("▸ {doing}"),
                 None => [

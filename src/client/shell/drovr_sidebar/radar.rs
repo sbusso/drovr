@@ -62,7 +62,12 @@ const SPIN_MS: u128 = 150;
 /// The spinner frame for wall-clock time `now_ms` (ms since the Unix epoch),
 /// so every redraw within the same 150 ms step draws the same frame.
 pub(super) fn spin_frame(now_ms: u128) -> &'static str {
-    FRAMES[(now_ms / SPIN_MS % FRAMES.len() as u128) as usize]
+    FRAMES[spin_index(now_ms) as usize % FRAMES.len()]
+}
+
+/// The spinner step at `now_ms`; it changes once per frame.
+pub(super) fn spin_index(now_ms: u128) -> u64 {
+    (now_ms / SPIN_MS) as u64
 }
 
 /// The mark in front of the title. Idle tiers have none: their colour says it.
