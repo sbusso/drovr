@@ -15,8 +15,9 @@ use serde_json::Value;
 
 use crate::api::client::ApiClient;
 use crate::api::schema::{
-    Method, PaneListParams, PaneReportMetadataParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSplitParams, PaneTarget, Request, SplitDirection,
+    Method, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneReportMetadataParams,
+    PaneRightClickTarget, PaneSendInputParams, PaneSplitParams, PaneTarget, Request,
+    SplitDirection,
 };
 
 /// Recent documents kept per workspace.
@@ -158,6 +159,21 @@ pub fn find_doc_pane(panes: &Value, workspace_id: &str) -> Option<String> {
                 .is_some_and(|value| !value.is_empty())
         })
         .and_then(|pane| pane["pane_id"].as_str().map(str::to_owned))
+}
+
+fn tab_of<'a>(panes: &'a Value, pane_id: &str) -> Option<&'a str> {
+    panes["panes"]
+        .as_array()?
+        .iter()
+        .find(|pane| pane["pane_id"].as_str() == Some(pane_id))?["tab_id"]
+        .as_str()
+}
+
+/// The caller's tab when the doc pane sits in another tab of the same
+/// workspace, so the doc pane can move next to the caller.
+fn caller_tab_to_join(panes: &Value, doc_pane: &str, caller: Option<&str>) -> Option<String> {
+    let caller_tab = tab_of(panes, caller?)?;
+    (tab_of(panes, doc_pane)? != caller_tab).then(|| caller_tab.to_owned())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -332,7 +348,25 @@ fn open(
     )?;
     if let Some(doc_pane) = find_doc_pane(&panes, &workspace_id) {
         write_control(&doc_pane, &path)?;
-        if args.focus {
+        // A user-driven open (`--focus`) brings the doc pane to the caller's
+        // tab instead of switching tabs. Agent opens leave it where it is.
+        let join = caller_tab_to_join(&panes, &doc_pane, caller.as_deref());
+        if let (true, Some(tab_id)) = (args.focus, join) {
+            call(
+                &client,
+                "pane.move",
+                Method::PaneMove(PaneMoveParams {
+                    pane_id: doc_pane.clone(),
+                    destination: PaneMoveDestination::Tab {
+                        tab_id,
+                        target_pane_id: caller.clone(),
+                        split: SplitDirection::Right,
+                        ratio: Some(CALLER_RATIO),
+                    },
+                    focus: true,
+                }),
+            )?;
+        } else if args.focus {
             call(
                 &client,
                 "pane.focus",
@@ -526,5 +560,20 @@ mod tests {
         assert_eq!(find_doc_pane(&panes, "w2").as_deref(), Some("w2:p2"));
         assert_eq!(find_doc_pane(&panes, "w3"), None);
         assert_eq!(find_doc_pane(&serde_json::json!({}), "w1"), None);
+    }
+
+    #[test]
+    fn doc_pane_joins_the_caller_tab_only_from_another_tab() {
+        let panes = serde_json::json!({"panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1"},
+            {"pane_id": "w1:p2", "tab_id": "w1:t2"},
+            {"pane_id": "w1:p3", "tab_id": "w1:t2"},
+        ]});
+        let join = |caller| caller_tab_to_join(&panes, "w1:p1", caller);
+        assert_eq!(join(Some("w1:p2")).as_deref(), Some("w1:t2"));
+        assert_eq!(join(Some("w1:p1")), None);
+        assert_eq!(join(Some("w1:p9")), None, "caller not in this workspace");
+        assert_eq!(join(None), None);
+        assert_eq!(caller_tab_to_join(&panes, "w1:p3", Some("w1:p2")), None);
     }
 }

@@ -154,6 +154,36 @@ fn ctrl_hover_underlines_a_markdown_path_without_asking_the_server() {
 }
 
 #[test]
+fn markdown_path_hover_survives_pane_output_that_keeps_the_path() {
+    let mut state = md_state();
+    let hover = mouse(&state, MouseEventKind::Moved, "a.md");
+    state.handle_raw_events(vec![RawInputEvent::Mouse(hover)]);
+    let redraw = |state: &mut ClientShellState, line: &str, revision: u64| {
+        let mut surface = md_surface();
+        surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+            &Buffer::with_lines([line, "PANE            "]),
+            None,
+            &[],
+        );
+        surface.panes[0].content_revision = revision;
+        state.set_pane_surface(surface);
+    };
+
+    // The agent redraws its screen; the path stays under the pointer.
+    redraw(&mut state, LINE, 2);
+    let regions = &state.link_hover.as_ref().expect("hover kept").regions;
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        usize::from(regions[0].start_col),
+        LINE.find("docs").unwrap()
+    );
+
+    // The path is gone from under the pointer: the underline goes too.
+    redraw(&mut state, "see nothing  ok ", 4);
+    assert!(state.link_hover.is_none());
+}
+
+#[test]
 fn ctrl_click_on_a_local_relative_path_looks_one_directory_down() {
     let root = std::env::temp_dir().join(format!(
         "drovr-md-click-{}-{:?}",

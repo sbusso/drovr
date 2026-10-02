@@ -28,6 +28,8 @@ pub(super) struct LinkHover {
     target: LinkHoverTarget,
     pub(super) regions: Vec<PaneLinkRegion>,
     resolved: bool,
+    /// drovr fork: the region is a plain-text Markdown path found here.
+    md_path: bool,
 }
 
 impl ClientShellState {
@@ -68,13 +70,51 @@ impl ClientShellState {
     }
 
     pub(super) fn invalidate_link_hover(&mut self) {
-        if self
-            .link_hover
-            .as_ref()
-            .is_some_and(|hover| !self.link_hover_target_current(&hover.target))
-        {
-            self.clear_link_hover();
+        let Some(hover) = self.link_hover.as_ref() else {
+            return;
+        };
+        if self.link_hover_target_current(&hover.target) {
+            return;
         }
+        // drovr fork: a Markdown path hover is found by the client, so it
+        // survives pane output that leaves a path under the pointer. Agent
+        // panes redraw often, which would otherwise drop the underline.
+        if hover.md_path {
+            if let Some(refreshed) = self.refresh_md_path_hover(&hover.target) {
+                self.link_hover = Some(refreshed);
+                return;
+            }
+        }
+        self.clear_link_hover();
+    }
+
+    /// The Markdown path hover at the same pointer cell after the pane's
+    /// content changed, when the pane kept its place and scroll offset.
+    fn refresh_md_path_hover(&self, old: &LinkHoverTarget) -> Option<LinkHover> {
+        let pane = self
+            .pane_surface
+            .as_ref()?
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == old.pane_id && pane.inner_rect == old.source_rect)?;
+        let target = LinkHoverTarget {
+            content_revision: pane.content_revision,
+            ..old.clone()
+        };
+        if !target.content_revision.is_multiple_of(2) || !self.link_hover_target_current(&target) {
+            return None;
+        }
+        let hit = self.md_path_in_pane(target.source_rect, target.row, target.col)?;
+        Some(LinkHover {
+            regions: vec![PaneLinkRegion {
+                row: target.row,
+                start_col: hit.start_col,
+                end_col: hit.end_col,
+            }],
+            target,
+            resolved: true,
+            md_path: true,
+        })
     }
 
     pub(super) fn update_link_hover(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
@@ -128,10 +168,12 @@ impl ClientShellState {
             return;
         }
         outcome.repaint |= self.clear_link_hover();
+        let mut md_path = false;
         let explicit = self.explicit_link_regions(&target).or_else(|| {
             // drovr fork: plain-text Markdown paths are links for Ctrl+click.
             self.md_path_in_pane(target.source_rect, target.row, target.col)
                 .map(|hit| {
+                    md_path = true;
                     vec![PaneLinkRegion {
                         row: target.row,
                         start_col: hit.start_col,
@@ -146,6 +188,7 @@ impl ClientShellState {
             target,
             regions,
             resolved,
+            md_path,
         });
         self.request_link_hover(outcome);
     }
@@ -229,6 +272,7 @@ impl ClientShellState {
                 target,
                 regions,
                 resolved: true,
+                md_path: false,
             });
         }
         if !cancelled {
