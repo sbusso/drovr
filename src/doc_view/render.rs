@@ -166,6 +166,9 @@ struct Renderer<'t> {
     link_stack: Vec<usize>,
     need_blank: bool,
     heading: Option<HeadingLevel>,
+    /// Text of the open heading for its slug, without link markers and
+    /// footnote labels.
+    heading_text: String,
     code: Option<String>,
     image_alt: Option<String>,
     table: Option<Table>,
@@ -188,6 +191,7 @@ pub fn render(markdown: &str, width: u16, theme: &Theme) -> Doc {
         link_stack: Vec::new(),
         need_blank: false,
         heading: None,
+        heading_text: String::new(),
         code: None,
         image_alt: None,
         table: None,
@@ -248,7 +252,7 @@ impl Renderer<'_> {
             Event::InlineHtml(html) => self.html(&html, false),
             Event::FootnoteReference(label) => {
                 let style = Style::default().fg(self.theme.dim);
-                self.push_text(&format!("[^{label}]"), style);
+                self.inline.push(RSpan::new(format!("[^{label}]"), style));
             }
             Event::Rule => {
                 self.begin_block();
@@ -388,7 +392,7 @@ impl Renderer<'_> {
                 self.need_blank = true;
             }
             TagEnd::Heading(level) => {
-                let text: String = self.inline.iter().map(|s| s.text.as_str()).collect();
+                let text = std::mem::take(&mut self.heading_text);
                 let base = slugify(&text);
                 let count = self.slug_counts.entry(base.clone()).or_insert(0);
                 let slug = if *count == 0 {
@@ -530,6 +534,9 @@ impl Renderer<'_> {
     }
 
     fn push_text(&mut self, text: &str, style: Style) {
+        if self.heading.is_some() {
+            self.heading_text.push_str(text);
+        }
         self.inline.push(RSpan {
             text: text.to_string(),
             style,
@@ -1094,6 +1101,10 @@ mod tests {
         assert_eq!(doc.anchor_line("hello-world-2"), Some(8));
         assert_eq!(doc.anchor_line("Hello%20World"), Some(0));
         assert_eq!(doc.anchor_line("missing"), None);
+
+        // Link markers and footnote labels are not part of the slug.
+        let doc = render("## See [the docs](x.md)[^n]\n\n[^n]: note", 40, &theme());
+        assert_eq!(doc.anchor_line("see-the-docs"), Some(0));
     }
 
     #[test]

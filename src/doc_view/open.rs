@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::api::client::ApiClient;
 use crate::api::schema::{
-    Method, PaneListParams, PaneRightClickTarget, PaneSendInputParams, PaneSplitParams, PaneTarget,
-    Request, SplitDirection,
+    Method, PaneListParams, PaneReportMetadataParams, PaneRightClickTarget, PaneSendInputParams,
+    PaneSplitParams, PaneTarget, Request, SplitDirection,
 };
 
 /// Recent documents kept per workspace.
@@ -72,6 +72,12 @@ impl RecentStore {
     pub fn recent(&self, workspace_id: &str) -> &[RecentDoc] {
         self.workspaces.get(workspace_id).map_or(&[], Vec::as_slice)
     }
+}
+
+/// Store key of a workspace: workspace ids are counters per herdr server, so
+/// the key names the server too.
+pub fn workspace_key(workspace_id: &str) -> String {
+    format!("{}/{workspace_id}", super::server_key())
 }
 
 pub fn store_path() -> PathBuf {
@@ -210,6 +216,32 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// Exclusive lock held while finding or splitting the doc pane of a
+/// workspace, so concurrent `doc open` calls share one pane.
+fn lock_workspace(workspace_key: &str) -> io::Result<std::fs::File> {
+    let dir = crate::config::state_dir().join("drovr");
+    std::fs::create_dir_all(&dir)?;
+    let name: String = workspace_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("doc-open-{name}.lock")))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn write_control(pane_id: &str, path: &Path) -> io::Result<()> {
+    let control = super::control_file_path(pane_id);
+    if let Some(parent) = control.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&control, super::control_content(path))
+}
+
 /// Entry point for `drovr doc open`; returns the process exit code.
 pub fn run_doc_open(args: &[String]) -> io::Result<i32> {
     let args = match parse_args(args) {
@@ -246,22 +278,23 @@ fn open(
     workspace_env: Option<String>,
 ) -> io::Result<String> {
     let client = ApiClient::local();
-    let workspace_id = match workspace_env {
-        Some(id) => id,
-        None => {
-            let pane_id = caller.clone().unwrap_or_default();
-            let pane = call(&client, "pane.get", Method::PaneGet(PaneTarget { pane_id }))?;
-            pane["pane"]["workspace_id"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| io::Error::other("cannot find the caller's workspace"))?
-        }
-    };
+    // HERDR_WORKSPACE_ID is set once at spawn and goes stale when the pane
+    // moves, so ask the server where the caller is now.
+    let current = caller.as_ref().and_then(|pane_id| {
+        let pane_id = pane_id.clone();
+        call(&client, "pane.get", Method::PaneGet(PaneTarget { pane_id }))
+            .ok()
+            .and_then(|pane| pane["pane"]["workspace_id"].as_str().map(str::to_owned))
+    });
+    let workspace_id = current
+        .or(workspace_env)
+        .ok_or_else(|| io::Error::other("cannot find the caller's workspace"))?;
+    let key = workspace_key(&workspace_id);
 
     let store = store_path();
     let (path, title) = if args.recent {
         let newest = load_store(&store)
-            .recent(&workspace_id)
+            .recent(&key)
             .first()
             .cloned()
             .ok_or_else(|| io::Error::other("no recent documents in this workspace"))?;
@@ -272,9 +305,11 @@ fn open(
         let home = env_var("HOME").map(PathBuf::from);
         (resolve_path(&arg, &cwd, home.as_deref()), args.title)
     };
-    if path.is_dir() {
+    // A missing file is fine (the viewer waits for it); a directory, FIFO
+    // or device is not.
+    if path.exists() && !path.is_file() {
         return Err(io::Error::other(format!(
-            "{} is a directory",
+            "{} is not a regular file",
             path.display()
         )));
     }
@@ -283,10 +318,11 @@ fn open(
         title,
         opened_at: unix_now(),
     };
-    if let Err(err) = update_store(&store, |store| store.record(&workspace_id, doc)) {
+    if let Err(err) = update_store(&store, |store| store.record(&key, doc)) {
         tracing::warn!(err = %err, "cannot record recent document");
     }
 
+    let _lock = lock_workspace(&key)?;
     let panes = call(
         &client,
         "pane.list",
@@ -295,11 +331,7 @@ fn open(
         }),
     )?;
     if let Some(doc_pane) = find_doc_pane(&panes, &workspace_id) {
-        let control = super::control_file_path(&doc_pane);
-        if let Some(parent) = control.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&control, path.display().to_string())?;
+        write_control(&doc_pane, &path)?;
         if args.focus {
             call(
                 &client,
@@ -346,20 +378,27 @@ fn open(
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| io::Error::other("pane.split returned no pane id"))?;
-    // The viewer only follows later changes of its control file; start it
-    // with the current path so an old file left by a reused pane id is inert.
-    let control = super::control_file_path(&new_pane);
-    if let Some(parent) = control.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Mark the pane as the doc pane now: the viewer reports it only once
+    // the shell has started it, and a concurrent `doc open` must find it.
+    let report: PaneReportMetadataParams = serde_json::from_value(serde_json::json!({
+        "pane_id": new_pane,
+        "source": super::METADATA_SOURCE,
+        "tokens": { super::METADATA_TOKEN: path.display().to_string() },
+    }))
+    .map_err(io::Error::other)?;
+    if let Err(err) = call(
+        &client,
+        "pane.report_metadata",
+        Method::PaneReportMetadata(report),
+    ) {
+        tracing::warn!(err = %err, "cannot mark the doc pane");
     }
-    std::fs::write(&control, path.display().to_string())?;
+    // The viewer reads the path from its control file, so the path is never
+    // typed into the shell.
+    write_control(&new_pane, &path)?;
     let exe = std::env::current_exe()?;
     // `exec`: quitting the viewer closes the pane.
-    let command = format!(
-        "exec {} doc view {}",
-        shell_quote(&exe.display().to_string()),
-        shell_quote(&path.display().to_string())
-    );
+    let command = format!("exec {} doc view", shell_quote(&exe.display().to_string()));
     call(
         &client,
         "pane.send_input",

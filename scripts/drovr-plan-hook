@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""drovr plan hook for Claude Code (PostToolUse on Write, Edit and MultiEdit).
+
+When Claude writes or edits a plan file under ~/.claude/plans/ (plan mode),
+show it in the workspace's drovr doc pane with `drovr doc open`. Plan mode
+keeps Claude from running commands itself, so the drovr-docs skill cannot
+open plans; this hook does. Runs `drovr doc open` in the background and never
+fails the agent: any error exits 0.
+
+Install: drovr-install-hooks (registers it in ~/.claude/settings.json).
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+def plans_dirs():
+    dirs = [os.path.expanduser("~/.claude/plans")]
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config:
+        dirs.append(os.path.join(os.path.expanduser(config), "plans"))
+    return [os.path.realpath(d) for d in dirs]
+
+
+def drovr_bin():
+    found = shutil.which("drovr")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/drovr")
+    return fallback if os.access(fallback, os.X_OK) else None
+
+
+def main():
+    if not os.environ.get("HERDR_PANE_ID"):
+        return
+    event = json.load(sys.stdin)
+    path = (event.get("tool_input") or {}).get("file_path") or ""
+    if not path.lower().endswith((".md", ".markdown")):
+        return
+    path = os.path.realpath(os.path.expanduser(path))
+    if not any(os.path.dirname(path) == d for d in plans_dirs()):
+        return
+    drovr = drovr_bin()
+    if not drovr:
+        return
+    subprocess.Popen(
+        [drovr, "doc", "open", path, "--title", "Plan"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

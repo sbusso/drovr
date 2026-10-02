@@ -31,13 +31,57 @@ const WHEEL_LINES: usize = 3;
 /// Metadata source and token other drovr commands use to find doc panes.
 pub const METADATA_SOURCE: &str = "drovr";
 pub const METADATA_TOKEN: &str = "drovr_doc";
+/// Environment variable carrying a file path to the `$EDITOR` pane.
+const OPEN_PATH_ENV: &str = "DROVR_OPEN_PATH";
 
-/// Control file `drovr doc open` writes to point an existing viewer pane at
-/// another document.
+/// Largest document the viewer reads; the rest is cut with a notice.
+const MAX_DOC_BYTES: u64 = 4 * 1024 * 1024;
+/// Loads slower than this space out reloads of a changing file.
+const SLOW_LOAD: Duration = Duration::from_millis(50);
+/// URL schemes handed to the OS opener. Anything else (custom app handlers,
+/// `smb:`, ...) could launch programs, so it is only shown.
+const EXTERNAL_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+/// Short id of the herdr server this process talks to. Pane and workspace
+/// ids are counters per server, so files keyed by them include this.
+pub fn server_key() -> String {
+    // FNV-1a: stable across builds, unlike `DefaultHasher`.
+    let socket = crate::api::socket_path();
+    let hash = socket
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{hash:016x}")
+}
+
+/// Control file `drovr doc open` writes to point a viewer pane at a
+/// document: a nonce line, then the path.
 pub fn control_file_path(pane_id: &str) -> PathBuf {
     crate::config::state_dir()
         .join("drovr")
-        .join(format!("doc-pane-{pane_id}.path"))
+        .join(format!("doc-pane-{}-{pane_id}.path", server_key()))
+}
+
+/// Control file content for `path`. The nonce makes every `doc open` a
+/// change, so reopening the shown path still brings it back.
+pub fn control_content(path: &Path) -> String {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    format!("{nonce}\n{}\n", path.display())
+}
+
+/// The path in control file content: its last non-empty line.
+fn control_target(content: &str) -> Option<PathBuf> {
+    content
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Where a link points, relative to the document that contains it.
@@ -51,7 +95,16 @@ pub enum Target {
 
 pub fn resolve_link(url: &str, current: &Path) -> Target {
     let url = url.trim();
-    let file_url = url.strip_prefix("file://");
+    let file_url = url
+        .get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        .map(|_| {
+            let rest = &url[5..];
+            // `file:///p` and `file:/p`; `file://localhost/p` keeps `/p`.
+            rest.strip_prefix("//localhost")
+                .or_else(|| rest.strip_prefix("//"))
+                .unwrap_or(rest)
+        });
     if file_url.is_none() && has_scheme(url) {
         return Target::External(url.to_string());
     }
@@ -82,6 +135,15 @@ pub fn resolve_link(url: &str, current: &Path) -> Target {
     } else {
         Target::File(resolved)
     }
+}
+
+/// Whether the OS opener may receive `url` (see `EXTERNAL_SCHEMES`).
+fn is_safe_external(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        EXTERNAL_SCHEMES
+            .iter()
+            .any(|known| scheme.eq_ignore_ascii_case(known))
+    })
 }
 
 fn has_scheme(url: &str) -> bool {
@@ -164,6 +226,10 @@ pub struct Viewer {
     control_seen: Option<String>,
     /// Set whenever the shown path changes, so the loop can report metadata.
     path_changed: bool,
+    /// Time the last load took and when it finished; reloads of a changing
+    /// file wait a few times that long so a big file cannot hog the loop.
+    load_cost: Duration,
+    loaded_at: Instant,
 }
 
 impl Viewer {
@@ -191,18 +257,20 @@ impl Viewer {
             control_path,
             control_seen,
             path_changed: true,
+            load_cost: Duration::ZERO,
+            loaded_at: Instant::now(),
         };
         viewer.load();
         viewer
     }
 
     fn load(&mut self) {
+        let started = Instant::now();
         self.stamp = stamp(&self.path);
-        self.source = match std::fs::read(&self.path) {
-            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-            Err(err) => Err(err.to_string()),
-        };
+        self.source = read_doc(&self.path);
         self.rerender();
+        self.load_cost = started.elapsed();
+        self.loaded_at = Instant::now();
     }
 
     fn rerender(&mut self) {
@@ -284,6 +352,10 @@ impl Viewer {
         if current == self.stamp && (current.is_some() || self.source.is_err()) {
             return false;
         }
+        // Cheap documents reload at once; costly ones wait four load times.
+        if self.load_cost > SLOW_LOAD && self.loaded_at.elapsed() < self.load_cost * 4 {
+            return false;
+        }
         let scroll = self.scroll;
         self.load();
         self.scroll = scroll;
@@ -302,13 +374,9 @@ impl Viewer {
             return false;
         }
         self.control_seen = content.clone();
-        let Some(target) = content
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty())
-        else {
+        let Some(target) = content.as_deref().and_then(control_target) else {
             return false;
         };
-        let target = PathBuf::from(target);
         if target == self.path {
             self.load();
         } else {
@@ -407,7 +475,11 @@ impl Viewer {
                 Action::None
             }
             Target::File(path) => Action::OpenFile(path),
-            Target::External(url) => Action::OpenExternal(url),
+            Target::External(url) if is_safe_external(&url) => Action::OpenExternal(url),
+            Target::External(url) => {
+                self.message = Some(format!("not opening {url}"));
+                Action::None
+            }
         }
     }
 
@@ -671,27 +743,68 @@ impl Viewer {
 }
 
 /// Splits `text` into pieces flagged as search hits (case-insensitive).
+/// `query` is already lowercase.
 fn split_matches(text: &str, query: &str) -> Vec<(String, bool)> {
-    let lower = text.to_lowercase();
-    // Lowercasing can change byte lengths outside ASCII; fall back to no
-    // highlight for such spans rather than slicing at a bad boundary.
-    if lower.len() != text.len() || query.is_empty() {
+    if query.is_empty() {
         return vec![(text.to_string(), false)];
     }
+    // Lowercasing can change byte lengths, so map every byte of the
+    // lowercase copy back to the start of the char it came from.
+    let mut lower = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len() + 1);
+    for (index, ch) in text.char_indices() {
+        for lc in ch.to_lowercase() {
+            lower.push(lc);
+            origin.resize(lower.len(), index);
+        }
+    }
+    origin.push(text.len());
     let mut out = Vec::new();
     let mut start = 0;
-    while let Some(found) = lower[start..].find(query) {
-        let begin = start + found;
+    let mut search = 0;
+    while let Some(found) = lower[search..].find(query) {
+        let lower_begin = search + found;
+        let lower_end = lower_begin + query.len();
+        search = lower_end;
+        let begin = origin[lower_begin].max(start);
+        let end = origin[lower_end];
+        if end <= begin {
+            continue;
+        }
         if begin > start {
             out.push((text[start..begin].to_string(), false));
         }
-        out.push((text[begin..begin + query.len()].to_string(), true));
-        start = begin + query.len();
+        out.push((text[begin..end].to_string(), true));
+        start = end;
     }
     if start < text.len() {
         out.push((text[start..].to_string(), false));
     }
     out
+}
+
+/// Reads a document: regular files only (a FIFO or device would block or
+/// never end), cut at `MAX_DOC_BYTES` with a notice.
+fn read_doc(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path).map_err(|err| err.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_DOC_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|err| err.to_string())?;
+    let cut = bytes.len() as u64 > MAX_DOC_BYTES;
+    bytes.truncate(MAX_DOC_BYTES as usize);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if cut {
+        text.push_str(&format!(
+            "\n\n---\n\n*Document cut at {} MiB; open it in an editor to see the rest.*\n",
+            MAX_DOC_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(text)
 }
 
 fn abbreviate_home(path: &Path) -> String {
@@ -763,58 +876,64 @@ fn clear_doc_report(pane_id: &str) {
         .status();
 }
 
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
-/// Opens a non-Markdown file: `$EDITOR` in a new herdr pane when running
-/// inside herdr, the OS opener otherwise.
+/// Opens a non-Markdown file in `$EDITOR` in a new herdr pane. Outside herdr
+/// the path is only shown: the OS opener would run executables.
 fn open_file(path: &Path) -> String {
-    if let Some(pane_id) = herdr_pane_id() {
-        let Ok(exe) = std::env::current_exe() else {
-            return "cannot locate drovr binary".into();
+    let Some(pane_id) = herdr_pane_id() else {
+        return format!("file: {}", path.display());
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return "cannot locate drovr binary".into();
+    };
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|e| !e.trim().is_empty())
+        .unwrap_or_else(|| "vi".into());
+    let cwd = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+    // The path comes from the document, so it reaches the editor through the
+    // pane's environment, never as typed shell text.
+    let path_env = format!("{OPEN_PATH_ENV}={}", path.display());
+    let command = format!("{editor} \"${OPEN_PATH_ENV}\"");
+    std::thread::spawn(move || {
+        let Ok(output) = Command::new(&exe)
+            .args(["pane", "split", &pane_id, "--direction", "right", "--focus"])
+            .arg("--cwd")
+            .arg(&cwd)
+            .arg("--env")
+            .arg(&path_env)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return;
         };
-        let editor = std::env::var("EDITOR")
+        let new_pane = serde_json::from_slice::<serde_json::Value>(&output.stdout)
             .ok()
-            .filter(|e| !e.trim().is_empty())
-            .unwrap_or_else(|| "vi".into());
-        let cwd = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-        let command = format!("{editor} {}", shell_quote(&path.display().to_string()));
-        std::thread::spawn(move || {
-            let Ok(output) = Command::new(&exe)
-                .args(["pane", "split", &pane_id, "--direction", "right", "--focus"])
-                .arg("--cwd")
-                .arg(&cwd)
+            .and_then(|v| v["result"]["pane"]["pane_id"].as_str().map(String::from));
+        if let Some(new_pane) = new_pane {
+            let _ = Command::new(&exe)
+                .args(["pane", "run", &new_pane, &command])
                 .stdin(Stdio::null())
+                .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .output()
-            else {
-                return;
-            };
-            let new_pane = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                .ok()
-                .and_then(|v| v["result"]["pane"]["pane_id"].as_str().map(String::from));
-            if let Some(new_pane) = new_pane {
-                let _ = Command::new(&exe)
-                    .args(["pane", "run", &new_pane, &command])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-        });
-        return format!("opening {} in $EDITOR", path.display());
-    }
-    open_external(&path.display().to_string())
+                .status();
+        }
+    });
+    format!("opening {} in $EDITOR", path.display())
 }
 
+/// Opens an http(s) or mailto URL. The viewer runs where the workspace
+/// lives; on a headless server the URL is shown for the user to open.
 fn open_external(url: &str) -> String {
+    if !crate::platform::can_open_urls() {
+        return format!("open on your machine: {url}");
+    }
     match crate::platform::open_url(url) {
         Ok(Some(mut child)) => {
             std::thread::spawn(move || child.wait());
             format!("opened {url}")
         }
-        Ok(None) => format!("no opener available for {url}"),
+        Ok(None) => format!("opened {url}"),
         Err(err) => format!("cannot open {url}: {err}"),
     }
 }
@@ -832,11 +951,23 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
-pub fn run_doc_view(path: &Path) -> io::Result<()> {
-    let path = normalize(&std::path::absolute(path)?);
-    let palette = crate::app::client_palette_from_config(&crate::config::Config::load().config);
+/// Runs the viewer on `path`, or, without one, on the path in this pane's
+/// control file (how `drovr doc open` starts it, so no path is typed into a
+/// shell).
+pub fn run_doc_view(path: Option<&Path>) -> io::Result<()> {
     let pane_id = herdr_pane_id();
     let control_path = pane_id.as_deref().map(control_file_path);
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => control_path
+            .as_deref()
+            .and_then(|control| std::fs::read_to_string(control).ok())
+            .as_deref()
+            .and_then(control_target)
+            .ok_or_else(|| io::Error::other("no document given and no doc open request"))?,
+    };
+    let path = normalize(&std::path::absolute(path)?);
+    let palette = crate::app::client_palette_from_config(&crate::config::Config::load().config);
     let mut viewer = Viewer::new(path, Theme::from_palette(&palette), control_path);
 
     enable_raw_mode()?;
@@ -972,6 +1103,41 @@ mod tests {
             resolve_link("src/main.rs", current),
             Target::File(PathBuf::from("/docs/plans/src/main.rs"))
         );
+        // Any case, one slash or localhost: still a local file.
+        for url in [
+            "FILE:///tmp/run.command",
+            "file:/tmp/run.command",
+            "File://localhost/tmp/run.command",
+        ] {
+            assert_eq!(
+                resolve_link(url, current),
+                Target::File(PathBuf::from("/tmp/run.command")),
+                "{url}"
+            );
+        }
+        assert!(is_safe_external("HTTPS://example.com"));
+        assert!(!is_safe_external("x-apple.systempreferences:foo"));
+        assert!(!is_safe_external("smb://host/share"));
+    }
+
+    #[test]
+    fn unsafe_schemes_are_shown_not_opened() {
+        let dir = TempDir::new("schemes");
+        let main = dir.write("main.md", "[a](smb://host/share) [b](https://x.y)");
+        let mut v = viewer(main, None);
+        assert_eq!(v.follow(0), Action::None);
+        assert_eq!(v.message.as_deref(), Some("not opening smb://host/share"));
+        assert_eq!(v.follow(1), Action::OpenExternal("https://x.y".into()));
+    }
+
+    #[test]
+    fn reads_only_regular_files_and_cuts_big_ones() {
+        let dir = TempDir::new("read");
+        assert_eq!(read_doc(&dir.0), Err("not a regular file".into()));
+        let big = dir.write("big.md", &"x".repeat(MAX_DOC_BYTES as usize + 10));
+        let text = read_doc(&big).unwrap();
+        assert!(text.contains("Document cut at"));
+        assert!(text.len() < MAX_DOC_BYTES as usize + 200);
     }
 
     #[test]
@@ -1052,6 +1218,20 @@ mod tests {
         assert_eq!(v.path, second);
         assert_eq!(v.back.len(), 1);
         assert_eq!(line_text(&v.doc.lines[0]), "second");
+
+        // Reopening the same path after navigating away brings it back.
+        v.go_back();
+        assert_eq!(v.path, first);
+        std::fs::write(&control, control_content(&second)).unwrap();
+        assert!(v.poll_control());
+        assert_eq!(v.path, second);
+        std::fs::write(&control, control_content(&first)).unwrap();
+        assert!(v.poll_control());
+        v.go_back();
+        assert_eq!(v.path, second);
+        std::fs::write(&control, control_content(&second)).unwrap();
+        assert!(v.poll_control());
+        assert_eq!(control_target("1\n/a.md\n"), Some(PathBuf::from("/a.md")));
     }
 
     #[test]
@@ -1079,6 +1259,11 @@ mod tests {
                 ("Needle".to_string(), true),
                 (" b".to_string(), false)
             ]
+        );
+        // 'ẞ' shrinks and 'Ⱥ' grows when lowercased: no panic, right span.
+        assert_eq!(
+            split_matches("ẞȺ", "ⱥ"),
+            vec![("ẞ".to_string(), false), ("Ⱥ".to_string(), true)]
         );
     }
 

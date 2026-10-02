@@ -799,6 +799,14 @@ pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
     None
 }
 
+/// Whether `open_url` can reach a desktop: false on a headless server, where
+/// `xdg-open` starts but nothing opens.
+pub fn can_open_urls() -> bool {
+    std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || running_inside_wsl()
+}
+
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("xdg-open")
         .arg(url)

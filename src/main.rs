@@ -555,11 +555,7 @@ fn main() -> io::Result<()> {
     if args.get(1).map(String::as_str) == Some("doc")
         && args.get(2).map(String::as_str) == Some("view")
     {
-        let Some(path) = args.get(3) else {
-            eprintln!("usage: drovr doc view <path>");
-            std::process::exit(2);
-        };
-        return doc_view::run_doc_view(std::path::Path::new(path));
+        return doc_view::run_doc_view(args.get(3).map(std::path::Path::new));
     }
     if args.get(1).map(String::as_str) == Some("doc")
         && args.get(2).map(String::as_str) == Some("open")

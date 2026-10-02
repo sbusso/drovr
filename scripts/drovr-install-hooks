@@ -2,38 +2,62 @@
 # Install drovr's Claude Code integration on this machine (run on every machine
 # where agents run):
 # - the usage hook: copied to ~/.local/bin and registered for the Stop,
-#   SessionStart and UserPromptSubmit events in ~/.claude/settings.json
-#   (backup kept; existing hooks untouched);
+#   SessionStart and UserPromptSubmit events in ~/.claude/settings.json;
+# - the plan hook: copied to ~/.local/bin and registered for PostToolUse on
+#   Write|Edit|MultiEdit, so plan-mode plans open in the doc pane;
 # - the drovr-docs skill: copied to ~/.claude/skills/drovr-docs/.
+# A backup of settings.json is kept and existing hooks are left untouched.
 # Files always come from sbusso/drovr (main), never from the current
 # directory: under `curl ... | bash` there is no script directory to resolve.
+# The plan hook and the skill are optional: a failed download skips them.
 set -euo pipefail
 raw=https://raw.githubusercontent.com/sbusso/drovr/main
 src="$(mktemp)"
+plan="$(mktemp)"
 skill="$(mktemp)"
-trap 'rm -f "$src" "$skill"' EXIT
+trap 'rm -f "$src" "$plan" "$skill"' EXIT
 curl -fsSL "$raw/scripts/drovr-usage-hook" -o "$src"
-curl -fsSL "$raw/skills/drovr-docs/SKILL.md" -o "$skill"
-mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills/drovr-docs"
+mkdir -p "$HOME/.local/bin"
 install -m 0755 "$src" "$HOME/.local/bin/drovr-usage-hook"
-install -m 0644 "$skill" "$HOME/.claude/skills/drovr-docs/SKILL.md"
-echo "installed skill: $HOME/.claude/skills/drovr-docs/SKILL.md"
+plan_hook=""
+if curl -fsSL "$raw/scripts/drovr-plan-hook" -o "$plan"; then
+  install -m 0755 "$plan" "$HOME/.local/bin/drovr-plan-hook"
+  plan_hook="$HOME/.local/bin/drovr-plan-hook"
+else
+  echo "plan hook not available; skipped" >&2
+fi
+if curl -fsSL "$raw/skills/drovr-docs/SKILL.md" -o "$skill"; then
+  mkdir -p "$HOME/.claude/skills/drovr-docs"
+  install -m 0644 "$skill" "$HOME/.claude/skills/drovr-docs/SKILL.md"
+  echo "installed skill: $HOME/.claude/skills/drovr-docs/SKILL.md"
+else
+  echo "drovr-docs skill not available; skipped" >&2
+fi
 settings="$HOME/.claude/settings.json"
 [ -f "$settings" ] || echo '{}' > "$settings"
 cp "$settings" "$settings.bak-pre-drovr-usage"
-python3 - "$settings" "$HOME/.local/bin/drovr-usage-hook" <<'EOF'
+python3 - "$settings" "$HOME/.local/bin/drovr-usage-hook" "$plan_hook" <<'EOF'
 import json, sys
-path, hook = sys.argv[1], sys.argv[2]
+path, usage, plan = sys.argv[1], sys.argv[2], sys.argv[3]
 settings = json.load(open(path))
-command = f"python3 {hook}"
-for event in ("Stop", "SessionStart", "UserPromptSubmit"):
-    groups = settings.setdefault("hooks", {}).setdefault(event, [])
+hooks = settings.setdefault("hooks", {})
+
+def register(event, command, matcher=None):
+    groups = hooks.setdefault(event, [])
     if not any(h.get("command") == command for group in groups for h in group.get("hooks", [])):
-        groups.append({"hooks": [{"type": "command", "command": command}]})
+        group = {"hooks": [{"type": "command", "command": command}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        groups.append(group)
     print(f"registered for {event}:", command)
+
+for event in ("Stop", "SessionStart", "UserPromptSubmit"):
+    register(event, f"python3 {usage}")
+if plan:
+    register("PostToolUse", f"python3 {plan}", "Write|Edit|MultiEdit")
 json.dump(settings, open(path, "w"), indent=2)
 EOF
-echo "drovr usage hook installed (backup: $settings.bak-pre-drovr-usage)"
+echo "drovr hooks installed (backup: $settings.bak-pre-drovr-usage)"
 cat <<'EOF'
 
 To open Markdown links in a doc pane (Ctrl+click), install the herdr plugin

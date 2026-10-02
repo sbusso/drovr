@@ -2568,6 +2568,11 @@ fn read_clipboard_unicode_text() -> Option<String> {
     None
 }
 
+/// Whether `open_url` can reach a desktop. A Windows session always has one.
+pub fn can_open_urls() -> bool {
+    true
+}
+
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     let operation = wide_null("open");
     let url = wide_null(url);

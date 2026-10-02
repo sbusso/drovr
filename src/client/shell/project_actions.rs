@@ -44,7 +44,7 @@ fn documents_target(
     }
     let store = crate::doc_view::open::load_store(&crate::doc_view::open::store_path());
     let docs = store
-        .recent(workspace_id)
+        .recent(&crate::doc_view::open::workspace_key(workspace_id))
         .iter()
         .take(DOCUMENTS_MENU_LIMIT)
         .cloned()

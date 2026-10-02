@@ -676,6 +676,11 @@ pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
     None
 }
 
+/// Whether `open_url` can reach a desktop. A macOS session always has one.
+pub fn can_open_urls() -> bool {
+    true
+}
+
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("open")
         .arg(url)
