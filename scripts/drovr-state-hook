@@ -7,8 +7,11 @@ Reports what the agent is doing and what it waits for as herdr pane metadata
 tokens from source `drovr-state`, for the drovr sidebar and inbox
 (docs/design/inbox-pane.md, section 8):
 
-  drovr_state        <kind>|<unix s>: idle, working, asks, finished, limit,
-                     denied or exited, and the time of the last change or tool
+  drovr_state        <kind>|<unix s>[|<beat>]: idle, working, asks, finished,
+                     limit, denied or exited, and the time of the last change
+                     or tool; <beat> is the time of the last hook event of any
+                     kind (subagent tools included, minute steps), sent only
+                     when it is later than <unix s>
   drovr_doing        the running tool, for example "Bash cargo test"
   drovr_wait         <kind>|<req8>|<sub?>|<summary> for the oldest pending
                      request; kind is permission, question or plan
@@ -75,6 +78,9 @@ SOURCE = "drovr-state"
 TOKEN_MAX = 80
 PRE_KEEP = 64
 PRE_TOOL_REPORT_GAP_NS = 2_000_000_000
+# drovr_state's beat moves in steps of this many seconds, so a busy subagent
+# adds at most one report a minute.
+BEAT_GAP_S = 60
 POLL_S = 0.25
 ERRORS_LOG_MAX = 256 * 1024
 TOKENS = (
@@ -252,6 +258,7 @@ def new_state():
     return {
         "kind": None,
         "ts": 0,
+        "beat": 0,
         "doing": "",
         "last": "",
         "pre": [],
@@ -313,7 +320,8 @@ def set_kind(state, kind, now_s):
 def desired_tokens(state):
     tokens = dict.fromkeys(TOKENS)
     if state["kind"]:
-        tokens["drovr_state"] = f"{state['kind']}|{state['ts']}"
+        beat = f"|{state['beat']}" if state["beat"] > state["ts"] else ""
+        tokens["drovr_state"] = f"{state['kind']}|{state['ts']}{beat}"
     tokens["drovr_doing"] = state["doing"] or None
     tokens["drovr_last"] = state["last"] or None
     if state["pending"]:
@@ -725,6 +733,10 @@ def main():
     with PaneState(pane) as pane_state:
         if foreign_session(agent, hook, pane_state.data):
             return
+        # Any event shows the agent is alive; the sidebar's stuck check reads
+        # it (a subagent's tools do not move ts).
+        if now_s - pane_state.data["beat"] >= BEAT_GAP_S:
+            pane_state.data["beat"] = now_s
         req, throttle = handle_event(agent, hook, pane, pane_state.data, now_s)
         report(pane_state.data, pane, throttle=throttle)
         pane_state.save()

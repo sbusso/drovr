@@ -10,7 +10,7 @@
 mod radar;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::agent_signal::{self, AgentSignal, InboxFilter, ItemKind};
 use super::projects::{self, Presence, ProjectLayout, OTHER};
@@ -411,15 +411,16 @@ fn build_rows(
         let recent = idle.is_some_and(|secs| secs < layout.recent_secs());
         let unknown = row.agent.agent_status == crate::api::schema::AgentStatus::Unknown;
         let signal = AgentSignal::parse(row.agent);
-        // A prompt or finish marked inactive in the sidebar is seen.
-        let status = match (presence, row.agent.agent_status) {
-            (
-                Presence::Idle,
-                crate::api::schema::AgentStatus::Blocked | crate::api::schema::AgentStatus::Done,
-            ) => crate::api::schema::AgentStatus::Idle,
-            (_, status) => status,
-        };
-        let item = signal.item(status, now, agent_signal::DEFAULT_STUCK_SECS);
+        let item = signal.item(
+            row.agent.agent_status,
+            now,
+            agent_signal::DEFAULT_STUCK_SECS,
+            layout.is_dismissed(&key, row.agent.state_change_seq),
+        );
+        // Elapsed time and the stuck check move with the clock alone.
+        if !stale && signal.ticking(row.agent.agent_status) {
+            CLOCK.store(true, Ordering::Relaxed);
+        }
         let doing = (presence == Presence::Working)
             .then(|| {
                 let secs = signal.doing_secs(now)?;
@@ -529,7 +530,13 @@ fn build_rows(
             }
             presences.push(presence);
             count += 1;
-            let item = workspace_agents.iter().filter_map(|agent| agent.item).min();
+            // Like the section count: an offline machine's last snapshot
+            // shows nothing (its agents only drift into stuck).
+            let item = workspace_agents
+                .iter()
+                .filter(|agent| !agent.stale)
+                .filter_map(|agent| agent.item)
+                .min();
             // Like the global badge: only agents you can reach and see.
             for agent in workspace_agents
                 .iter()
@@ -1576,6 +1583,27 @@ static SPINNING: AtomicBool = AtomicBool::new(false);
 /// long as an agent works, so nothing repaints once none does.
 pub(super) fn take_spinning() -> bool {
     SPINNING.swap(false, Ordering::Relaxed)
+}
+
+/// Set when a render shows an agent whose elapsed time or stuck check
+/// depends on the clock (see [`take_clock_tick`]).
+static CLOCK: AtomicBool = AtomicBool::new(false);
+/// Unix second of the last clock repaint.
+static CLOCK_SECOND: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a repaint is due for the clock: once a second while the last
+/// render had an agent working under the state hook, including agents in
+/// collapsed sections, whose items still count in the header.
+pub(super) fn take_clock_tick() -> bool {
+    if !CLOCK.load(Ordering::Relaxed) {
+        return false;
+    }
+    let now = agent_signal::unix_now();
+    if CLOCK_SECOND.swap(now, Ordering::Relaxed) == now {
+        return false;
+    }
+    CLOCK.store(false, Ordering::Relaxed);
+    true
 }
 
 /// Structured workspace headers start one column right of the project

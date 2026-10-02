@@ -573,14 +573,13 @@ impl ClientShellState {
             self.focus_next_attention_agent(outcome);
             return true;
         }
-        if let Some(filter) = self
+        let inbox = self
             .hits
             .drovr_inbox
             .iter()
             .find(|(rect, _)| super::contains(*rect, point))
-            .map(|(_, filter)| filter.clone())
-        {
-            self.open_inbox(filter, outcome);
+            .map(|(_, filter)| filter.clone());
+        if inbox.is_some_and(|filter| self.open_inbox(filter, outcome)) {
             return true;
         }
         if super::contains(self.hits.drovr_view_toggle, point) {
@@ -604,15 +603,17 @@ impl ClientShellState {
     }
 
     /// Opens the inbox pane filtered to `filter` (a sidebar glyph or section
-    /// count was clicked). Stub: the inbox pane lands in build step 4 of
-    /// docs/design/inbox-pane.md; until then the click opens nothing.
+    /// count was clicked); false leaves the click to the row or header
+    /// below. Stub: the inbox pane lands in build step 4 of
+    /// docs/design/inbox-pane.md; until then the click keeps its old effect
+    /// (focus the row, toggle the header).
     pub(super) fn open_inbox(
         &mut self,
         filter: super::agent_signal::InboxFilter,
-        outcome: &mut ClientShellInput,
-    ) {
+        _outcome: &mut ClientShellInput,
+    ) -> bool {
         tracing::debug!(?filter, "inbox pane not built yet");
-        outcome.repaint = true;
+        false
     }
 
     /// prefix+u: focus the next agent (in sidebar order) that is blocked,
@@ -1159,6 +1160,7 @@ impl ClientShellState {
         outcome.repaint |= projects::expire_peek();
         // Advance the structured view's spinner while an agent works.
         outcome.repaint |= super::drovr_sidebar::take_spinning();
+        outcome.repaint |= super::drovr_sidebar::take_clock_tick();
     }
 
     /// Once the workspace created above shows up, type the agent command into

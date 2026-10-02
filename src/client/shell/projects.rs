@@ -696,16 +696,20 @@ impl ProjectLayout {
         if self.is_unread(key) {
             return Presence::Unread;
         }
-        let dismissed = self
-            .dismissed
-            .iter()
-            .any(|entry| *entry == Self::dismissed_key(key, seq));
+        let dismissed = self.is_dismissed(key, seq);
         match status {
             AgentStatus::Working => Presence::Working,
             AgentStatus::Blocked if !dismissed => Presence::Blocked,
             AgentStatus::Done if !dismissed => Presence::Done,
             _ => Presence::Idle,
         }
+    }
+
+    /// The agent was marked inactive in its current state (`seq`).
+    pub(super) fn is_dismissed(&self, key: &str, seq: u64) -> bool {
+        self.dismissed
+            .iter()
+            .any(|entry| *entry == Self::dismissed_key(key, seq))
     }
 
     /// Manual status: unread (needs attention) or inactive (dismissed until the

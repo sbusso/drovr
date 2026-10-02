@@ -73,6 +73,9 @@ pub(super) struct AgentSignal {
     /// `drovr_state`: the kind and the unix time of its last change or
     /// reported PreToolUse.
     state: Option<(StateKind, u64)>,
+    /// `drovr_state`'s beat: the last hook event of any kind (subagent tools
+    /// included), when later than the state time.
+    beat: Option<u64>,
     /// `drovr_doing`: the running tool ("Bash cargo test").
     pub(super) doing: Option<String>,
     /// Kind of the oldest pending request in `drovr_wait`.
@@ -83,18 +86,22 @@ pub(super) struct AgentSignal {
 
 impl AgentSignal {
     /// Reads the tokens of `agent`. Pane tokens outlive the agent, so they
-    /// only count while the pane runs an agent that has the hook.
+    /// only count while the pane runs an agent that has the hook. A pane
+    /// whose agent is gone (herdr keeps a named pane) shows `exited` when its
+    /// session ended or the process died mid-turn. Ceiling: stock herdr drops
+    /// an unnamed pane from the agent list once its agent exits, and its
+    /// panes carry no tokens, so such a pane shows nothing.
     pub(super) fn parse(agent: &ClientShellAgent) -> Self {
-        if !matches!(agent.agent.as_deref(), Some("claude" | "codex")) {
-            return Self::default();
-        }
         let token = |name: &str| {
             super::projects::agent_token(agent, name)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         };
+        let mut beat = None;
         let state = token("drovr_state").and_then(|value| {
-            let (kind, at) = value.split_once('|')?;
+            let mut fields = value.split('|');
+            let (kind, at) = (fields.next()?, fields.next()?);
+            beat = fields.next().and_then(|beat| beat.parse().ok());
             let kind = match kind {
                 "idle" => StateKind::Idle,
                 "working" => StateKind::Working,
@@ -107,6 +114,19 @@ impl AgentSignal {
             };
             Some((kind, at.parse().ok()?))
         });
+        match agent.agent.as_deref() {
+            Some("claude" | "codex") => {}
+            None => {
+                return match state {
+                    Some((StateKind::Exited | StateKind::Working, at)) => Self {
+                        state: Some((StateKind::Exited, at)),
+                        ..Self::default()
+                    },
+                    _ => Self::default(),
+                };
+            }
+            Some(_) => return Self::default(),
+        }
         let wait = token("drovr_wait").and_then(|value| match value.split('|').next()? {
             "permission" => Some(ItemKind::Permission),
             "question" => Some(ItemKind::Question),
@@ -115,15 +135,31 @@ impl AgentSignal {
         });
         Self {
             state,
+            beat,
             doing: token("drovr_doing").map(str::to_owned),
             wait,
-            ctx: token("drovr_ctx").and_then(|value| value.parse().ok()),
+            // Claude only: a codex in the same pane must not inherit the last
+            // Claude session's context.
+            ctx: super::projects::agent_context_tokens(agent),
         }
     }
 
     /// The inbox item this agent makes, if any. `now` is the unix time in
-    /// seconds; `stuck_secs` is the workspace's stuck threshold.
-    pub(super) fn item(&self, status: AgentStatus, now: u64, stuck_secs: u64) -> Option<ItemKind> {
+    /// seconds; `stuck_secs` is the workspace's stuck threshold. `seen` is a
+    /// sidebar "mark inactive" for the agent's current state: it hides every
+    /// kind but the waiting ones, which stay until the prompt is answered.
+    pub(super) fn item(
+        &self,
+        status: AgentStatus,
+        now: u64,
+        stuck_secs: u64,
+        seen: bool,
+    ) -> Option<ItemKind> {
+        self.kind(status, now, stuck_secs)
+            .filter(|kind| !seen || kind.waiting())
+    }
+
+    fn kind(&self, status: AgentStatus, now: u64, stuck_secs: u64) -> Option<ItemKind> {
         let kind = self.state.map(|(kind, _)| kind);
         match status {
             // herdr sees a prompt; the hook says which, else it is a dialog
@@ -131,7 +167,9 @@ impl AgentSignal {
             // elicitation, trust prompt).
             AgentStatus::Blocked => Some(self.wait.unwrap_or(ItemKind::Dialog)),
             AgentStatus::Working => match self.state {
-                Some((StateKind::Working, at)) if now.saturating_sub(at) >= stuck_secs => {
+                Some((StateKind::Working, at))
+                    if now.saturating_sub(at.max(self.beat.unwrap_or(0))) >= stuck_secs =>
+                {
                     Some(ItemKind::Stuck)
                 }
                 _ => self.near_limit().then_some(ItemKind::Limit),
@@ -147,6 +185,12 @@ impl AgentSignal {
                 _ => None,
             },
         }
+    }
+
+    /// The hook says working, so the elapsed time and the stuck check move
+    /// with the clock alone.
+    pub(super) fn ticking(&self, status: AgentStatus) -> bool {
+        status == AgentStatus::Working && matches!(self.state, Some((StateKind::Working, _)))
     }
 
     /// Seconds since the running tool started, while the hook says working.
@@ -204,12 +248,12 @@ mod tests {
 
     fn agent(vendor: &str, tokens: &[(&str, &str)]) -> ClientShellAgent {
         ClientShellAgent {
+            agent: (!vendor.is_empty()).then(|| vendor.into()),
             pane_id: "p1".into(),
             workspace_id: "w1".into(),
             tab_id: "t1".into(),
             name: None,
             display_agent: None,
-            agent: Some(vendor.into()),
             title: None,
             terminal_title: None,
             terminal_title_stripped: None,
@@ -227,7 +271,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn item(vendor: &str, tokens: &[(&str, &str)], status: AgentStatus) -> Option<ItemKind> {
-        AgentSignal::parse(&agent(vendor, tokens)).item(status, NOW, DEFAULT_STUCK_SECS)
+        AgentSignal::parse(&agent(vendor, tokens)).item(status, NOW, DEFAULT_STUCK_SECS, false)
     }
 
     #[test]
@@ -245,6 +289,7 @@ mod tests {
             signal,
             AgentSignal {
                 state: Some((StateKind::Working, 1_799_999_970)),
+                beat: None,
                 doing: Some("Bash cargo test".into()),
                 wait: Some(ItemKind::Plan),
                 ctx: Some(1200),
@@ -270,6 +315,27 @@ mod tests {
         assert!(AgentSignal::parse(&agent("codex", &leftover))
             .doing
             .is_some());
+        // drovr_ctx comes from the Claude usage hook: a codex in the same
+        // pane does not inherit it.
+        let ctx = [("drovr_ctx", "180000")];
+        assert_eq!(AgentSignal::parse(&agent("codex", &ctx)).ctx, None);
+        assert_eq!(
+            item("codex", &ctx, AgentStatus::Done),
+            Some(ItemKind::Finished)
+        );
+    }
+
+    #[test]
+    fn a_pane_whose_agent_is_gone_shows_exited_after_a_cut_turn() {
+        use AgentStatus::{Idle, Unknown};
+        for state in ["exited|5", "working|5"] {
+            let tokens = [("drovr_state", state), ("drovr_doing", "Bash x")];
+            assert_eq!(item("", &tokens, Unknown), Some(ItemKind::Exited));
+            assert_eq!(item("", &tokens, Idle), Some(ItemKind::Exited));
+        }
+        for state in ["finished|5", "asks|5", "idle|5"] {
+            assert_eq!(item("", &[("drovr_state", state)], Idle), None);
+        }
     }
 
     #[test]
@@ -303,6 +369,12 @@ mod tests {
             item("claude", &[("drovr_state", &quiet)], Working),
             Some(ItemKind::Stuck)
         );
+        // Subagent events move the beat, not the tool time.
+        let busy = format!("{}|{}", at(DEFAULT_STUCK_SECS + 60), NOW - 60);
+        assert_eq!(item("claude", &[("drovr_state", &busy)], Working), None);
+        let signal = AgentSignal::parse(&agent("claude", &[("drovr_state", &busy)]));
+        assert!(signal.ticking(Working));
+        assert!(!signal.ticking(AgentStatus::Idle));
         // Without the hook there is no event time, so never stuck.
         assert_eq!(item("pi", &[], Working), None);
         assert_eq!(
@@ -336,6 +408,19 @@ mod tests {
         assert_eq!(check("idle", Idle), None);
         assert_eq!(item("pi", &[], Done), Some(ItemKind::Finished));
         assert_eq!(item("pi", &[], Idle), None);
+        // Marked inactive in the sidebar: only waiting kinds remain.
+        let seen = |tokens: &[(&str, &str)], status| {
+            AgentSignal::parse(&agent("claude", tokens)).item(status, NOW, DEFAULT_STUCK_SECS, true)
+        };
+        let asks = format!("asks|{NOW}");
+        assert_eq!(seen(&[("drovr_state", &asks)], Done), None);
+        assert_eq!(seen(&[], Done), None);
+        let wait = [("drovr_wait", "permission|ab12cd34||git push")];
+        assert_eq!(
+            seen(&wait, AgentStatus::Blocked),
+            Some(ItemKind::Permission)
+        );
+        assert_eq!(seen(&[], AgentStatus::Blocked), Some(ItemKind::Dialog));
     }
 
     #[test]

@@ -240,6 +240,9 @@ Stop and Interrupt for Codex (`~/.codex/hooks.json`).
   not wipe each other.
 - Subagent events (`agent_id` set): PreToolUse is ignored for `drovr_doing`;
   PermissionRequest is kept and the item is labelled "subagent".
+- Every event, subagent events included, moves a beat (in 60 s steps) that
+  `drovr_state` carries as a third field while it is later than the state
+  time; stuck counts from the later of the two.
 - The hook skips a report when no value changed, and a PreToolUse report
   follows the previous PreToolUse report by at least 2 s; a held-back value
   goes out with the next report. A PostToolUse that only clears `drovr_doing`
@@ -254,7 +257,7 @@ Stop and Interrupt for Codex (`~/.codex/hooks.json`).
 
 | Key | Value (≤ 80 chars) | Cleared by |
 |---|---|---|
-| `drovr_state` | `<kind>\|<unix s>`: idle, working, asks, finished, limit, denied, exited; the time is the last kind change or reported PreToolUse | SessionEnd (set to `exited` when the session ends while working) |
+| `drovr_state` | `<kind>\|<unix s>[\|<beat>]`: idle, working, asks, finished, limit, denied, exited; the time is the last kind change or reported PreToolUse, the beat the last hook event | SessionEnd (set to `exited` when the session ends while working) |
 | `drovr_doing` | `Bash cargo test` | PostToolUse, Stop |
 | `drovr_wait` | `<kind>\|<req8>\|<sub?>\|<summary>` | request end, prompt, Stop |
 | `drovr_o1`-`drovr_o4` | option labels, single-select question only | same as `drovr_wait` |
@@ -386,15 +389,24 @@ secrets; `DROVR_STATE_TEXT=0` reports kinds only.
    Built in `src/client/shell/agent_signal.rs`: `AgentSignal::parse` reads
    the drovr-state tokens of a Claude or Codex pane, and `AgentSignal::item`
    gives the pane's item kind for the sidebar now and the inbox in step 4.
-   A prompt or finish marked inactive in the sidebar counts as seen. The
+   An agent marked inactive in the sidebar keeps only waiting items until
+   its next state change; the inbox reads the same mark through `item`.
+   drovr_ctx counts for Claude panes only. A named pane whose agent is gone
+   shows `exited` when its session ended or died mid-turn; stock herdr drops
+   unnamed panes from the agent list, so those show nothing. Agents of an
+   offline machine show no glyph. While an agent works under the hook the
+   sidebar repaints once a second, so elapsed time and stuck move. The
    structured view draws the glyph on the workspace row, the detailed view
    on the agent row, and the compact view on the workspace row; a working
    agent's title becomes `▸ <drovr_doing>` with its elapsed time on the
    right. The section count replaces the structured header's needs-you and
    agent counts. Clicks on a glyph or count call `open_inbox`, a stub until
-   step 4. Two gaps: the stuck threshold is the 10-minute default until step
+   step 4 that leaves the click to the row or header below. Three gaps: the stuck threshold is the 10-minute default until step
    4 adds the setting, and the tokens do not name the model, so `limit` from
-   `drovr_ctx` assumes a 200k window, or 1M once the context passes 200k.
+   `drovr_ctx` assumes a 200k window, or 1M once the context passes 200k
+   (transcripts name the model without the `[1m]` suffix). The `drovr_state`
+   time is the agent machine's clock, compared with the client's, so clock
+   skew between machines shifts elapsed time and stuck.
 4. **Inbox pane, read and jump**: `drovr inbox` process, `drovr_inbox` token,
    toggle and reuse, flat order, filters, server marks, per-workspace stuck
    threshold, focus-drop window. Tests: ordering, focus-drop window, narrow

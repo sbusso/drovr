@@ -552,6 +552,25 @@ class StateHookTests(unittest.TestCase):
         self.assertNotIn("drovr_doing", tokens)
         self.assertTrue(tokens["drovr_state"].startswith("idle|"))
 
+    def test_subagent_events_move_the_beat_not_the_tool_time(self):
+        self.prompt()
+        self.run_hook(self.pre("t1", "explore", tool_name="Agent"))
+        working = self.tokens()["drovr_state"]
+        self.assertEqual(working.count("|"), 1, "no beat while it equals the tool time")
+        # Ten minutes later the subagent is still running tools.
+        path = self.state / "w1_p1.json"
+        data = json.loads(path.read_text())
+        data["ts"] -= 600
+        data["beat"] -= 600
+        path.write_text(json.dumps(data))
+        self.run_hook(self.pre("s1", "ls", agent_id="sub1"))
+        kind, ts, beat = self.tokens()["drovr_state"].split("|")
+        self.assertEqual((kind, int(ts)), ("working", data["ts"]))
+        self.assertGreaterEqual(int(beat), data["ts"] + 600)
+        # A kind change moves the time to the beat again.
+        self.run_hook({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "done"})
+        self.assertEqual(self.tokens()["drovr_state"].split("|")[0::2], ["finished"])
+
     def test_codex_request_is_published_without_waiting(self):
         self.prompt()
         start = time.monotonic()
