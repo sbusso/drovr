@@ -561,6 +561,11 @@ fn main() -> io::Result<()> {
         };
         return doc_view::run_doc_view(std::path::Path::new(path));
     }
+    if args.get(1).map(String::as_str) == Some("doc")
+        && args.get(2).map(String::as_str) == Some("open")
+    {
+        std::process::exit(doc_view::open::run_doc_open(&args[3..])?);
+    }
 
     finish_cli(cli::maybe_run(&args))?;
 

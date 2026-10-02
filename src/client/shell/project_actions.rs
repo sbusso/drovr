@@ -28,6 +28,66 @@ fn move_items(items: &mut Vec<ClientContextMenuItem>, groups: &[String], grouped
     items.push(item("→ New project…", Action::ProjectAssignNew));
 }
 
+/// Recent documents shown in a workspace's "Documents…" submenu.
+const DOCUMENTS_MENU_LIMIT: usize = 10;
+
+/// The "Documents…" submenu of a workspace, or None when it has no recent
+/// documents. Recent documents are recorded by `drovr doc open` on the machine
+/// that hosts the workspace, so only workspaces on this machine have them here.
+fn documents_target(
+    endpoint_id: &ClientEndpointId,
+    workspace_id: &str,
+    pane_id: Option<String>,
+) -> Option<Box<ClientContextMenuTarget>> {
+    if !endpoint_id.is_local() || cfg!(test) {
+        return None;
+    }
+    let store = crate::doc_view::open::load_store(&crate::doc_view::open::store_path());
+    let docs = store
+        .recent(workspace_id)
+        .iter()
+        .take(DOCUMENTS_MENU_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    (!docs.is_empty()).then(|| {
+        Box::new(ClientContextMenuTarget::Documents {
+            workspace_id: workspace_id.to_owned(),
+            pane_id,
+            docs,
+        })
+    })
+}
+
+/// Runs `drovr doc open` against this machine's server for a workspace (and
+/// the agent pane the menu was opened on), in the background.
+fn open_local_document(workspace_id: String, pane_id: Option<String>, path: std::path::PathBuf) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["doc", "open", "--focus"])
+        .arg(&path)
+        .env("HERDR_WORKSPACE_ID", workspace_id)
+        .env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    match pane_id {
+        Some(pane_id) => command.env("HERDR_PANE_ID", pane_id),
+        None => command.env_remove("HERDR_PANE_ID"),
+    };
+    std::thread::spawn(move || match command.output() {
+        Ok(output) if !output.status.success() => tracing::warn!(
+            path = %path.display(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "drovr doc open failed"
+        ),
+        Err(err) => tracing::warn!(err = %err, "cannot run drovr doc open"),
+        _ => {}
+    });
+}
+
 /// Read-only usage lines for a project's menu (from the drovr usage hook).
 fn usage_items(name: &str) -> Vec<ClientContextMenuItem> {
     let layout = projects::layout();
@@ -58,12 +118,16 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             hidden,
             groups,
             base,
+            documents,
             ..
         } => {
             let mut items = base
                 .as_deref()
                 .map(super::context_menu::items_for)
                 .unwrap_or_default();
+            if documents.is_some() {
+                items.push(item("Documents…", Action::Documents));
+            }
             move_items(&mut items, groups, *grouped);
             if *grouped {
                 items.push(item("Move up", Action::ProjectMoveUp));
@@ -117,6 +181,11 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             .enumerate()
             .map(|(index, (_, label))| item(format!("on {label}"), Action::NewOnMachine(index)))
             .collect(),
+        ClientContextMenuTarget::Documents { docs, .. } => docs
+            .iter()
+            .enumerate()
+            .map(|(index, doc)| item(doc.label(), Action::OpenDocument(index)))
+            .collect(),
         ClientContextMenuTarget::Agent {
             unread_key,
             seq,
@@ -126,6 +195,7 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             active,
             groups,
             grouped,
+            documents,
             ..
         } => {
             let presence = projects::layout().presence(unread_key, *seq, *status);
@@ -145,6 +215,9 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             ));
             if *active {
                 items.push(item("Rename pane…", Action::AgentRename));
+            }
+            if documents.is_some() {
+                items.push(item("Documents…", Action::Documents));
             }
             if workspace_key.is_some() {
                 move_items(&mut items, groups, *grouped);
@@ -257,6 +330,7 @@ impl ClientShellState {
             groups: Self::group_names(),
             key,
             base,
+            documents: documents_target(endpoint_id, workspace_id, None),
         })
     }
 
@@ -290,6 +364,7 @@ impl ClientShellState {
                 .is_some_and(|key| projects::layout().is_hidden(key)),
             grouped: self.workspace_group(&endpoint_id, &workspace_id).is_some(),
             groups: Self::group_names(),
+            documents: documents_target(&endpoint_id, &workspace_id, Some(pane_id.clone())),
             workspace_key,
             active: endpoint_id == self.active_endpoint_id,
             endpoint_id,
@@ -574,9 +649,29 @@ impl ClientShellState {
         &mut self,
         target: ClientContextMenuTarget,
         action: Action,
+        (x, y): (u16, u16),
         outcome: &mut ClientShellInput,
     ) {
         match target {
+            ClientContextMenuTarget::ProjectWorkspace {
+                documents: Some(documents),
+                ..
+            }
+            | ClientContextMenuTarget::Agent {
+                documents: Some(documents),
+                ..
+            } if action == Action::Documents => self.open_menu(*documents, x, y),
+            ClientContextMenuTarget::Documents {
+                workspace_id,
+                pane_id,
+                docs,
+            } => {
+                if let Action::OpenDocument(index) = action {
+                    if let Some(doc) = docs.into_iter().nth(index) {
+                        open_local_document(workspace_id, pane_id, doc.path);
+                    }
+                }
+            }
             ClientContextMenuTarget::ProjectWorkspace { key, groups, .. } => match action {
                 Action::ProjectAssignTo(index) => {
                     if let Some(name) = groups.get(index) {

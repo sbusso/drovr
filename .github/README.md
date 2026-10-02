@@ -150,6 +150,41 @@ project to choose your own.
   folder on the chosen machine.
 - Right-click a project → **New agent here** does the same and starts `cc` in it.
 
+### Document pane
+A pane next to your agent that shows a Markdown file rendered: plans, reports,
+specs. It reloads when the file changes and keeps your scroll position, follows
+links between documents (Backspace goes back), searches with `/`, and `q`
+closes the pane. Each
+workspace has at most one doc pane; opening another document switches it.
+
+Three ways to open a document:
+- **From an agent or a shell**: `drovr doc open <path> [--title <title>]`.
+  The first call splits a pane to the right of the caller (45% of its width)
+  without taking focus; later calls switch that pane. Add `--focus` to move
+  to it. `drovr doc open --recent` reopens the workspace's newest document.
+- **Ctrl+click a Markdown link** in a pane, with the `drovr-docs` plugin
+  installed (see below). Plain text is clickable only for `http(s)` URLs, so
+  bare paths and `file://` links work when the program prints them as
+  hyperlinks.
+- **Right-click a workspace or an agent** in the sidebar → **Documents…**
+  lists the workspace's last 10 documents. The item shows for workspaces on
+  this machine that have opened documents.
+
+`drovr doc view <path>` runs the viewer in the current pane. Each machine keeps
+its recent documents in `~/.local/state/herdr/drovr/docs.json` (20 per
+workspace); `drovr doc open` runs on the machine that hosts the workspace.
+
+Install the plugin and the Claude Code skill on each machine that runs agents:
+
+```bash
+herdr plugin install sbusso/drovr/plugins/drovr-docs --ref drovr-main
+mkdir -p ~/.claude/skills && cp -R skills/drovr-docs ~/.claude/skills/   # from a drovr checkout
+```
+
+The plugin adds the Ctrl+click handler and an **Open document…** workspace
+action (the newest recent document). The skill tells agents to open the plans
+and reports they write for you with `drovr doc open`.
+
 ### Small fixes
 - Workspaces are tracked by id, so two with the same name are independent and a
   rename keeps a workspace in its project.

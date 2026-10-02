@@ -1,6 +1,7 @@
 //! `drovr doc view <path>`: a full-screen Markdown viewer that runs inside a
 //! herdr pane, reloads the file when it changes and follows links.
 
+pub mod open;
 mod render;
 
 use std::io;

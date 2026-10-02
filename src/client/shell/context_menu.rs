@@ -18,6 +18,7 @@ pub(super) fn items_for(target: &ClientContextMenuTarget) -> Vec<ClientContextMe
             ClientContextMenuTarget::ProjectWorkspace { .. }
             | ClientContextMenuTarget::Project { .. }
             | ClientContextMenuTarget::NewWorkspacePicker { .. }
+            | ClientContextMenuTarget::Documents { .. }
             | ClientContextMenuTarget::Agent { .. } => {
                 super::project_actions::project_menu_items(target)
             }
@@ -238,7 +239,7 @@ impl ClientShellState {
                 action,
                 outcome,
             ),
-            target => self.activate_project_action(target, action, outcome),
+            target => self.activate_project_action(target, action, (menu.x, menu.y), outcome),
         }
         outcome.repaint = true;
     }

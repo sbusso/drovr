@@ -583,6 +583,10 @@ pub(super) enum ClientContextMenuAction {
     Info,
     AgentFocus,
     AgentRename,
+    /// Open the workspace's recent documents submenu.
+    Documents,
+    /// Open recent document N of a `Documents` menu.
+    OpenDocument(usize),
 }
 
 #[derive(Debug)]
@@ -614,6 +618,7 @@ pub(super) enum ClientContextMenuTarget {
         hidden: bool,
         groups: Vec<String>,
         base: Option<Box<ClientContextMenuTarget>>,
+        documents: Option<Box<ClientContextMenuTarget>>,
     },
     Project {
         name: String,
@@ -637,6 +642,13 @@ pub(super) enum ClientContextMenuTarget {
         active: bool,
         groups: Vec<String>,
         grouped: bool,
+        documents: Option<Box<ClientContextMenuTarget>>,
+    },
+    /// drovr: recent documents of a workspace on this machine (newest first).
+    Documents {
+        workspace_id: String,
+        pane_id: Option<String>,
+        docs: Vec<crate::doc_view::open::RecentDoc>,
     },
 }
 
