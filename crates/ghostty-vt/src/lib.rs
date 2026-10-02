@@ -214,7 +214,8 @@ const KITTY_PLACEMENT_DATA_COLUMNS: ffi::GhosttyKittyGraphicsPlacementData = 10;
 const KITTY_PLACEMENT_DATA_ROWS: ffi::GhosttyKittyGraphicsPlacementData = 11;
 
 static INSTALL_PNG_DECODER: Once = Once::new();
-static KITTY_PLACEHOLDER_DIACRITICS: OnceLock<HashMap<u32, u32>> = OnceLock::new();
+static KITTY_PLACEHOLDER_DIACRITICS: OnceLock<Vec<u32>> = OnceLock::new();
+static KITTY_PLACEHOLDER_DIACRITIC_INDEX: OnceLock<HashMap<u32, u32>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum KittyImageFormat {
@@ -2497,13 +2498,14 @@ fn kitty_placeholder_color_to_id(color: CellColor) -> u32 {
     }
 }
 
-fn kitty_placeholder_diacritic_index(codepoint: u32) -> Option<u32> {
-    let map = KITTY_PLACEHOLDER_DIACRITICS.get_or_init(|| {
-        // Reuse Ghostty's vendored table so Herdr decodes the same placeholder
-        // row/column diacritics that libghostty accepts.
+/// Kitty placeholder row/column diacritics in index order.
+fn kitty_placeholder_diacritics() -> &'static [u32] {
+    KITTY_PLACEHOLDER_DIACRITICS.get_or_init(|| {
+        // Reuse Ghostty's vendored table so Herdr encodes and decodes the same
+        // placeholder row/column diacritics that libghostty accepts.
         let source =
             include_str!("../../../vendor/libghostty-vt/src/terminal/kitty/graphics_unicode.zig");
-        let mut map = HashMap::new();
+        let mut table = Vec::new();
         let mut in_table = false;
         for line in source.lines() {
             let line = line.trim();
@@ -2524,12 +2526,33 @@ fn kitty_placeholder_diacritic_index(codepoint: u32) -> Option<u32> {
                 continue;
             };
             if let Ok(value) = u32::from_str_radix(hex, 16) {
-                map.insert(value, map.len() as u32);
+                table.push(value);
             }
         }
-        map
-    });
-    map.get(&codepoint).copied()
+        table
+    })
+}
+
+/// Diacritic that encodes row or column `index` in a Kitty Unicode
+/// placeholder cell.
+pub fn kitty_placeholder_diacritic(index: usize) -> Option<char> {
+    kitty_placeholder_diacritics()
+        .get(index)
+        .copied()
+        .and_then(char::from_u32)
+}
+
+fn kitty_placeholder_diacritic_index(codepoint: u32) -> Option<u32> {
+    KITTY_PLACEHOLDER_DIACRITIC_INDEX
+        .get_or_init(|| {
+            kitty_placeholder_diacritics()
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (*value, index as u32))
+                .collect()
+        })
+        .get(&codepoint)
+        .copied()
 }
 
 fn kitty_virtual_placement_geometry(

@@ -1043,6 +1043,9 @@ pub struct UiConfig {
     pub toast: ToastConfig,
     /// Play sounds when agents change state in background workspaces.
     pub sound: SoundConfig,
+    /// drovr fork: the doc pane uses the full pane width instead of a
+    /// centred reading column with margins. Default: false.
+    pub doc_full_width: bool,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -1269,6 +1272,7 @@ impl Default for UiConfig {
             accent: "cyan".into(),
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
+            doc_full_width: false,
         }
     }
 }
@@ -1628,6 +1632,13 @@ prompt_new_tab_name = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn doc_full_width_defaults_off_and_parses() {
+        assert!(!Config::default().ui.doc_full_width);
+        let config: Config = toml::from_str("[ui]\ndoc_full_width = true\n").unwrap();
+        assert!(config.ui.doc_full_width);
     }
 
     #[test]

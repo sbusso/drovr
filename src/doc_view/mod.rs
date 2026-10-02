@@ -1,6 +1,7 @@
 //! `drovr doc view <path>`: a full-screen Markdown viewer that runs inside a
 //! herdr pane, reloads the file when it changes and follows links.
 
+mod image;
 pub mod open;
 mod render;
 pub(crate) use render::percent_decode;
@@ -206,12 +207,35 @@ fn stamp(path: &Path) -> Option<Stamp> {
     })
 }
 
+/// Widest text column. Wider panes centre it, like a reading view.
+const MAX_TEXT_WIDTH: u16 = 88;
+/// Rows above the body: the header and one blank row.
+const BODY_TOP: u16 = 2;
+
+/// Left offset and width of the text column in a pane `width` cells wide.
+/// `full` uses the whole pane.
+fn text_column(width: u16, full: bool) -> (u16, u16) {
+    if full {
+        return (0, width.max(1));
+    }
+    let margin = match width {
+        40.. => 3,
+        20.. => 1,
+        _ => 0,
+    };
+    let text = width.saturating_sub(2 * margin).clamp(1, MAX_TEXT_WIDTH);
+    (width.saturating_sub(text) / 2, text)
+}
+
 pub struct Viewer {
     path: PathBuf,
     source: Result<String, String>,
     stamp: Option<Stamp>,
     updated: Option<String>,
     theme: Theme,
+    images: image::Images,
+    /// Text spans the whole pane instead of a centred reading column.
+    full_width: bool,
     doc: Doc,
     width: u16,
     height: usize,
@@ -244,6 +268,8 @@ impl Viewer {
             stamp: None,
             updated: None,
             theme,
+            images: image::Images::default(),
+            full_width: false,
             doc: Doc::default(),
             width: 80,
             height: 20,
@@ -276,7 +302,18 @@ impl Viewer {
 
     fn rerender(&mut self) {
         self.doc = match &self.source {
-            Ok(text) => render::render(text, self.width, &self.theme),
+            Ok(text) => {
+                let (images, path) = (&mut self.images, &self.path);
+                images.begin();
+                let doc = render::render(
+                    text,
+                    text_column(self.width, self.full_width).1,
+                    &self.theme,
+                    &mut |url, width| images.place(url, path, width),
+                );
+                images.finish();
+                doc
+            }
             Err(err) => self.missing_doc(err),
         };
         if self
@@ -320,13 +357,42 @@ impl Viewer {
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
-        self.height = usize::from(height.saturating_sub(2)).max(1);
+        self.height = usize::from(height.saturating_sub(BODY_TOP + 1)).max(1);
         if width != self.width {
             self.width = width;
             self.rerender();
         } else {
             self.clamp_scroll();
         }
+    }
+
+    /// Switches between the reading column and the full pane width, keeping
+    /// about the same part of the document in view.
+    fn toggle_full_width(&mut self) {
+        let (scroll, lines) = (self.scroll, self.doc.lines.len().max(1));
+        self.full_width = !self.full_width;
+        self.rerender();
+        self.scroll_to_line(scroll * self.doc.lines.len() / lines);
+        self.message = Some(
+            if self.full_width {
+                "full width"
+            } else {
+                "reading width"
+            }
+            .into(),
+        );
+    }
+
+    /// Sets the cell size in pixels that images are laid out with.
+    pub fn set_cell_size(&mut self, cell: Option<(u32, u32)>) {
+        if self.images.set_cell_size(cell) {
+            self.rerender();
+        }
+    }
+
+    /// Graphics commands to write to the terminal before the next frame.
+    pub fn take_graphics(&mut self) -> Vec<u8> {
+        self.images.take_pending()
     }
 
     fn max_scroll(&self) -> usize {
@@ -574,6 +640,7 @@ impl Viewer {
             KeyCode::Char('/') => self.search_input = Some(String::new()),
             KeyCode::Char('n') => self.jump_match(true),
             KeyCode::Char('N') => self.jump_match(false),
+            KeyCode::Char('w') => self.toggle_full_width(),
             KeyCode::Char('r') => {
                 self.load();
                 self.updated = Some(local_time());
@@ -598,9 +665,11 @@ impl Viewer {
         Action::None
     }
 
-    /// Link under a screen cell. Row 0 is the header line.
+    /// Link under a screen cell. The body starts at row `BODY_TOP`, inset
+    /// by the text column's left margin.
     fn link_at(&self, column: u16, row: u16) -> Option<usize> {
-        let row = usize::from(row).checked_sub(1)?;
+        let row = usize::from(row.checked_sub(BODY_TOP)?);
+        let column = column.checked_sub(text_column(self.width, self.full_width).0)?;
         if row >= self.height {
             return None;
         }
@@ -667,7 +736,7 @@ impl Viewer {
             )
         } else {
             Span::styled(
-                " j/k scroll  tab links  enter open  b back  / search  q quit",
+                " j/k scroll  tab links  enter open  b back  / search  w width  q quit",
                 dim,
             )
         };
@@ -721,7 +790,8 @@ impl Viewer {
             Paragraph::new(self.header()),
             Rect::new(area.x, area.y, area.width, 1.min(area.height)),
         );
-        let body_height = area.height.saturating_sub(2);
+        let body_height = area.height.saturating_sub(BODY_TOP + 1);
+        let (left, text_width) = text_column(area.width, self.full_width);
         let lines: Vec<Line> = self
             .doc
             .lines
@@ -732,7 +802,12 @@ impl Viewer {
             .collect();
         frame.render_widget(
             Paragraph::new(lines),
-            Rect::new(area.x, area.y + 1, area.width, body_height),
+            Rect::new(
+                area.x + left,
+                area.y + BODY_TOP.min(area.height),
+                text_width.min(area.width),
+                body_height,
+            ),
         );
         if area.height >= 2 {
             frame.render_widget(
@@ -939,6 +1014,27 @@ fn open_external(url: &str) -> String {
     }
 }
 
+/// Cell size in pixels, or `None` when the terminal does not report pixels.
+fn cell_size() -> Option<(u32, u32)> {
+    let size = ratatui::crossterm::terminal::window_size().ok()?;
+    if size.columns == 0 || size.rows == 0 {
+        return None;
+    }
+    Some((
+        u32::from(size.width) / u32::from(size.columns),
+        u32::from(size.height) / u32::from(size.rows),
+    ))
+}
+
+fn write_graphics(bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut out = io::stdout().lock();
+    io::Write::write_all(&mut out, bytes)?;
+    io::Write::flush(&mut out)
+}
+
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -968,8 +1064,14 @@ pub fn run_doc_view(path: Option<&Path>) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("no document given and no doc open request"))?,
     };
     let path = normalize(&std::path::absolute(path)?);
-    let palette = crate::app::client_palette_from_config(&crate::config::Config::load().config);
+    let config = crate::config::Config::load().config;
+    let palette = crate::app::client_palette_from_config(&config);
+    let graphics = config.kitty_graphics_enabled();
     let mut viewer = Viewer::new(path, Theme::from_palette(&palette), control_path);
+    if config.ui.doc_full_width {
+        viewer.toggle_full_width();
+        viewer.message = None;
+    }
 
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -990,8 +1092,12 @@ pub fn run_doc_view(path: Option<&Path>) -> io::Result<()> {
                 report_doc(pane_id, &viewer.path);
             }
         }
+        if graphics {
+            viewer.set_cell_size(cell_size());
+        }
         let size = terminal.size()?;
         viewer.resize(size.width, size.height);
+        write_graphics(&viewer.take_graphics())?;
         terminal.draw(|frame| viewer.draw(frame))?;
 
         let timeout = next_poll.saturating_duration_since(Instant::now());
@@ -1014,6 +1120,7 @@ pub fn run_doc_view(path: Option<&Path>) -> io::Result<()> {
             next_poll = Instant::now() + POLL_INTERVAL;
         }
     }
+    write_graphics(&viewer.images.clear_all())?;
     drop(terminal);
     if let Some(pane_id) = &pane_id {
         clear_doc_report(pane_id);
@@ -1276,12 +1383,26 @@ mod tests {
         let click = |column| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
-            row: 1,
+            row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.link_at(0, 1), None);
-        assert_eq!(v.link_at(4, 1), Some(0));
-        assert_eq!(v.handle_mouse(click(4)), Action::None);
+        // At 80 columns the text starts after a 3-column margin.
+        assert_eq!(text_column(80, false), (3, 74));
+        assert_eq!(text_column(200, false), (56, 88));
+        assert_eq!(text_column(10, false), (0, 10));
+        assert_eq!(text_column(200, true), (0, 200));
+        assert_eq!(v.link_at(2, 2), None);
+        assert_eq!(v.link_at(3, 2), None);
+        assert_eq!(v.link_at(7, 1), None);
+        assert_eq!(v.link_at(7, 2), Some(0));
+        assert_eq!(v.handle_mouse(click(7)), Action::None);
         assert_eq!(v.selected, Some(0));
+
+        // `w` drops the margin, so the link starts at column 3.
+        v.handle_key(key(KeyCode::Char('w')));
+        assert_eq!(v.link_at(2, 2), None);
+        assert_eq!(v.link_at(3, 2), Some(0));
+        v.handle_key(key(KeyCode::Char('w')));
+        assert_eq!(v.link_at(3, 2), None);
     }
 }

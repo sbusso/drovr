@@ -5,10 +5,13 @@
 
 use std::collections::HashMap;
 
-use pulldown_cmark::{Alignment, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
+};
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::image::Placed;
 use crate::app::state::Palette;
 
 /// Colours used by the viewer.
@@ -155,8 +158,13 @@ struct Table {
     header_rows: usize,
 }
 
-struct Renderer<'t> {
+/// Places the image at a URL in at most the given columns; `None` shows the
+/// alt text instead.
+pub type ImageFn<'a> = dyn FnMut(&str, usize) -> Option<Placed> + 'a;
+
+struct Renderer<'t, 'i> {
     theme: &'t Theme,
+    images: &'t mut ImageFn<'i>,
     width: usize,
     doc: Doc,
     slug_counts: HashMap<String, usize>,
@@ -170,18 +178,22 @@ struct Renderer<'t> {
     /// footnote labels.
     heading_text: String,
     code: Option<String>,
+    /// Info string of the open fenced code block, shown as a label.
+    code_lang: String,
     image_alt: Option<String>,
+    image_url: String,
     table: Option<Table>,
     in_html_comment: bool,
 }
 
-pub fn render(markdown: &str, width: u16, theme: &Theme) -> Doc {
+pub fn render(markdown: &str, width: u16, theme: &Theme, images: &mut ImageFn<'_>) -> Doc {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_FOOTNOTES;
     let mut renderer = Renderer {
         theme,
+        images,
         width: usize::from(width).max(1),
         doc: Doc::default(),
         slug_counts: HashMap::new(),
@@ -193,7 +205,9 @@ pub fn render(markdown: &str, width: u16, theme: &Theme) -> Doc {
         heading: None,
         heading_text: String::new(),
         code: None,
+        code_lang: String::new(),
         image_alt: None,
+        image_url: String::new(),
         table: None,
         in_html_comment: false,
     };
@@ -202,17 +216,16 @@ pub fn render(markdown: &str, width: u16, theme: &Theme) -> Doc {
     }
     renderer.flush_inline();
     let mut doc = renderer.doc;
-    while doc
-        .lines
-        .last()
-        .is_some_and(|line| line_text(line).trim().is_empty())
-    {
+    // Trailing blank lines go; a code block's bottom padding row stays.
+    while doc.lines.last().is_some_and(|line| {
+        line_text(line).trim().is_empty() && line.iter().all(|s| s.style.bg.is_none())
+    }) {
         doc.lines.pop();
     }
     doc
 }
 
-impl Renderer<'_> {
+impl Renderer<'_, '_> {
     fn event(&mut self, event: Event<'_>) {
         if let Some(code) = self.code.as_mut() {
             if let Event::Text(text) = &event {
@@ -235,9 +248,11 @@ impl Renderer<'_> {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.push_text(&text, self.current_style()),
             Event::Code(text) => {
-                let style = self
-                    .current_style()
-                    .patch(Style::default().fg(self.theme.inline_code));
+                let style = self.current_style().patch(
+                    Style::default()
+                        .fg(self.theme.inline_code)
+                        .bg(self.theme.code_bg),
+                );
                 self.push_text(&text, style);
             }
             Event::InlineMath(text) | Event::DisplayMath(text) => {
@@ -287,6 +302,12 @@ impl Renderer<'_> {
         match tag {
             Tag::Paragraph => self.begin_block(),
             Tag::Heading { level, .. } => {
+                // Top-level sections get extra space above them.
+                if level <= HeadingLevel::H2 && self.need_blank {
+                    self.flush_inline();
+                    let prefix = self.blank_prefix();
+                    self.push_line(prefix);
+                }
                 self.begin_block();
                 self.heading = Some(level);
             }
@@ -294,9 +315,15 @@ impl Renderer<'_> {
                 self.begin_block();
                 self.containers.push(Container::Quote);
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.begin_block();
                 self.code = Some(String::new());
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        info.split_whitespace().next().unwrap_or("").to_string()
+                    }
+                    CodeBlockKind::Indented => String::new(),
+                };
             }
             Tag::HtmlBlock => self.begin_block(),
             Tag::List(start) => {
@@ -376,7 +403,10 @@ impl Renderer<'_> {
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
-            Tag::Image { .. } => self.image_alt = Some(String::new()),
+            Tag::Image { dest_url, .. } => {
+                self.image_alt = Some(String::new());
+                self.image_url = dest_url.to_string();
+            }
             _ => {}
         }
     }
@@ -478,6 +508,15 @@ impl Renderer<'_> {
             }
             TagEnd::Image => {
                 let alt = self.image_alt.take().unwrap_or_default();
+                let url = std::mem::take(&mut self.image_url);
+                // Tables and headings keep their single-line layout.
+                if self.table.is_none() && self.heading.is_none() {
+                    let width = self.avail();
+                    if let Some(placed) = (self.images)(&url, width) {
+                        self.emit_image(placed);
+                        return;
+                    }
+                }
                 let style = Style::default()
                     .fg(self.theme.dim)
                     .add_modifier(Modifier::ITALIC);
@@ -647,21 +686,42 @@ impl Renderer<'_> {
         }
     }
 
+    /// An image breaks the paragraph: text before it flushes, then one line
+    /// of placeholder cells per image row.
+    fn emit_image(&mut self, placed: Placed) {
+        self.flush_inline();
+        let style = Style::default().fg(placed.color());
+        for row in 0..placed.rows {
+            self.emit_line(vec![RSpan::new(placed.row_text(row), style)]);
+        }
+    }
+
+    /// Code sits on a background box with two columns of side padding and
+    /// one row above and below; the top row carries the language label.
     fn emit_code(&mut self, code: &str) {
         let width = self.avail();
         let style = Style::default()
             .fg(self.theme.code_fg)
             .bg(self.theme.code_bg);
-        let inner = width.saturating_sub(2).max(1);
+        let label_style = style.fg(self.theme.dim);
+        let inner = width.saturating_sub(4).max(1);
+        let lang = std::mem::take(&mut self.code_lang);
+        let label = truncate(&[RSpan::new(lang, label_style)], inner);
+        let pad = width.saturating_sub(line_width(&label) + 2);
+        let mut top = vec![RSpan::new(" ".repeat(pad), style)];
+        top.extend(label);
+        top.push(RSpan::new("  ", style));
+        self.emit_line(top);
         let code = code.strip_suffix('\n').unwrap_or(code);
         for raw in code.split('\n') {
             let text = raw.replace('\t', "    ");
             for chunk in hard_chunks(&text, inner) {
-                let pad = width.saturating_sub(chunk.width() + 1);
-                let content = format!(" {chunk}{}", " ".repeat(pad));
+                let pad = width.saturating_sub(chunk.width() + 2);
+                let content = format!("  {chunk}{}", " ".repeat(pad));
                 self.emit_line(vec![RSpan::new(content, style)]);
             }
         }
+        self.emit_line(vec![RSpan::new(" ".repeat(width), style)]);
     }
 
     fn emit_table(&mut self, table: Table) {
@@ -941,6 +1001,10 @@ mod tests {
         Theme::from_palette(&Palette::catppuccin())
     }
 
+    fn no_images(_: &str, _: usize) -> Option<Placed> {
+        None
+    }
+
     fn texts(doc: &Doc) -> Vec<String> {
         doc.lines.iter().map(line_text).collect()
     }
@@ -952,23 +1016,33 @@ mod tests {
     #[test]
     fn headings_are_bold_coloured_and_h1_h2_get_rules() {
         let t = theme();
-        let doc = render("# Title\n\n## Sub\n\n### Third\n\ntext", 20, &t);
+        let doc = render(
+            "# Title\n\n## Sub\n\n### Third\n\ntext",
+            20,
+            &t,
+            &mut no_images,
+        );
         let lines = texts(&doc);
         assert_eq!(lines[0], "Title");
         assert_eq!(lines[1], "━".repeat(20));
-        assert_eq!(lines[3], "Sub");
-        assert_eq!(lines[4], "─".repeat(20));
-        assert_eq!(lines[6], "Third");
-        assert_eq!(lines[8], "text");
+        assert_eq!(lines[4], "Sub");
+        assert_eq!(lines[5], "─".repeat(20));
+        assert_eq!(lines[7], "Third");
+        assert_eq!(lines[9], "text");
         let span = &doc.lines[0][0];
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(span.style.fg, Some(t.headings[0]));
-        assert_eq!(doc.lines[6][0].style.fg, Some(t.headings[2]));
+        assert_eq!(doc.lines[7][0].style.fg, Some(t.headings[2]));
     }
 
     #[test]
     fn paragraphs_wrap_to_width_with_inline_styles() {
-        let doc = render("one *two* **three** `four` ~~five~~ six", 12, &theme());
+        let doc = render(
+            "one *two* **three** `four` ~~five~~ six",
+            12,
+            &theme(),
+            &mut no_images,
+        );
         assert_eq!(texts(&doc), vec!["one two", "three four", "five six"]);
         let two = doc.lines[0].iter().find(|s| s.text == "two").unwrap();
         assert!(two.style.add_modifier.contains(Modifier::ITALIC));
@@ -978,6 +1052,7 @@ mod tests {
         assert!(five.style.add_modifier.contains(Modifier::CROSSED_OUT));
         let four = doc.lines[1].iter().find(|s| s.text == "four").unwrap();
         assert_eq!(four.style.fg, Some(theme().inline_code));
+        assert_eq!(four.style.bg, Some(theme().code_bg));
     }
 
     #[test]
@@ -999,16 +1074,36 @@ mod tests {
     #[test]
     fn code_blocks_are_padded_with_background() {
         let t = theme();
-        let doc = render("```rust\nfn x() {}\n\tlet y;\n```", 16, &t);
+        let doc = render("```rust\nfn x() {}\n\tlet y;\n```", 16, &t, &mut no_images);
         let lines = texts(&doc);
-        assert_eq!(lines[0], " fn x() {}      ");
-        assert_eq!(lines[1], "     let y;     ");
-        assert_eq!(doc.lines[0][0].style.bg, Some(t.code_bg));
+        assert_eq!(lines[0], "          rust  ");
+        assert_eq!(lines[1], "  fn x() {}     ");
+        assert_eq!(lines[2], "      let y;    ");
+        assert_eq!(lines[3], " ".repeat(16));
+        assert!(doc
+            .lines
+            .iter()
+            .flatten()
+            .all(|s| s.style.bg == Some(t.code_bg)));
+    }
+
+    #[test]
+    fn top_level_headings_get_extra_space_above() {
+        let doc = render("text\n\n## Sub\n\n### Third", 10, &theme(), &mut no_images);
+        assert_eq!(
+            texts(&doc),
+            vec!["text", "", "", "Sub", "─".repeat(10).as_str(), "", "Third"]
+        );
     }
 
     #[test]
     fn block_quotes_get_a_bar_on_every_line() {
-        let doc = render("> quoted text here\n>\n> second", 12, &theme());
+        let doc = render(
+            "> quoted text here\n>\n> second",
+            12,
+            &theme(),
+            &mut no_images,
+        );
         assert_eq!(
             texts(&doc),
             vec!["▎ quoted", "▎ text here", "▎ ", "▎ second"]
@@ -1018,7 +1113,7 @@ mod tests {
     #[test]
     fn lists_nest_and_number() {
         let md = "- a\n  - b\n    long text\n- c\n\n3. x\n4. y\n";
-        let doc = render(md, 12, &theme());
+        let doc = render(md, 12, &theme(), &mut no_images);
         assert_eq!(
             texts(&doc),
             vec!["• a", "  ◦ b long", "    text", "• c", "", "3. x", "4. y"]
@@ -1027,7 +1122,7 @@ mod tests {
 
     #[test]
     fn task_list_markers_replace_bullets() {
-        let doc = render("- [ ] todo\n- [x] done", 20, &theme());
+        let doc = render("- [ ] todo\n- [x] done", 20, &theme(), &mut no_images);
         assert_eq!(texts(&doc), vec!["☐ todo", "☑ done"]);
         assert_eq!(doc.lines[1][0].style.fg, Some(theme().checked));
     }
@@ -1035,7 +1130,7 @@ mod tests {
     #[test]
     fn tables_fit_and_truncate() {
         let md = "| a | b |\n|---|--:|\n| 1 | 22 |\n";
-        let doc = render(md, 40, &theme());
+        let doc = render(md, 40, &theme(), &mut no_images);
         assert_eq!(
             texts(&doc),
             vec![
@@ -1047,7 +1142,7 @@ mod tests {
             ]
         );
         let md = "| name | description |\n|---|---|\n| x | a very long description indeed |\n";
-        let doc = render(md, 24, &theme());
+        let doc = render(md, 24, &theme(), &mut no_images);
         let lines = texts(&doc);
         assert!(lines.iter().all(|l| l.width() <= 24), "{lines:?}");
         assert!(lines[3].contains('…'), "{lines:?}");
@@ -1066,6 +1161,7 @@ mod tests {
             "see [docs](other.md#part) and ![logo](x.png)\n\n---\n\n<https://example.com>",
             40,
             &theme(),
+            &mut no_images,
         );
         let lines = texts(&doc);
         assert_eq!(lines[0], "see docs[1] and [image: logo]");
@@ -1090,26 +1186,63 @@ mod tests {
     }
 
     #[test]
+    fn placed_images_become_placeholder_rows() {
+        let placed = Placed {
+            id: 7,
+            cols: 4,
+            rows: 2,
+        };
+        let mut images = |url: &str, width: usize| {
+            assert_eq!(width, 30);
+            (url == "a.png").then_some(placed)
+        };
+        let doc = render(
+            "before ![a](a.png) after ![b](b.png)",
+            30,
+            &theme(),
+            &mut images,
+        );
+        let lines = texts(&doc);
+        assert_eq!(lines[0], "before");
+        assert_eq!(lines[1], placed.row_text(0));
+        assert_eq!(lines[2], placed.row_text(1));
+        assert_eq!(lines[3], "after [image: b]");
+        assert_eq!(doc.lines[1][0].style.fg, Some(placed.color()));
+        assert_eq!(line_width(&doc.lines[1]), 4);
+    }
+
+    #[test]
     fn anchors_follow_github_slugs() {
         let doc = render(
             "# Hello, World!\n\ntext\n\n## Hello World\n\n## Hello World",
             40,
             &theme(),
+            &mut no_images,
         );
         assert_eq!(doc.anchor_line("hello-world"), Some(0));
-        assert_eq!(doc.anchor_line("hello-world-1"), Some(5));
-        assert_eq!(doc.anchor_line("hello-world-2"), Some(8));
+        assert_eq!(doc.anchor_line("hello-world-1"), Some(6));
+        assert_eq!(doc.anchor_line("hello-world-2"), Some(10));
         assert_eq!(doc.anchor_line("Hello%20World"), Some(0));
         assert_eq!(doc.anchor_line("missing"), None);
 
         // Link markers and footnote labels are not part of the slug.
-        let doc = render("## See [the docs](x.md)[^n]\n\n[^n]: note", 40, &theme());
+        let doc = render(
+            "## See [the docs](x.md)[^n]\n\n[^n]: note",
+            40,
+            &theme(),
+            &mut no_images,
+        );
         assert_eq!(doc.anchor_line("see-the-docs"), Some(0));
     }
 
     #[test]
     fn html_comments_are_hidden() {
-        let doc = render("<!-- hidden\nstill -->\n\nshown", 40, &theme());
+        let doc = render(
+            "<!-- hidden\nstill -->\n\nshown",
+            40,
+            &theme(),
+            &mut no_images,
+        );
         assert_eq!(texts(&doc), vec!["shown"]);
     }
 }
