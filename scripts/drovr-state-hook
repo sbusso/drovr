@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+"""drovr state hook for Claude Code and Codex.
+
+Usage: drovr-state-hook claude|codex   (hook JSON on stdin)
+
+Reports what the agent is doing and what it waits for as herdr pane metadata
+tokens from source `drovr-state`, for the drovr sidebar and inbox
+(docs/design/inbox-pane.md, section 8):
+
+  drovr_state        <kind>|<unix s>: idle, working, asks, finished, limit,
+                     denied or exited, and the time of the last change or tool
+  drovr_doing        the running tool, for example "Bash cargo test"
+  drovr_wait         <kind>|<req8>|<sub?>|<summary> for the oldest pending
+                     request; kind is permission, question or plan
+  drovr_o1-drovr_o4  option labels of a single-select question
+  drovr_diff         diffstat of a pending Edit or Write, or "<n> lines" for a plan
+  drovr_last         first line of the last assistant message (a trailing "?"
+                     is kept)
+
+Claude's PermissionRequest input has no tool_use_id, so each PreToolUse is
+recorded as (tool_use_id, hash of tool_name and tool_input) and a
+PermissionRequest claims the oldest unclaimed record with the same hash.
+
+Pending requests are a set. PostToolUse and PostToolUseFailure with the
+claimed tool id, PermissionDenied and the request's own hook exit remove one;
+UserPromptSubmit, Stop, SessionStart, SessionEnd and an idle Notification clear
+the set. drovr_wait shows the oldest pending request.
+
+Claude PermissionRequest: after publishing, the hook waits for a decision file
+<state>/decide/<req8>.json (polled every 250 ms) and prints it as the hook
+decision. The file is a JSON object:
+  {"behavior": "allow"}                     allow once
+  {"behavior": "allow", "always": true}     allow with the request's
+                                            permission_suggestions
+  {"behavior": "deny", "message": "..."}    deny, with a note for Claude
+The hook exits without output when its request leaves the pending set or after
+DROVR_DECIDE_WAIT_S seconds (default 600); the dialog then stays on screen.
+Codex PermissionRequest: published only; its decision format is not verified,
+so the hook does not wait.
+
+<state> is $DROVR_STATE_HOOK_DIR, else <herdr state dir>/drovr/state-hook, where
+the herdr state dir is $XDG_STATE_HOME/herdr or ~/.local/state/herdr. Per-pane
+state lives in <state>/<pane>.json, locked with flock on <pane>.lock.
+
+Text is redacted (common secret shapes) before it is reported.
+DROVR_STATE_TEXT=0 reports kinds only: tool names, no commands, questions,
+options, paths or messages.
+
+Never fails the agent: errors go to <state>/errors.log and the hook exits 0.
+Install: drovr-install-hooks.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+import traceback
+
+SOURCE = "drovr-state"
+TOKEN_MAX = 80
+PRE_KEEP = 64
+PRE_TOOL_REPORT_GAP_NS = 2_000_000_000
+POLL_S = 0.25
+ERRORS_LOG_MAX = 256 * 1024
+TOKENS = (
+    "drovr_state",
+    "drovr_doing",
+    "drovr_wait",
+    "drovr_o1",
+    "drovr_o2",
+    "drovr_o3",
+    "drovr_o4",
+    "drovr_diff",
+    "drovr_last",
+)
+
+# ---------------------------------------------------------------- text
+
+
+REDACTIONS = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S), "***"),
+    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
+    (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1***@"),
+    (
+        re.compile(
+            r"(?i)([\w.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|auth|credential|private[_-]?key|access[_-]?key)[\w.-]*"
+            r"\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(r"(?i)(--?(?:token|password|passwd|secret|api-?key|auth|credentials?)\s+)(\"[^\"]*\"|'[^']*'|\S+)"),
+        r"\1***",
+    ),
+    (re.compile(r"(?i)(\s-p)(\S{4,})"), r"\1***"),
+    (
+        re.compile(
+            r"\b(sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+            r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|glpat-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35})"
+        ),
+        "***",
+    ),
+    # Long opaque strings with letters and digits (keys, hashes); paths and
+    # long identifiers without digits are kept.
+    (re.compile(r"\b(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[A-Za-z])[A-Za-z0-9+_-]{32,}={0,2}"), "***"),
+)
+
+
+def redact(text):
+    for pattern, replacement in REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def text_enabled():
+    return os.environ.get("DROVR_STATE_TEXT", "1") != "0"
+
+
+def one_line(text):
+    return " ".join(str(text).split())
+
+
+def cut(text, limit=TOKEN_MAX):
+    text = one_line(text)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def clean(text, limit=TOKEN_MAX):
+    """Redacted single line, at most `limit` characters; empty without text."""
+    if not text_enabled() or not text:
+        return ""
+    return cut(redact(str(text)), limit)
+
+
+def first_line(text):
+    for line in str(text).splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def rel_path(path, cwd):
+    if cwd and isinstance(path, str) and path.startswith(cwd.rstrip("/") + "/"):
+        return path[len(cwd.rstrip("/")) + 1 :]
+    return path
+
+
+def tool_arg(tool, tool_input, cwd):
+    """The argument that identifies a tool call, before redaction."""
+    if not isinstance(tool_input, dict):
+        return ""
+    command = tool_input.get("command") or tool_input.get("cmd")
+    if isinstance(command, list):
+        command = " ".join(str(part) for part in command)
+    if isinstance(command, str) and command:
+        return first_line(command)
+    for key in ("file_path", "notebook_path", "path"):
+        if isinstance(tool_input.get(key), str):
+            return rel_path(tool_input[key], cwd)
+    for key in ("pattern", "url", "query", "description", "prompt"):
+        if isinstance(tool_input.get(key), str):
+            return first_line(tool_input[key])
+    return ""
+
+
+def tool_summary(tool, tool_input, cwd):
+    tool = tool or "tool"
+    if not text_enabled():
+        return cut(tool)
+    arg = tool_arg(tool, tool_input, cwd)
+    return clean(f"{tool} {arg}" if arg else tool)
+
+
+def line_count(text):
+    return len(text.splitlines()) if isinstance(text, str) and text else 0
+
+
+def diffstat(tool, tool_input, cwd):
+    if not text_enabled() or not isinstance(tool_input, dict):
+        return ""
+    path = rel_path(tool_input.get("file_path") or "", cwd)
+    if tool == "Write":
+        added, removed = line_count(tool_input.get("content")), 0
+    elif tool == "Edit":
+        added, removed = line_count(tool_input.get("new_string")), line_count(tool_input.get("old_string"))
+    elif tool == "MultiEdit":
+        edits = [e for e in tool_input.get("edits") or [] if isinstance(e, dict)]
+        added = sum(line_count(e.get("new_string")) for e in edits)
+        removed = sum(line_count(e.get("old_string")) for e in edits)
+    else:
+        return ""
+    return clean(f"+{added} −{removed} {path}")
+
+
+def plan_title(plan):
+    for line in str(plan).splitlines():
+        if line.strip():
+            return line.strip().lstrip("#").strip()
+    return "plan"
+
+
+# ---------------------------------------------------------------- state
+
+
+def state_root():
+    explicit = os.environ.get("DROVR_STATE_HOOK_DIR")
+    if explicit:
+        return explicit
+    base = os.environ.get("XDG_STATE_HOME")
+    herdr_state = os.path.join(base, "herdr") if base else os.path.expanduser("~/.local/state/herdr")
+    return os.path.join(herdr_state, "drovr", "state-hook")
+
+
+def log_error(message):
+    try:
+        root = state_root()
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, "errors.log")
+        if os.path.exists(path) and os.path.getsize(path) > ERRORS_LOG_MAX:
+            os.replace(path, path + ".1")
+        with open(path, "a") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message.rstrip()}\n")
+    except OSError:
+        pass
+
+
+def new_state():
+    return {
+        "kind": None,
+        "ts": 0,
+        "doing": "",
+        "last": "",
+        "pre": [],
+        "pending": [],
+        "reported": {},
+        "report_ns": 0,
+        "pre_report_ns": 0,
+    }
+
+
+class PaneState:
+    """Per-pane state file under an exclusive flock (context manager)."""
+
+    def __init__(self, pane):
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", pane)
+        root = state_root()
+        os.makedirs(root, exist_ok=True)
+        self.path = os.path.join(root, f"{safe}.json")
+        self.lock_path = os.path.join(root, f"{safe}.lock")
+
+    def __enter__(self):
+        self.lock = open(self.lock_path, "a")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.data = read_state(self.path)
+        return self
+
+    def save(self):
+        tmp = f"{self.path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as handle:
+            json.dump(self.data, handle)
+        os.replace(tmp, self.path)
+
+    def __exit__(self, *exc):
+        self.lock.close()
+
+
+def read_state(path):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+        return {**new_state(), **data} if isinstance(data, dict) else new_state()
+    except (OSError, ValueError):
+        return new_state()
+
+
+def tool_hash(tool, tool_input):
+    raw = json.dumps([tool, tool_input], sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def set_kind(state, kind, now_s):
+    if state["kind"] != kind:
+        state["kind"] = kind
+        state["ts"] = now_s
+
+
+def desired_tokens(state):
+    tokens = dict.fromkeys(TOKENS)
+    if state["kind"]:
+        tokens["drovr_state"] = f"{state['kind']}|{state['ts']}"
+    tokens["drovr_doing"] = state["doing"] or None
+    tokens["drovr_last"] = state["last"] or None
+    if state["pending"]:
+        req = state["pending"][0]
+        head = f"{req['kind']}|{req['req']}|{'sub' if req.get('sub') else ''}|"
+        tokens["drovr_wait"] = head + cut(req.get("summary") or "", TOKEN_MAX - len(head)) if req.get("summary") else head
+        for index, label in enumerate((req.get("options") or [])[:4], start=1):
+            tokens[f"drovr_o{index}"] = label or None
+        tokens["drovr_diff"] = req.get("diff") or None
+    return tokens
+
+
+def report(state, pane, throttle=False):
+    """Send the tokens that changed since the last successful report."""
+    tokens = desired_tokens(state)
+    changed = {k: v for k, v in tokens.items() if state["reported"].get(k) != v}
+    if not changed:
+        return
+    now_ns = time.time_ns()
+    if throttle and now_ns - state["pre_report_ns"] < PRE_TOOL_REPORT_GAP_NS:
+        return
+    # The seq is taken here, under the pane lock, not at hook start: every
+    # report carries the full current state, so ordering by lock order keeps
+    # a slow hook (a waiting PermissionRequest) from being dropped by herdr.
+    seq = max(now_ns, state["report_ns"] + 1)
+    args = []
+    for key, value in sorted(changed.items()):
+        args += ["--token", f"{key}={value}"] if value else ["--clear-token", key]
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    try:
+        result = subprocess.run(
+            [herdr, "pane", "report-metadata", pane, "--source", SOURCE, "--seq", str(seq), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        log_error(f"report-metadata failed: {error}")
+        return
+    if result.returncode != 0:
+        log_error(f"report-metadata exit {result.returncode}: {result.stderr.decode(errors='replace')}")
+        return
+    state["report_ns"] = seq
+    if throttle:
+        state["pre_report_ns"] = seq
+    state["reported"] = {k: v for k, v in tokens.items() if v}
+
+
+# ---------------------------------------------------------------- events
+
+
+def remove_request(state, predicate):
+    before = len(state["pending"])
+    state["pending"] = [req for req in state["pending"] if not predicate(req)]
+    return len(state["pending"]) != before
+
+
+def turn_boundary(state):
+    state["pending"] = []
+    state["pre"] = []
+    state["doing"] = ""
+
+
+def last_message(hook):
+    message = hook.get("last_assistant_message")
+    if isinstance(message, str) and message.strip():
+        return message
+    return transcript_last_message(hook.get("transcript_path"))
+
+
+def transcript_last_message(path):
+    """Text of the last assistant entry in a Claude transcript tail."""
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return ""
+    with open(path, "rb") as handle:
+        handle.seek(max(0, os.path.getsize(path) - 256 * 1024))
+        lines = handle.read().splitlines()
+    for raw in reversed(lines):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if isinstance(content, str):
+            return content
+        texts = [c.get("text", "") for c in content or [] if isinstance(c, dict) and c.get("type") == "text"]
+        if any(t.strip() for t in texts):
+            return "\n".join(texts)
+    return ""
+
+
+def last_summary(message):
+    """First line of the message; a "?" that ends the message is kept."""
+    if not text_enabled():
+        return ""
+    line = clean(first_line(message))
+    if message.rstrip().endswith("?") and not line.endswith("?"):
+        line = line[: TOKEN_MAX - 1].rstrip("…") + "?"
+    return line
+
+
+def build_request(agent, hook, tool_id):
+    """The pending request for a PermissionRequest, or None for prompts the
+    inbox cannot represent (they stay jump-only dialog items)."""
+    tool = hook.get("tool_name") or ""
+    tool_input = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
+    cwd = hook.get("cwd") or ""
+    req = {
+        "req": secrets.token_hex(4),
+        "tool_use_id": tool_id,
+        "sub": bool(hook.get("agent_id")),
+        "agent": agent,
+        "pid": os.getpid(),
+    }
+    if tool == "AskUserQuestion":
+        questions = tool_input.get("questions") or []
+        if len(questions) != 1 or not isinstance(questions[0], dict):
+            return None
+        question = questions[0]
+        options = question.get("options") or []
+        if question.get("multiSelect") or not 1 <= len(options) <= 4:
+            return None
+        labels = [(o.get("label") if isinstance(o, dict) else o) or "" for o in options]
+        req.update(kind="question", summary=clean(question.get("question")), options=[clean(x) for x in labels])
+    elif tool == "ExitPlanMode":
+        plan = tool_input.get("plan") or ""
+        req.update(kind="plan", summary=clean(plan_title(plan)))
+        req["diff"] = f"{line_count(plan)} lines" if text_enabled() else ""
+        if isinstance(tool_input.get("planFilePath"), str):
+            req["plan_path"] = tool_input["planFilePath"]
+    else:
+        req.update(kind="permission", summary=tool_summary(tool, tool_input, cwd))
+        req["diff"] = diffstat(tool, tool_input, cwd)
+    return req
+
+
+def handle_event(agent, hook, pane, state, now_s):
+    """Apply one hook event to the pane state. Returns (request, throttle):
+    the request this invocation added (PermissionRequest), and whether the
+    report may be throttled."""
+    event = hook.get("hook_event_name") or ""
+    sub = bool(hook.get("agent_id"))
+    tool = hook.get("tool_name") or ""
+    tool_input = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
+    tool_id = hook.get("tool_use_id") if isinstance(hook.get("tool_use_id"), str) else None
+    cwd = hook.get("cwd") or ""
+
+    if event == "SessionStart":
+        turn_boundary(state)
+        state["last"] = ""
+        set_kind(state, "idle", now_s)
+    elif event == "UserPromptSubmit":
+        turn_boundary(state)
+        state["last"] = ""
+        set_kind(state, "working", now_s)
+    elif event == "PreToolUse":
+        if tool_id:
+            state["pre"].append([tool_id, tool_hash(tool, tool_input), False])
+            state["pre"] = state["pre"][-PRE_KEEP:]
+        if not sub:
+            state["doing"] = tool_summary(tool, tool_input, cwd)
+            state["kind"] = "working"
+            state["ts"] = now_s
+            return None, True
+    elif event in ("PostToolUse", "PostToolUseFailure"):
+        if tool_id:
+            state["pre"] = [p for p in state["pre"] if p[0] != tool_id]
+            remove_request(state, lambda r: r.get("tool_use_id") == tool_id)
+        if not sub:
+            state["doing"] = ""
+    elif event == "PermissionRequest":
+        if not tool_id:
+            digest = tool_hash(tool, tool_input)
+            for record in state["pre"]:
+                if not record[2] and record[1] == digest:
+                    record[2] = True
+                    tool_id = record[0]
+                    break
+        req = build_request(agent, hook, tool_id)
+        if req:
+            state["pending"].append(req)
+        return req, False
+    elif event == "PermissionDenied":
+        if tool_id:
+            remove_request(state, lambda r: r.get("tool_use_id") == tool_id)
+        else:
+            digest = tool_hash(tool, tool_input)
+            ids = {p[0] for p in state["pre"] if p[1] == digest}
+            remove_request(state, lambda r: r.get("tool_use_id") in ids)
+        if not sub:
+            state["doing"] = ""
+            state["last"] = clean(f"denied: {tool_summary(tool, tool_input, cwd)}")
+            set_kind(state, "denied", now_s)
+    elif event == "Notification":
+        # An idle prompt means no dialog is open: a permission answered "No"
+        # or interrupted with Esc in the terminal fires no other event.
+        kind = hook.get("notification_type") or ""
+        message = str(hook.get("message") or "")
+        if kind == "idle_prompt" or "waiting for your input" in message:
+            turn_boundary(state)
+    elif event == "Stop":
+        turn_boundary(state)
+        message = last_message(hook)
+        state["last"] = last_summary(message)
+        set_kind(state, "asks" if message.rstrip().endswith("?") else "finished", now_s)
+    elif event == "StopFailure":
+        turn_boundary(state)
+        error = str(hook.get("error") or "error")
+        details = hook.get("error_details") or hook.get("message") or ""
+        if error == "rate_limit":
+            state["last"] = "rate limit"
+            set_kind(state, "limit", now_s)
+        else:
+            state["last"] = clean(f"error: {error} {details}".strip()) or "error"
+            set_kind(state, "finished", now_s)
+    elif event == "SessionEnd":
+        exited = state["kind"] == "working"
+        turn_boundary(state)
+        state["last"] = ""
+        # Section 2 "exited": a session that ends mid-turn stays visible.
+        if exited:
+            set_kind(state, "exited", now_s)
+        else:
+            state["kind"] = None
+    return None, False
+
+
+# ---------------------------------------------------------------- decisions
+
+
+def decide_path(req):
+    return os.path.join(state_root(), "decide", f"{req}.json")
+
+
+def read_decision(path):
+    """A validated decision from the inbox, or None. Invalid files are
+    logged and removed so a corrected one can follow."""
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        log_error(f"invalid decision file {path}: {error}")
+        remove_file(path)
+        return None
+    message = data.get("message") if isinstance(data, dict) else None
+    valid = (
+        isinstance(data, dict)
+        and data.get("behavior") in ("allow", "deny")
+        and isinstance(data.get("always", False), bool)
+        and (message is None or (isinstance(message, str) and len(message) <= 4000))
+    )
+    if not valid:
+        log_error(f"invalid decision file {path}: {str(data)[:200]}")
+        remove_file(path)
+        return None
+    return data
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def decision_output(decision, hook):
+    if decision["behavior"] == "allow":
+        result = {"behavior": "allow"}
+        suggestions = hook.get("permission_suggestions")
+        if decision.get("always") and isinstance(suggestions, list) and suggestions:
+            result["updatedPermissions"] = suggestions
+    else:
+        result = {"behavior": "deny", "message": decision.get("message") or "Denied in drovr"}
+    return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": result}}
+
+
+def still_pending(path, req):
+    return any(r.get("req") == req for r in read_state(path)["pending"])
+
+
+def wait_for_decision(pane, hook, req):
+    """Poll for the inbox's decision until the request leaves the pending set
+    or the wait limit passes. Returns the hook output or None."""
+    try:
+        limit = float(os.environ.get("DROVR_DECIDE_WAIT_S", "600"))
+    except ValueError:
+        limit = 600.0
+    deadline = time.monotonic() + limit
+    path = decide_path(req["req"])
+    state_path = PaneState(pane).path
+    while time.monotonic() < deadline:
+        decision = read_decision(path)
+        if decision is not None:
+            with PaneState(pane) as pane_state:
+                # A decision counts only while its request is pending: a stale
+                # file for a finished request is ignored.
+                if not any(r.get("req") == req["req"] for r in pane_state.data["pending"]):
+                    return None
+            return decision_output(decision, hook)
+        if not still_pending(state_path, req["req"]):
+            return None
+        time.sleep(POLL_S)
+    return None
+
+
+def finish_request(pane, req):
+    """The request's own hook exit: drop it and report the next one."""
+    remove_file(decide_path(req["req"]))
+    with PaneState(pane) as pane_state:
+        if remove_request(pane_state.data, lambda r: r.get("req") == req["req"]):
+            report(pane_state.data, pane)
+            pane_state.save()
+
+
+# ---------------------------------------------------------------- main
+
+
+def on_signal(signum, _frame):
+    raise SystemExit(0)
+
+
+def main():
+    agent = sys.argv[1] if len(sys.argv) > 1 else "claude"
+    raw = sys.stdin.read()
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return
+    hook = json.loads(raw) if raw.strip() else {}
+    if not isinstance(hook, dict):
+        return
+    now_s = int(time.time())
+    with PaneState(pane) as pane_state:
+        req, throttle = handle_event(agent, hook, pane, pane_state.data, now_s)
+        report(pane_state.data, pane, throttle=throttle)
+        pane_state.save()
+    # Codex: the PermissionRequest decision format is not verified yet, so the
+    # request is published only; its end events remove it.
+    if not req or agent != "claude":
+        return
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, on_signal)
+    output = None
+    try:
+        output = wait_for_decision(pane, hook, req)
+    finally:
+        finish_request(pane, req)
+    if output:
+        sys.stdout.write(json.dumps(output))
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        pass
+    except Exception:  # noqa: BLE001 - a state hook must never break the agent
+        log_error(traceback.format_exc())
+    sys.exit(0)

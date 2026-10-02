@@ -197,8 +197,11 @@ PostToolUse, PostToolUseFailure, PermissionRequest, PermissionDenied,
 Notification, Stop, StopFailure and SessionEnd, for Claude and for Codex
 (`~/.codex/hooks.json` PermissionRequest).
 
-- `--seq` is `time.time_ns()` taken at hook start, as herdr's own hook does;
-  herdr drops reports whose seq is not newer.
+- `--seq` is `time.time_ns()` taken under the pane lock when the report is
+  sent; herdr drops reports whose seq is not newer. (Draft 3 said "at hook
+  start", as herdr's own hook does. Each report carries the merged pane state,
+  so a seq from hook start would let herdr drop a newer state, and a waiting
+  PermissionRequest hook's exit report would always be dropped.)
 - Per-pane state lives in `<state_dir>/drovr/state-hook/<pane>.json` under
   `flock`.
 - Claude's PermissionRequest input has no `tool_use_id` (section 11). The hook
@@ -209,24 +212,32 @@ Notification, Stop, StopFailure and SessionEnd, for Claude and for Codex
 - Each PermissionRequest gets a random 8-character request id. Pending requests
   are a set: PostToolUse and PostToolUseFailure with the claimed tool id,
   PermissionDenied, and the request's own hook exit remove one;
-  UserPromptSubmit, Stop, SessionStart and SessionEnd clear the set.
+  UserPromptSubmit, Stop, SessionStart, SessionEnd and an idle Notification
+  (`notification_type` `idle_prompt`) clear the set. The idle Notification is
+  the only event after "No" or Esc in the terminal (section 11).
+- AskUserQuestion with several questions, multi-select or more than 4
+  options does not enter the set; the hook exits at once and herdr's blocked
+  state makes it a dialog item.
   `drovr_wait` always reflects the oldest pending request, so parallel tools do
   not wipe each other.
 - Subagent events (`agent_id` set): PreToolUse is ignored for `drovr_doing`;
   PermissionRequest is kept and the item is labelled "subagent".
-- The hook skips a report when no value changed, and PreToolUse reports at most
-  every 2 s. No TTL: a TTL makes every report count as changed and pushes a
+- The hook skips a report when no value changed, and a PreToolUse report
+  follows the previous PreToolUse report by at least 2 s; a held-back value
+  goes out with the next report. Ceiling: a long tool that starts within 2 s
+  of the previous one shows the previous tool in `drovr_doing` until the next
+  event; a trailing report would need a background process. No TTL: a TTL makes every report count as changed and pushes a
   snapshot to every client.
 - On failure (for example `metadata_token_limit`) the hook appends stderr to
   `<state_dir>/drovr/state-hook/errors.log` and exits 0.
 
 | Key | Value (≤ 80 chars) | Cleared by |
 |---|---|---|
-| `drovr_state` | `<kind>\|<unix s>` | SessionEnd |
+| `drovr_state` | `<kind>\|<unix s>`: idle, working, asks, finished, limit, denied, exited; the time is the last kind change or reported PreToolUse | SessionEnd (set to `exited` when the session ends while working) |
 | `drovr_doing` | `Bash cargo test` | PostToolUse, Stop |
 | `drovr_wait` | `<kind>\|<req8>\|<sub?>\|<summary>` | request end, prompt, Stop |
 | `drovr_o1`-`drovr_o4` | option labels, single-select question only | same as `drovr_wait` |
-| `drovr_diff` | diffstat for Edit, Write | same as `drovr_wait` |
+| `drovr_diff` | diffstat for Edit, Write; `<n> lines` for a plan | same as `drovr_wait` |
 | `drovr_last` | first line of the last message; `?` suffix kept | UserPromptSubmit |
 
 Token budget: the 32-key limit is per terminal across all sources, and going
@@ -270,6 +281,10 @@ can still answer in the terminal (section 11).
    - `n`, `r`: `{"behavior": "deny", "message": "<note or 'Denied in drovr'>"}`
    - `a`: `allow` with `updatedPermissions` from the request's
      `permission_suggestions` (documented, to verify in build step 2).
+   The decision file is `{"behavior": "allow"}`, `{"behavior": "allow",
+   "always": true}` or `{"behavior": "deny", "message": "..."}`; any other
+   content is logged and removed. A file whose request is no longer pending is
+   ignored.
 4. The hook exits with no output when its request leaves the pending set
    (terminal answer, turn end) or after the wait limit (default 10 min,
    `DROVR_DECIDE_WAIT_S`). The dialog then stays, and the item falls back to
@@ -281,7 +296,10 @@ ignores the hook's later output (verified). If the hook answers first, the
 dialog closes and a late keypress lands in the prompt input, not in a dialog.
 
 Codex: its PermissionRequest hook decision format is not verified yet; Codex
-permissions use the key path below until it is.
+permissions use the key path below until it is. The hook publishes the Codex request and exits
+at once; Codex has no PostToolUseFailure, PermissionDenied, Notification,
+StopFailure or SessionEnd hooks, so its request is removed by the claimed
+tool's PostToolUse or a turn boundary.
 
 ### Question and plan items: keys
 
@@ -382,8 +400,22 @@ Verified:
   `allow`, including `updatedInput.answers` for the question, leaves the
   dialog open.
 
-Documented, not verified: `updatedPermissions` on allow; the 600 s default
-hook timeout; PermissionRequest does not fire in `-p` mode.
+Verified in build step 2 (same setup, hooks from drovr-state-hook):
+
+- PreToolUse matching: the PermissionRequest claimed the PreToolUse
+  `tool_use_id`, and the terminal answer's PostToolUse removed the request.
+- A decision file `deny` with a message closed the dialog.
+- `allow` with `updatedPermissions` from `permission_suggestions` writes the
+  suggestion: for `curl -sI https://example.com` the suggestion was
+  `addRules` `Bash(curl -sI https://example.com)` to `localSettings`; the
+  hook wrote that rule to `.claude/settings.local.json`, and the same command
+  then ran without a dialog. The dialog's own option offered the broader
+  `curl *`, so `a` grants the exact command only. For a write redirect the
+  suggestion was `addDirectories` for the session, and neither the hook nor
+  the dialog's option 2 stopped the next prompt.
+
+Documented, not verified: the 600 s default hook timeout; PermissionRequest
+does not fire in `-p` mode.
 
 ## Decisions
 
@@ -412,13 +444,14 @@ hook timeout; PermissionRequest does not fire in `-p` mode.
 
 1. Answered: the inbox is drawn by the client (section 3), so it is the same
    on local and remote workspaces.
-2. Does `allow` with `updatedPermissions` from `permission_suggestions` behave
-   like the dialog's "always" option? Verify in build step 2.
-3. What is Codex's PermissionRequest decision format, and does Codex keep its
+2. What is Codex's PermissionRequest decision format, and does Codex keep its
    dialog on screen while the hook waits?
 
 Answered:
 
+- Does `allow` with `updatedPermissions` behave like the dialog's "always"
+  option? It applies the request's suggestion, which can be narrower than the
+  dialog's option (exact command rather than `curl *`); see section 11.
 - Does Claude keep its dialog on screen while a PermissionRequest hook waits,
   and can the hook return the decision? Yes to both for Bash (section 11).
   Permission answers use the hook; for AskUserQuestion and ExitPlanMode only

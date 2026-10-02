@@ -1,63 +1,165 @@
 #!/usr/bin/env bash
-# Install drovr's Claude Code integration on this machine (run on every machine
-# where agents run):
+# Install drovr's Claude Code and Codex integration on this machine (run on
+# every machine where agents run):
 # - the usage hook: copied to ~/.local/bin and registered for the Stop,
 #   SessionStart and UserPromptSubmit events in ~/.claude/settings.json;
 # - the plan hook: copied to ~/.local/bin and registered for PostToolUse on
 #   Write|Edit|MultiEdit, so plan-mode plans open in the doc pane;
+# - the state hook: copied to ~/.local/bin and registered for the inbox events
+#   in ~/.claude/settings.json and, when ~/.codex exists, ~/.codex/hooks.json;
 # - the drovr-docs skill: copied to ~/.claude/skills/drovr-docs/.
-# A backup of settings.json is kept and existing hooks are left untouched.
-# Files always come from sbusso/drovr (main), never from the current
-# directory: under `curl ... | bash` there is no script directory to resolve.
-# The plan hook and the skill are optional: a failed download skips them.
+# Each hook is appended to its event; existing hooks keep their order. A backup
+# of each changed settings file is kept.
+# --dry-run prints the settings diff and changes nothing:
+#   ssh host 'bash -s -- --dry-run' < scripts/drovr-install-hooks
+# Files come from sbusso/drovr (main), never from the current directory: under
+# `curl ... | bash` there is no script directory to resolve. DROVR_RAW
+# overrides the base URL (file:// works, for tests).
+# The plan hook, the state hook and the skill are optional: a failed download
+# skips them.
 set -euo pipefail
-raw=https://raw.githubusercontent.com/sbusso/drovr/main
-src="$(mktemp)"
-plan="$(mktemp)"
-skill="$(mktemp)"
-trap 'rm -f "$src" "$plan" "$skill"' EXIT
-curl -fsSL "$raw/scripts/drovr-usage-hook" -o "$src"
-mkdir -p "$HOME/.local/bin"
-install -m 0755 "$src" "$HOME/.local/bin/drovr-usage-hook"
-plan_hook=""
-if curl -fsSL "$raw/scripts/drovr-plan-hook" -o "$plan"; then
-  install -m 0755 "$plan" "$HOME/.local/bin/drovr-plan-hook"
-  plan_hook="$HOME/.local/bin/drovr-plan-hook"
-else
-  echo "plan hook not available; skipped" >&2
-fi
-if curl -fsSL "$raw/skills/drovr-docs/SKILL.md" -o "$skill"; then
-  mkdir -p "$HOME/.claude/skills/drovr-docs"
-  install -m 0644 "$skill" "$HOME/.claude/skills/drovr-docs/SKILL.md"
-  echo "installed skill: $HOME/.claude/skills/drovr-docs/SKILL.md"
-else
-  echo "drovr-docs skill not available; skipped" >&2
-fi
+dry_run=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=1 ;;
+    *) echo "usage: drovr-install-hooks [--dry-run]" >&2; exit 2 ;;
+  esac
+done
+raw="${DROVR_RAW:-https://raw.githubusercontent.com/sbusso/drovr/main}"
+bin="$HOME/.local/bin"
+usage_hook="$bin/drovr-usage-hook"
+plan_hook="$bin/drovr-plan-hook"
+state_hook="$bin/drovr-state-hook"
 settings="$HOME/.claude/settings.json"
-[ -f "$settings" ] || echo '{}' > "$settings"
-cp "$settings" "$settings.bak-pre-drovr-usage"
-python3 - "$settings" "$HOME/.local/bin/drovr-usage-hook" "$plan_hook" <<'EOF'
-import json, sys
-path, usage, plan = sys.argv[1], sys.argv[2], sys.argv[3]
-settings = json.load(open(path))
-hooks = settings.setdefault("hooks", {})
+codex_hooks=""
+[ -d "$HOME/.codex" ] && codex_hooks="$HOME/.codex/hooks.json"
 
-def register(event, command, matcher=None):
-    groups = hooks.setdefault(event, [])
-    if not any(h.get("command") == command for group in groups for h in group.get("hooks", [])):
-        group = {"hooks": [{"type": "command", "command": command}]}
-        if matcher:
-            group = {"matcher": matcher, **group}
-        groups.append(group)
-    print(f"registered for {event}:", command)
+if [ "$dry_run" = 0 ]; then
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL "$raw/scripts/drovr-usage-hook" -o "$tmp/usage"
+  mkdir -p "$bin"
+  install -m 0755 "$tmp/usage" "$usage_hook"
+  if curl -fsSL "$raw/scripts/drovr-plan-hook" -o "$tmp/plan"; then
+    install -m 0755 "$tmp/plan" "$plan_hook"
+  else
+    echo "plan hook not available; skipped" >&2
+    plan_hook=""
+  fi
+  if curl -fsSL "$raw/scripts/drovr-state-hook" -o "$tmp/state"; then
+    install -m 0755 "$tmp/state" "$state_hook"
+  else
+    echo "state hook not available; skipped" >&2
+    state_hook=""
+  fi
+  if curl -fsSL "$raw/skills/drovr-docs/SKILL.md" -o "$tmp/skill"; then
+    mkdir -p "$HOME/.claude/skills/drovr-docs"
+    install -m 0644 "$tmp/skill" "$HOME/.claude/skills/drovr-docs/SKILL.md"
+    echo "installed skill: $HOME/.claude/skills/drovr-docs/SKILL.md"
+  else
+    echo "drovr-docs skill not available; skipped" >&2
+  fi
+fi
 
-for event in ("Stop", "SessionStart", "UserPromptSubmit"):
-    register(event, f"python3 {usage}")
-if plan:
-    register("PostToolUse", f"python3 {plan}", "Write|Edit|MultiEdit")
-json.dump(settings, open(path, "w"), indent=2)
+python3 - "$dry_run" "$settings" "$codex_hooks" "$usage_hook" "$plan_hook" "$state_hook" <<'EOF'
+import difflib, json, os, shutil, sys
+
+dry_run = sys.argv[1] == "1"
+settings, codex_hooks, usage, plan, state = sys.argv[2:7]
+# The PermissionRequest hook waits up to DROVR_DECIDE_WAIT_S (600 s) for an
+# inbox decision; Claude must not kill it first.
+DECIDE_TIMEOUT = 605
+CLAUDE_STATE_EVENTS = (
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+    "PostToolUseFailure", "PermissionRequest", "PermissionDenied",
+    "Notification", "Stop", "StopFailure", "SessionEnd",
+)
+# Codex has no PostToolUseFailure, PermissionDenied, Notification,
+# StopFailure or SessionEnd hooks.
+CODEX_STATE_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop")
+
+
+def load(path):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return {}
+
+
+def register(data, event, command, matcher=None, timeout=None):
+    """Append a hook group for `command`, unless one exists; an existing
+    entry keeps its place and only gets the expected timeout."""
+    groups = data.setdefault("hooks", {}).setdefault(event, [])
+    for group in groups:
+        for hook in group.get("hooks", []):
+            if hook.get("command") == command:
+                if timeout is not None:
+                    hook["timeout"] = timeout
+                return
+    hook = {"type": "command", "command": command}
+    if timeout is not None:
+        hook["timeout"] = timeout
+    group = {"hooks": [hook]}
+    if matcher:
+        group = {"matcher": matcher, **group}
+    groups.append(group)
+
+
+def state_hooks(data, agent, events):
+    command = f"python3 {state} {agent}"
+    for event in events:
+        register(data, event, command, timeout=DECIDE_TIMEOUT if event == "PermissionRequest" else 10)
+
+
+def apply(path, edit):
+    before = load(path)
+    after = json.loads(json.dumps(before))
+    edit(after)
+    old = json.dumps(before, indent=2).splitlines(keepends=True)
+    new = json.dumps(after, indent=2).splitlines(keepends=True)
+    diff = "".join(difflib.unified_diff(old, new, path, path + " (drovr)"))
+    if not diff:
+        print(f"{path}: no change")
+        return
+    if dry_run:
+        sys.stdout.write(diff if diff.endswith("\n") else diff + "\n")
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    existed = os.path.exists(path)
+    if existed:
+        shutil.copy2(path, path + ".bak-pre-drovr")
+    tmp = path + ".drovr.tmp"
+    with open(tmp, "w") as handle:
+        json.dump(after, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp, path)
+    print(f"updated {path} (backup: {path}.bak-pre-drovr)" if existed else f"created {path}")
+
+
+def claude(data):
+    for event in ("Stop", "SessionStart", "UserPromptSubmit"):
+        register(data, event, f"python3 {usage}")
+    if plan:
+        register(data, "PostToolUse", f"python3 {plan}", "Write|Edit|MultiEdit")
+    if state:
+        state_hooks(data, "claude", CLAUDE_STATE_EVENTS)
+
+
+apply(settings, claude)
+if codex_hooks and state:
+    apply(codex_hooks, lambda data: state_hooks(data, "codex", CODEX_STATE_EVENTS))
 EOF
-echo "drovr hooks installed (backup: $settings.bak-pre-drovr-usage)"
+
+if [ "$dry_run" = 1 ]; then
+  echo "dry run: nothing changed"
+  exit 0
+fi
+echo "drovr hooks installed"
+if [ -n "$codex_hooks" ] && [ -n "$state_hook" ]; then
+  echo "Codex runs hooks only with codex_hooks enabled in ~/.codex/config.toml"
+  echo "(herdr's codex integration enables it)."
+fi
 cat <<'EOF'
 
 To open Markdown links in a doc pane (Ctrl+click), install the herdr plugin
