@@ -139,7 +139,11 @@ impl ClientShellState {
                     })
                     .collect::<Vec<_>>()
             } else {
-                super::drovr_sidebar::ordered_workspaces(&self.endpoints, &self.active_endpoint_id)
+                super::drovr_sidebar::ordered_workspaces(
+                    &self.endpoints,
+                    &self.active_endpoint_id,
+                    self.config.show_empty_workspaces,
+                )
             };
             if workspaces.is_empty() {
                 return true;

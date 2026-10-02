@@ -338,7 +338,9 @@ fn workspace_presence(
 }
 
 /// Sidebar rows for `layout`. `show_empty` false drops workspaces without
-/// agents from the structured view (`[ui.sidebar] show_empty_workspaces`).
+/// agents, except the focused one and new ones (`[ui.sidebar]
+/// show_empty_workspaces`; callers apply it to the structured view only, see
+/// [`shows_empty`]).
 fn build_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
@@ -475,7 +477,7 @@ fn build_rows(
             if layout.active_only && !current {
                 continue;
             }
-            if structured && workspace_agents.is_empty() && !show_empty {
+            if !show_empty && workspace_agents.is_empty() && !focused_here && !new_workspace {
                 continue;
             }
             presences.push(presence);
@@ -485,8 +487,11 @@ fn build_rows(
                 .filter(|agent| !layout.active_only || agent.current)
             {
                 agent_count += 1;
-                needs += usize::from(agent.presence.needs_attention());
-                blocked |= agent.presence == Presence::Blocked;
+                // Like the global badge: only agents you can reach and see.
+                if !agent.stale && !hidden {
+                    needs += usize::from(agent.presence.needs_attention());
+                    blocked |= agent.presence == Presence::Blocked;
+                }
             }
             let focused = workspace.focused && &endpoint.endpoint_id == active_endpoint_id;
             if layout.compact || workspace_agents.is_empty() {
@@ -592,20 +597,28 @@ fn build_rows(
     rows
 }
 
+/// Whether the sidebar draws workspaces without agents: always, except in the
+/// structured view with `show_empty_workspaces = false`.
+fn shows_empty(layout: &ProjectLayout, show_empty_workspaces: bool) -> bool {
+    show_empty_workspaces || !layout.structured || layout.compact
+}
+
 /// Workspaces in sidebar order, as alt+up/down should walk them: projects then
 /// Other, skipping hidden ones and (in the active view) inactive ones.
 /// Collapsed projects still count; collapsing is about space, not relevance.
 pub(super) fn ordered_workspaces(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
+    show_empty_workspaces: bool,
 ) -> Vec<(ClientEndpointId, String)> {
     let mut layout = projects::layout();
+    let show_empty = shows_empty(&layout, show_empty_workspaces);
     layout.compact = true;
     layout.other_collapsed = false;
     for group in &mut layout.groups {
         group.collapsed = false;
     }
-    build_rows(endpoints, active_endpoint_id, &layout, true)
+    build_rows(endpoints, active_endpoint_id, &layout, show_empty)
         .into_iter()
         .filter_map(|row| match row {
             Row::Workspace {
@@ -899,7 +912,7 @@ fn render_panel_with(
         endpoints,
         active_endpoint_id,
         layout,
-        config.show_empty_workspaces,
+        shows_empty(layout, config.show_empty_workspaces),
     );
     // One blank, inert line between the toggles and the first section.
     let body = Rect::new(
@@ -2900,6 +2913,17 @@ mod tests {
             ),
             "Access downgrade after renewal"
         );
+        // A name left on the pane by an earlier Claude session does not
+        // rename another agent running there now.
+        let mut codex = agent("p1", "w1", "codex", "");
+        codex.title = None;
+        codex.terminal_title_stripped = Some("Port the CLI".into());
+        codex.tokens = vec![
+            ("drovr_name".into(), "Old claude session".into()),
+            ("drovr_ctx".into(), "1200".into()),
+        ];
+        assert_eq!(agent_title(&codex, Some(&plain), None), "Port the CLI");
+        assert_eq!(projects::agent_context_tokens(&codex), None);
         // 2. A real terminal title.
         assert_eq!(title("Fix the parser", &[], &plain, None), "Fix the parser");
         // 3. The vendor's product name or the folder alone give way to the
@@ -3005,10 +3029,26 @@ mod tests {
         assert!((0..30).all(|y| !line(&buffer, y).contains("scratch")));
         let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, false);
         assert!(!describe(&rows).contains(&"W scratch -".to_owned()));
+        // ...unless it is the focused workspace, which stays reachable.
+        let mut focused = endpoints.clone();
+        if let Some(snapshot) = focused[0].snapshot.as_deref_mut() {
+            for workspace in &mut snapshot.workspaces {
+                workspace.focused = workspace.workspace_id == "w3";
+            }
+        }
+        let rows = build_rows(&focused, &ClientEndpointId::Local, &layout, false);
+        assert!(describe(&rows).contains(&"W scratch -".to_owned()));
         // Other views keep them.
         let mut detailed = layout.clone();
         detailed.structured = false;
-        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &detailed, false);
+        assert!(!shows_empty(&layout, false));
+        assert!(shows_empty(&detailed, false));
+        let rows = build_rows(
+            &endpoints,
+            &ClientEndpointId::Local,
+            &detailed,
+            shows_empty(&detailed, false),
+        );
         assert!(describe(&rows).contains(&"W scratch -".to_owned()));
         let config: crate::config::Config =
             toml::from_str("[ui.sidebar]\nshow_empty_workspaces = false\nagent_gap = 0\n")
@@ -3018,6 +3058,47 @@ mod tests {
         let defaults = crate::config::Config::default().ui.sidebar;
         assert!(defaults.show_empty_workspaces);
         assert_eq!(defaults.agent_gap, 1);
+    }
+
+    #[test]
+    fn header_needs_counts_skip_offline_machines_and_hidden_workspaces() {
+        let mut endpoints = fixture();
+        for endpoint in &mut endpoints {
+            if let Some(snapshot) = endpoint.snapshot.as_deref_mut() {
+                for agent in &mut snapshot.agents {
+                    agent.agent_status = AgentStatus::Blocked;
+                }
+            }
+        }
+        let needs = |endpoints: &[ClientShellEndpoint], layout: &ProjectLayout| {
+            build_rows(endpoints, &ClientEndpointId::Local, layout, true)
+                .into_iter()
+                .filter_map(|row| match row {
+                    Row::Header {
+                        label,
+                        needs,
+                        blocked,
+                        ..
+                    } => Some((label, needs, blocked)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut layout = structured_layout();
+        endpoints[1].status = ClientEndpointStatus::Online;
+        assert_eq!(
+            needs(&endpoints, &layout),
+            vec![("GTM".into(), 3, true), ("Other".into(), 1, true)]
+        );
+        // The remote machine drops offline; Code is hidden but shown.
+        endpoints[1].status = ClientEndpointStatus::Reconnecting;
+        layout.hidden = vec!["local/w2:Code".into()];
+        layout.show_hidden = true;
+        assert_eq!(
+            needs(&endpoints, &layout),
+            vec![("GTM".into(), 2, true), ("Other".into(), 0, false)]
+        );
+        assert_eq!(attention_count(&endpoints, &layout), (2, true));
     }
 
     #[test]
