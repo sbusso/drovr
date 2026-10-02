@@ -68,13 +68,15 @@ impl SavedSshApiBridge {
             }
         };
         let command = super::attach::cached_remote_api_command(&metadata, session);
+        // drovr fork: a per-process counter keeps two live bridges for one
+        // profile (an endpoint edited while the old bridge is still in use)
+        // from claiming the same socket.
+        static NEXT_BRIDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_BRIDGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
         let path = crate::platform::remote_bridge_endpoint_path(
-            &format!("herdr-api-ssh-{}-{profile_id}.sock", std::process::id()),
-            &format!(
-                "herdr-api-{}-{}.sock",
-                std::process::id(),
-                &profile_id[..16]
-            ),
+            &format!("herdr-api-ssh-{pid}-{n}-{profile_id}.sock"),
+            &format!("herdr-api-{pid}-{n}-{}.sock", &profile_id[..16]),
         );
         let bridge = SshStdioBridge::start_command(
             target.to_owned(),

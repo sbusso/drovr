@@ -33,4 +33,6 @@ pub(super) enum ClientLoopEvent {
         force: bool,
     },
     Timer,
+    /// drovr fork: a remote Ctrl+click doc open failed; shown as a notice.
+    RemoteDocOpenFailed(String),
 }

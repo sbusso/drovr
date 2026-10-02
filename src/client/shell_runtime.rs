@@ -53,9 +53,17 @@ pub(super) fn dispatch_client_shell_actions(
                 path,
             } => shell::open_local_document(workspace_id, Some(pane_id), path.into()),
             shell::ClientShellAction::OpenRemoteDocument { bridge, doc } => {
+                let failures = shell
+                    .as_deref()
+                    .and_then(|shell| shell.remote_doc_failures.clone());
                 std::thread::spawn(move || {
                     if let Err(err) = bridge.open_document(&doc) {
                         warn!(err = %err, path = %doc.path, "remote doc open failed");
+                        if let Some(failures) = failures {
+                            let _ = failures.blocking_send(ClientLoopEvent::RemoteDocOpenFailed(
+                                err.to_string(),
+                            ));
+                        }
                     }
                 });
             }

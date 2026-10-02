@@ -1058,6 +1058,10 @@ pub(crate) struct ClientShellState {
     pub(super) queued_notifications: VecDeque<ClientVisibleNotification>,
     pub(super) endpoint_notice_seen: HashSet<ClientEndpointNoticeKey>,
     pub(super) visible_endpoint_notice: Option<ClientVisibleEndpointNotice>,
+    /// drovr fork: where a remote doc open's thread reports a failure, so the
+    /// client loop shows it as a notice. `None` in tests and drops failures.
+    pub(in crate::client) remote_doc_failures:
+        Option<tokio::sync::mpsc::Sender<crate::client::events::ClientLoopEvent>>,
     pub(super) outer_focused: Option<bool>,
     pub(super) ascii_input_source_active: bool,
     pub(super) pending_input_source_changes: Vec<bool>,
@@ -1223,6 +1227,7 @@ impl ClientShellState {
             queued_notifications: VecDeque::new(),
             endpoint_notice_seen: HashSet::new(),
             visible_endpoint_notice: None,
+            remote_doc_failures: None,
             outer_focused: None,
             ascii_input_source_active: false,
             pending_input_source_changes: Vec::new(),

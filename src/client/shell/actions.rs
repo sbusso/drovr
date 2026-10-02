@@ -375,6 +375,16 @@ impl ClientShellState {
         true
     }
 
+    /// drovr fork: shows a failed remote Ctrl+click doc open.
+    pub(crate) fn push_remote_doc_failure(&mut self, message: String) -> bool {
+        self.push_endpoint_notice(
+            ClientEndpointNoticeKind::Rejected,
+            "drovr.doc.open",
+            "Document not opened",
+            message,
+        )
+    }
+
     pub(super) fn push_endpoint_method_with_kind(
         &mut self,
         method: crate::api::schema::Method,

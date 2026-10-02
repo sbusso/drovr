@@ -28,7 +28,10 @@ const DOCS_PLUGIN_ACTION: &str = "open-link";
 const DOCS_INVOCATION_SOURCE: &str = "drovr_click";
 /// Exit status of the doc open script when the SSH shell does not find drovr.
 const NO_DROVR: i32 = 127;
+/// Exit status of the doc open script when the path is not a regular file.
+const NOT_A_FILE: i32 = 66;
 const API_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const PLUGIN_INVOKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A Ctrl+clicked Markdown path in a pane of a remote endpoint. `path` is
 /// absolute or `~`-relative; the remote machine expands `~`.
@@ -76,8 +79,8 @@ impl EndpointBridge {
     }
 
     /// An API client for the endpoint's herdr server, after a read-only
-    /// status probe. A bridge started from stale cached metadata is
-    /// rediscovered once; other requests are never replayed.
+    /// status probe. A bridge whose metadata went stale is rediscovered
+    /// once; other requests are never replayed.
     pub(crate) fn api_client(&self) -> io::Result<ApiClient> {
         let mut api = self
             .api
@@ -112,10 +115,7 @@ impl EndpointBridge {
         };
         match probe(bridge) {
             Ok(client) => return Ok(client),
-            Err(error)
-                if bridge.used_cached_metadata
-                    && SavedSshApiBridge::stale_metadata_failure(&error) =>
-            {
+            Err(error) if SavedSshApiBridge::stale_metadata_failure(&error) => {
                 bridge.invalidate_metadata();
             }
             Err(error) => {
@@ -132,18 +132,40 @@ impl EndpointBridge {
 
     /// Shows `doc` in the doc pane of its workspace on the remote machine and
     /// focuses it: `drovr doc open` there, or the `drovr.docs` plugin when
-    /// the SSH shell does not find drovr.
+    /// the SSH shell does not find drovr or the machine runs Windows (no
+    /// POSIX shell).
     pub(crate) fn open_document(&self, doc: &RemoteDocOpen) -> io::Result<()> {
+        if self.cached_os().as_deref() == Some("windows") {
+            return self.open_document_with_plugin(doc);
+        }
         let output = self.run_sh(&doc_open_script(&self.profile.session, doc))?;
         match output.status.code() {
             Some(0) => Ok(()),
             Some(NO_DROVR) => self.open_document_with_plugin(doc),
+            Some(NOT_A_FILE) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} on {}: not a file", doc.path, self.profile.label),
+            )),
             _ => Err(io::Error::other(format!(
                 "drovr doc open on {}: {}",
                 self.profile.label,
                 String::from_utf8_lossy(&output.stderr).trim()
             ))),
         }
+    }
+
+    /// The OS recorded when the endpoint last connected, if any. Without
+    /// it, the POSIX shell is tried first.
+    fn cached_os(&self) -> Option<String> {
+        let profile = &self.profile;
+        crate::client::endpoint::SshMetadataCache::new(
+            profile.id.as_str(),
+            &profile.target,
+            &profile.session,
+        )
+        .ok()?
+        .load()
+        .map(|metadata| metadata.os)
     }
 
     fn open_document_with_plugin(&self, doc: &RemoteDocOpen) -> io::Result<()> {
@@ -153,7 +175,7 @@ impl EndpointBridge {
         };
         let response = self
             .api_client()?
-            .request_value(&request)
+            .request_value_with_timeout(&request, PLUGIN_INVOKE_TIMEOUT)
             .map_err(|error| io::Error::other(error.to_string()))?;
         match response.get("error") {
             Some(error) => Err(io::Error::other(format!(
@@ -166,13 +188,15 @@ impl EndpointBridge {
     }
 }
 
-/// The script `open_document` runs: drovr from the PATH, else from
-/// `~/.local/bin` (the PATH of a non-interactive SSH shell often lacks it),
-/// else exit `NO_DROVR`. The pane and workspace go in the environment, as
-/// they do for `drovr doc open` run inside a pane.
+/// The script `open_document` runs: exit `NOT_A_FILE` unless the path (with
+/// `~` expanded) is a regular file, since `drovr doc open` accepts a missing
+/// file and waits for it. Then drovr from the PATH, else from `~/.local/bin`
+/// (the PATH of a non-interactive SSH shell often lacks it), else exit
+/// `NO_DROVR`. The pane and workspace go in the environment, as they do for
+/// `drovr doc open` run inside a pane.
 fn doc_open_script(session: &str, doc: &RemoteDocOpen) -> String {
     format!(
-        "HERDR_PANE_ID={pane}\nHERDR_WORKSPACE_ID={workspace}\nexport HERDR_PANE_ID HERDR_WORKSPACE_ID\nunset HERDR_SOCKET_PATH HERDR_SESSION\ndrovr=$(command -v drovr 2>/dev/null) || drovr=\"$HOME/.local/bin/drovr\"\n[ -x \"$drovr\" ] || exit {NO_DROVR}\nexec \"$drovr\" --session {session} doc open --focus {path} </dev/null\n",
+        "HERDR_PANE_ID={pane}\nHERDR_WORKSPACE_ID={workspace}\nexport HERDR_PANE_ID HERDR_WORKSPACE_ID\nunset HERDR_SOCKET_PATH HERDR_SESSION\ndoc={path}\ncase $doc in \"~\") doc=$HOME ;; \"~/\"*) doc=$HOME/${{doc#\"~/\"}} ;; esac\n[ -f \"$doc\" ] || exit {NOT_A_FILE}\ndrovr=$(command -v drovr 2>/dev/null) || drovr=\"$HOME/.local/bin/drovr\"\n[ -x \"$drovr\" ] || exit {NO_DROVR}\nexec \"$drovr\" --session {session} doc open --focus \"$doc\" </dev/null\n",
         pane = shell_quote(&doc.pane_id),
         workspace = shell_quote(&doc.workspace_id),
         session = shell_quote(session),
@@ -258,20 +282,32 @@ mod tests {
         ));
         let home = root.join("home");
         std::fs::create_dir_all(&home).expect("home");
-        let expected = "--session|agents|doc|open|--focus|~/it's a plan.md|w1:p2 w1\n";
+        let expected = format!(
+            "--session|agents|doc|open|--focus|{}/it's a plan.md|w1:p2 w1\n",
+            home.display()
+        );
+
+        // The file does not exist: drovr is never run.
+        stub(&home.join(".local/bin/drovr"));
+        assert_eq!(
+            run(&home, "/usr/bin:/bin"),
+            (Some(NOT_A_FILE), String::new())
+        );
+        std::fs::remove_file(home.join(".local/bin/drovr")).expect("unstub");
+        std::fs::write(home.join("it's a plan.md"), "# plan\n").expect("doc");
 
         // No drovr anywhere: the plugin fallback's exit status.
         assert_eq!(run(&home, "/usr/bin:/bin"), (Some(NO_DROVR), String::new()));
 
         stub(&home.join(".local/bin/drovr"));
-        assert_eq!(run(&home, "/usr/bin:/bin"), (Some(0), expected.into()));
+        assert_eq!(run(&home, "/usr/bin:/bin"), (Some(0), expected.clone()));
 
         std::fs::remove_file(home.join("args")).expect("reset");
         std::fs::remove_file(home.join(".local/bin/drovr")).expect("unstub");
         let bin = root.join("bin");
         stub(&bin.join("drovr"));
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        assert_eq!(run(&home, &path), (Some(0), expected.into()));
+        assert_eq!(run(&home, &path), (Some(0), expected.clone()));
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
