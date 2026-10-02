@@ -68,10 +68,11 @@ pub(super) fn handle_shell_notification_effects(
                     warn!(err = %err, "failed to emit terminal notification");
                 }
             }
+            // andreconde fork (sheprd): clickable notify-send notification.
+            #[cfg(not(windows))]
             shell::ClientShellNotificationEffect::System {
                 title,
                 body,
-                #[cfg(not(windows))]
                 click: Some((endpoint_id, pane_id)),
                 ..
             } if sheprd_has_display() => {
