@@ -228,3 +228,26 @@ fn ctrl_click_on_a_local_relative_path_looks_one_directory_down() {
     );
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
+
+#[test]
+fn workflow_cue_click_opens_the_view_beside_its_agent() {
+    let mut state = md_state();
+    let mut outcome = ClientShellInput::default();
+    state.open_workflow_view(
+        super::super::drovr_sidebar::WorkflowHit {
+            rect: Rect::default(),
+            endpoint_id: ClientEndpointId::Local,
+            workspace_id: "ws_1".into(),
+            pane_id: "pane_1".into(),
+            doc: "/home/me/.cache/drovr/workflows/wf_1.md".into(),
+        },
+        &mut outcome,
+    );
+    assert!(matches!(
+        &outcome.actions[..],
+        [ClientShellAction::OpenLocalDocument { workspace_id, pane_id, path }]
+            if workspace_id == "ws_1"
+                && pane_id == "pane_1"
+                && path == "/home/me/.cache/drovr/workflows/wf_1.md"
+    ));
+}

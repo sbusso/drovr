@@ -983,6 +983,52 @@ pub(super) fn agent_session_name(agent: &crate::protocol::ClientShellAgent) -> O
         .filter(|name| !name.is_empty())
 }
 
+/// State of a Claude workflow, from the workflow hook's `drovr_wf` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkflowState {
+    Running,
+    Done,
+    Failed,
+}
+
+/// A Claude workflow's progress on an agent row: finished phases out of the
+/// script's phases, and the Markdown view the hook keeps up to date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkflowCue {
+    pub(super) state: WorkflowState,
+    pub(super) done: u16,
+    pub(super) total: u16,
+    /// The current phase ("state hook"), or how the run ended.
+    pub(super) phase: Option<String>,
+    pub(super) doc: Option<String>,
+}
+
+/// The workflow cue from `drovr_wf` ("running 2/6"), `drovr_wf_phase` and
+/// `drovr_wf_doc`.
+pub(super) fn agent_workflow(agent: &crate::protocol::ClientShellAgent) -> Option<WorkflowCue> {
+    let (state, count) = claude_token(agent, "drovr_wf")?.trim().split_once(' ')?;
+    let (done, total) = count.split_once('/')?;
+    let (done, total): (u16, u16) = (done.parse().ok()?, total.parse().ok()?);
+    Some(WorkflowCue {
+        state: match state {
+            "running" => WorkflowState::Running,
+            "done" => WorkflowState::Done,
+            "failed" => WorkflowState::Failed,
+            _ => return None,
+        },
+        done: done.min(total),
+        total: total.max(1),
+        phase: claude_token(agent, "drovr_wf_phase")
+            .map(str::trim)
+            .filter(|phase| !phase.is_empty())
+            .map(str::to_owned),
+        doc: claude_token(agent, "drovr_wf_doc")
+            .map(str::trim)
+            .filter(|doc| doc.starts_with('/'))
+            .map(str::to_owned),
+    })
+}
+
 fn observe_usage(endpoint: &ClientShellEndpoint, snapshot: &crate::protocol::ClientShellSnapshot) {
     let mut store = usage_store().lock().unwrap_or_else(|e| e.into_inner());
     for agent in &snapshot.agents {

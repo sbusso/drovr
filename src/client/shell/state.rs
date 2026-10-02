@@ -96,6 +96,8 @@ pub(super) struct ShellHitMap {
     pub(super) projects: Vec<(Rect, String)>,
     /// drovr fork: combined sidebar rows and header toggles.
     pub(super) drovr_rows: Vec<super::drovr_sidebar::RowHit>,
+    /// drovr fork: workflow cues on agent rows (click opens the run's view).
+    pub(super) drovr_workflows: Vec<super::drovr_sidebar::WorkflowHit>,
     /// Where a dragged workspace lands, by pointer position.
     pub(super) drovr_drops: Vec<super::drovr_sidebar::DropSlot>,
     pub(super) drovr_view_toggle: Rect,

@@ -2125,6 +2125,18 @@ impl ClientShellState {
                     self.persist_chrome_preferences(outcome);
                     return;
                 }
+                // drovr fork: a workflow cue opens the run's view in the doc
+                // pane; the rest of the row focuses the agent.
+                if let Some(hit) = self
+                    .hits
+                    .drovr_workflows
+                    .iter()
+                    .find(|hit| super::contains(hit.rect, point))
+                    .cloned()
+                {
+                    self.open_workflow_view(hit, outcome);
+                    return;
+                }
                 if self.begin_row_press(point) {
                     // drovr fork: combined sidebar row.
                     return;

@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""drovr workflow hook for Claude Code (PostToolUse on Workflow).
+
+When Claude launches a background workflow, start a detached watcher that
+follows the run and reports its progress to herdr as pane metadata tokens
+(visible to every drovr client):
+  drovr_wf      "<state> <done>/<total>": state is running, done or failed;
+                done counts finished phases of the script's meta.phases
+  drovr_wf_phase  the current phase's detail, else its title ("state hook"),
+                or how the run ended
+  drovr_wf_doc  path of a Markdown view of the run (phases, agents, results),
+                which the drovr sidebar opens in the doc pane on click
+  drovr_wf_run  the run id, so a newer run in the pane replaces this one
+The watcher reads the run's journal.jsonl every few seconds, ends when the
+session transcript reports the workflow's task as finished, and clears the
+tokens a while later. Never fails the agent: any error exits 0.
+
+Install: drovr-install-hooks (registers it in ~/.claude/settings.json).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+DOC_DIR = os.path.expanduser("~/.cache/drovr/workflows")
+SOURCE = "drovr-wf"
+POLL_S = 3
+# The cue stays this long after the run ends, then the tokens are cleared.
+LINGER_S = 600
+# A run whose journal has not changed for this long is treated as gone
+# (the session was closed and took the workflow with it).
+STALE_S = 3 * 3600
+MAX_S = 24 * 3600
+END_RE = re.compile(r"<status>(\w+)</status>")
+
+
+def herdr(*args):
+    binary = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    return subprocess.run(
+        [binary, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+        check=False,
+    )
+
+
+def report(pane, tokens=None, clear=()):
+    args = []
+    for name, value in (tokens or {}).items():
+        args += ["--token", f"{name}={value[:80]}"]
+    for name in clear:
+        args += ["--clear-token", name]
+    herdr("pane", "report-metadata", pane, "--source", SOURCE, *args)
+
+
+def pane_run(pane):
+    """The run id the pane currently shows, or None."""
+    try:
+        out = herdr("pane", "get", pane).stdout
+        return json.loads(out)["result"]["pane"]["tokens"].get("drovr_wf_run")
+    except (ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return None
+
+
+def script_meta(path):
+    """(description, [(title, detail)]) from the script's `meta` literal."""
+    try:
+        with open(path) as handle:
+            text = handle.read(20000)
+    except OSError:
+        return "", []
+    head = text.split("phases", 1)
+    desc = re.search(r"description:\s*(['\"`])(.*?)\1", head[0], re.S)
+    phases = []
+    if len(head) == 2:
+        block = head[1].split("]", 1)[0]
+        for item in re.finditer(r"\{([^}]*)\}", block):
+            title = re.search(r"title:\s*(['\"`])(.*?)\1", item.group(1), re.S)
+            detail = re.search(r"detail:\s*(['\"`])(.*?)\1", item.group(1), re.S)
+            if title:
+                phases.append((title.group(2), detail.group(2) if detail else ""))
+    return (desc.group(2) if desc else ""), phases
+
+
+def read_journal(path):
+    """Agents in start order: {key: {label, phase, result}}."""
+    agents = {}
+    try:
+        with open(path) as handle:
+            for raw in handle:
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                key = entry.get("key")
+                if entry.get("type") == "started" and key:
+                    agents.setdefault(key, {"label": entry.get("label") or "agent",
+                                            "phase": entry.get("phase") or "",
+                                            "result": None})
+                elif entry.get("type") == "result" and key in agents:
+                    agents[key]["result"] = entry.get("result")
+    except OSError:
+        pass
+    return agents
+
+
+def progress(phases, agents, state):
+    """(done, total, current phase index or None)."""
+    titles = [title for title, _ in phases]
+    seen = [a["phase"] for a in agents.values() if a["phase"] in titles]
+    current = max((titles.index(p) for p in seen), default=None)
+    total = len(titles) or 1
+    if state == "done":
+        return total, total, None
+    return (current or 0), total, current
+
+
+def result_summary(result):
+    if isinstance(result, dict):
+        for field in ("summary", "changes", "verdict", "status"):
+            value = result.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return json.dumps(result)[:400]
+    return str(result or "").strip()
+
+
+def render(run, desc, phases, agents, state, started):
+    done, total, current = progress(phases, agents, state)
+    lines = [f"# {run['name']}", ""]
+    if desc:
+        lines += [desc, ""]
+    elapsed = int((time.time() - started) / 60)
+    now = datetime.now().strftime("%H:%M:%S")
+    lines += [f"**{state}** · phase {min(done + (state == 'running'), total)} of {total} · "
+              f"{elapsed} min · updated {now}", ""]
+    if phases:
+        lines += ["## Phases", ""]
+        for index, (title, detail) in enumerate(phases):
+            if state == "done" or index < done:
+                mark = "✓"
+            elif index == current:
+                mark = "✗" if state == "failed" else "▸"
+            else:
+                mark = "·"
+            lines.append(f"- {mark} **{title}**" + (f" — {detail}" if detail else ""))
+        lines.append("")
+    if agents:
+        lines += ["## Agents", "", "| Agent | Phase | Status |", "|---|---|---|"]
+        for agent in agents.values():
+            status = "done" if agent["result"] is not None else "running"
+            lines.append(f"| {agent['label']} | {agent['phase']} | {status} |")
+        lines.append("")
+        finished = [a for a in agents.values() if a["result"] is not None]
+        if finished:
+            lines += ["## Results", ""]
+            for agent in finished:
+                summary = result_summary(agent["result"])
+                if len(summary) > 600:
+                    summary = summary[:600].rstrip() + "…"
+                lines += [f"### {agent['label']}", "", summary, ""]
+    if state == "done":
+        phase = "done"
+    elif current is None:
+        phase = "starting"
+    else:
+        # The detail says what the phase does; a title like "Step 2" only
+        # repeats the count shown beside it.
+        title, detail = phases[current]
+        phase = detail or title
+        phase = f"failed in {phase}" if state == "failed" else phase
+    return "\n".join(lines).rstrip() + "\n", (f"{state} {done}/{total}", phase)
+
+
+def write_doc(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def end_status(transcript, task_id, offset):
+    """(status or None, new offset): the workflow task's final status from a
+    task notification in the session transcript."""
+    if not transcript or not task_id:
+        return None, offset
+    marker = f"<task-id>{task_id}</task-id>".encode()
+    status = None
+    try:
+        with open(transcript, "rb") as handle:
+            handle.seek(offset)
+            for raw in handle:
+                if not raw.endswith(b"\n"):
+                    break
+                offset += len(raw)
+                if marker in raw:
+                    found = END_RE.search(raw.decode("utf-8", "replace"))
+                    if found:
+                        status = found.group(1)
+    except OSError:
+        pass
+    return status, offset
+
+
+def watch(run):
+    pane = run["pane"]
+    journal = os.path.join(run["dir"], "journal.jsonl")
+    doc = os.path.join(DOC_DIR, f"{run['run_id']}.md")
+    desc, phases = script_meta(run.get("script") or "")
+    started = run["started"]
+    offset = run.get("offset", 0)
+    state = "running"
+    last_cue = None
+    last_change = time.time()
+    while time.time() - started < MAX_S:
+        if pane_run(pane) not in (run["run_id"], None):
+            return  # a newer run took over the pane
+        status, offset = end_status(run.get("transcript"), run.get("task_id"), offset)
+        if status:
+            state = "done" if status == "completed" else "failed"
+        try:
+            last_change = max(last_change, os.path.getmtime(journal))
+        except OSError:
+            pass
+        if state == "running" and time.time() - last_change > STALE_S:
+            state = "failed"
+        text, cue = render(run, desc, phases, read_journal(journal), state, started)
+        write_doc(doc, text)
+        if cue != last_cue:
+            report(pane, {"drovr_wf": cue[0], "drovr_wf_phase": cue[1], "drovr_wf_doc": doc,
+                          "drovr_wf_run": run["run_id"]})
+            last_cue = cue
+        if state != "running":
+            break
+        time.sleep(POLL_S)
+    time.sleep(LINGER_S)
+    if pane_run(pane) == run["run_id"]:
+        report(pane, clear=("drovr_wf", "drovr_wf_phase", "drovr_wf_doc", "drovr_wf_run"))
+
+
+def launch(hook):
+    pane = os.environ.get("HERDR_PANE_ID")
+    response = hook.get("tool_response")
+    if not pane or not isinstance(response, dict):
+        return
+    if response.get("status") != "async_launched" or not response.get("transcriptDir"):
+        return
+    run_id = response.get("runId") or os.path.basename(response["transcriptDir"])
+    transcript = hook.get("transcript_path")
+    run = {
+        "pane": pane,
+        "run_id": run_id,
+        "task_id": response.get("taskId"),
+        "name": response.get("workflowName") or run_id,
+        "dir": response["transcriptDir"],
+        "script": response.get("scriptPath"),
+        "transcript": transcript,
+        # Only notifications after the launch can end this run.
+        "offset": os.path.getsize(transcript) if transcript and os.path.exists(transcript) else 0,
+        "started": time.time(),
+    }
+    os.makedirs(DOC_DIR, exist_ok=True)
+    # Claim the pane first, so an older watcher stops on its next poll.
+    report(pane, {"drovr_wf": "running 0/1", "drovr_wf_phase": "starting", "drovr_wf_run": run_id})
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--watch", json.dumps(run)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--watch":
+        watch(json.loads(sys.argv[2]))
+    else:
+        launch(json.load(sys.stdin))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001 - a hook must never break the agent
+        pass
+    sys.exit(0)

@@ -314,6 +314,51 @@ impl ClientShellState {
     }
 }
 
+impl ClientShellState {
+    /// drovr fork: opens a workflow's Markdown view (written by the workflow
+    /// hook on the agent's machine) in the doc pane beside the agent.
+    pub(super) fn open_workflow_view(
+        &mut self,
+        hit: super::drovr_sidebar::WorkflowHit,
+        outcome: &mut ClientShellInput,
+    ) {
+        if hit.endpoint_id.is_local() {
+            outcome.actions.push(ClientShellAction::OpenLocalDocument {
+                workspace_id: hit.workspace_id,
+                pane_id: hit.pane_id,
+                path: hit.doc,
+            });
+            return;
+        }
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == hit.endpoint_id)
+        else {
+            return;
+        };
+        let pane = endpoint.snapshot.as_deref().and_then(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == hit.pane_id)
+        });
+        let (Some(bridge), Some(pane)) = (endpoint.bridge.clone(), pane) else {
+            return;
+        };
+        outcome.actions.push(ClientShellAction::OpenRemoteDocument {
+            bridge,
+            doc: crate::remote::RemoteDocOpen {
+                workspace_id: hit.workspace_id,
+                tab_id: pane.tab_id.clone(),
+                pane_id: hit.pane_id,
+                cwd: pane.foreground_cwd.clone().or_else(|| pane.cwd.clone()),
+                path: hit.doc,
+            },
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

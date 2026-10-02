@@ -5,6 +5,8 @@
 #   SessionStart and UserPromptSubmit events in ~/.claude/settings.json;
 # - the plan hook: copied to ~/.local/bin and registered for PostToolUse on
 #   Write|Edit|MultiEdit, so plan-mode plans open in the doc pane;
+# - the workflow hook: copied to ~/.local/bin and registered for PostToolUse on
+#   Workflow, so the sidebar shows a running workflow's progress;
 # - the state hook: copied to ~/.local/bin and registered for the inbox events
 #   in ~/.claude/settings.json and, when ~/.codex exists, ~/.codex/hooks.json;
 # - the drovr-docs skill: copied to ~/.claude/skills/drovr-docs/.
@@ -15,7 +17,7 @@
 # Files come from sbusso/drovr (main), never from the current directory: under
 # `curl ... | bash` there is no script directory to resolve. DROVR_RAW
 # overrides the base URL (file:// works, for tests).
-# The plan hook, the state hook and the skill are optional: a failed download
+# The plan, workflow and state hooks and the skill are optional: a failed download
 # skips them.
 set -euo pipefail
 dry_run=0
@@ -29,6 +31,7 @@ raw="${DROVR_RAW:-https://raw.githubusercontent.com/sbusso/drovr/main}"
 bin="$HOME/.local/bin"
 usage_hook="$bin/drovr-usage-hook"
 plan_hook="$bin/drovr-plan-hook"
+workflow_hook="$bin/drovr-workflow-hook"
 state_hook="$bin/drovr-state-hook"
 settings="$HOME/.claude/settings.json"
 codex_hooks=""
@@ -46,6 +49,12 @@ if [ "$dry_run" = 0 ]; then
     echo "plan hook not available; skipped" >&2
     plan_hook=""
   fi
+  if curl -fsSL "$raw/scripts/drovr-workflow-hook" -o "$tmp/workflow"; then
+    install -m 0755 "$tmp/workflow" "$workflow_hook"
+  else
+    echo "workflow hook not available; skipped" >&2
+    workflow_hook=""
+  fi
   if curl -fsSL "$raw/scripts/drovr-state-hook" -o "$tmp/state"; then
     install -m 0755 "$tmp/state" "$state_hook"
   else
@@ -61,11 +70,11 @@ if [ "$dry_run" = 0 ]; then
   fi
 fi
 
-python3 - "$dry_run" "$settings" "$codex_hooks" "$usage_hook" "$plan_hook" "$state_hook" <<'EOF'
+python3 - "$dry_run" "$settings" "$codex_hooks" "$usage_hook" "$plan_hook" "$state_hook" "$workflow_hook" <<'EOF'
 import difflib, json, os, shutil, sys
 
 dry_run = sys.argv[1] == "1"
-settings, codex_hooks, usage, plan, state = sys.argv[2:7]
+settings, codex_hooks, usage, plan, state, workflow = sys.argv[2:8]
 # The PermissionRequest hook waits up to DROVR_DECIDE_WAIT_S (600 s) for an
 # inbox decision; Claude must not kill it first.
 DECIDE_TIMEOUT = 605
@@ -144,6 +153,8 @@ def claude(data):
         register(data, event, f"python3 {usage}")
     if plan:
         register(data, "PostToolUse", f"python3 {plan}", "Write|Edit|MultiEdit")
+    if workflow:
+        register(data, "PostToolUse", f"python3 {workflow}", "Workflow")
     if state:
         state_hooks(data, "claude", CLAUDE_STATE_EVENTS)
 

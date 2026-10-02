@@ -27,6 +27,16 @@ pub(super) struct RowHit {
     pub(super) pane_id: Option<String>,
 }
 
+/// A workflow cue on an agent row; a click opens `doc` in the doc pane.
+#[derive(Clone, Debug)]
+pub(super) struct WorkflowHit {
+    pub(super) rect: Rect,
+    pub(super) endpoint_id: ClientEndpointId,
+    pub(super) workspace_id: String,
+    pub(super) pane_id: String,
+    pub(super) doc: String,
+}
+
 /// Where a workspace dropped on the sidebar goes: into `section` (a project
 /// name, or [`OTHER`]) just before the workspace `before`, or last.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +160,8 @@ enum Row {
         /// Agent id ("claude", "codex"), for the structured view's mark.
         vendor: Option<String>,
         tone: radar::Tone,
+        /// A Claude workflow's progress, shown at the right edge.
+        workflow: Option<projects::WorkflowCue>,
         /// The agent's inbox item; the glyph shows on this row only in the
         /// detailed view, which has no workspace rows.
         item: Option<ItemKind>,
@@ -179,8 +191,14 @@ impl Row {
     fn height(&self) -> u16 {
         match self {
             Row::Agent {
-                workspace, machine, ..
-            } if workspace.is_some() || machine.is_some() => 2,
+                workspace,
+                machine,
+                workflow,
+                ..
+            } => {
+                1 + u16::from(workspace.is_some() || machine.is_some())
+                    + u16::from(workflow.is_some())
+            }
             _ => 1,
         }
     }
@@ -202,6 +220,7 @@ struct AgentInfo {
     ctx: Option<String>,
     vendor: Option<String>,
     tone: radar::Tone,
+    workflow: Option<projects::WorkflowCue>,
     item: Option<ItemKind>,
     doing: Option<(String, String)>,
 }
@@ -418,6 +437,7 @@ fn build_rows(
                 current: presence.is_active() || kept || recent,
                 ctx: projects::agent_context_tokens(row.agent)
                     .map(|tokens| format!("ctx {}", projects::format_tokens(tokens))),
+                workflow: projects::agent_workflow(row.agent),
                 focused: row.agent.focused && &endpoint.endpoint_id == active_endpoint_id,
                 stale,
                 title: agent_title(row.agent, pane, tab),
@@ -593,6 +613,7 @@ fn build_rows(
                     ctx: agent.ctx,
                     vendor: agent.vendor,
                     tone: agent.tone,
+                    workflow: agent.workflow,
                     item: agent.item,
                     doing: agent.doing,
                 });
@@ -1275,6 +1296,7 @@ fn render_row(
             age,
             faded,
             ctx,
+            workflow,
             item,
             doing,
             ..
@@ -1355,6 +1377,24 @@ fn render_row(
             }
             if *stale || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            if let Some(cue) = workflow {
+                let line = Rect::new(
+                    rect.x + 3,
+                    rect.bottom().saturating_sub(1),
+                    rect.width.saturating_sub(3),
+                    1,
+                );
+                render_workflow_line(
+                    buffer,
+                    line,
+                    cue,
+                    palette,
+                    hits,
+                    endpoint,
+                    workspace_id,
+                    pane_id,
+                );
             }
             if glyph {
                 push_glyph_hit(hits, rect, endpoint, workspace_id);
@@ -1607,6 +1647,7 @@ fn render_structured_row(
             ctx,
             vendor,
             tone,
+            workflow,
             doing,
             ..
         } => {
@@ -1655,6 +1696,19 @@ fn render_structured_row(
             put_text(buffer, x, rect.y, width, &radar::fit(&text, width), style);
             if *stale || (*faded && !*focused) {
                 buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+            }
+            if let Some(cue) = workflow {
+                let line = Rect::new(x, rect.y + 1, rect.right().saturating_sub(x), 1);
+                render_workflow_line(
+                    buffer,
+                    line,
+                    cue,
+                    palette,
+                    hits,
+                    endpoint,
+                    workspace_id,
+                    pane_id,
+                );
             }
             hits.endpoint_agents
                 .push((rect, endpoint.endpoint_id.clone(), pane_id.clone()));
@@ -1757,6 +1811,72 @@ struct StructuredHeader<'a> {
     waiting: bool,
     /// Today's usage, shown instead of the count while peeking.
     usage: Option<&'a str>,
+}
+
+/// drovr fork: a Claude workflow's line under its agent row, from `x`:
+/// "▰▰▱▱▱▱ 2/6 · state hook", the count in the bar's colour. A click opens
+/// the run's view.
+#[allow(clippy::too_many_arguments)] // one draw call; a struct would only rename the args
+fn render_workflow_line(
+    buffer: &mut Buffer,
+    line: Rect,
+    cue: &projects::WorkflowCue,
+    palette: &Palette,
+    hits: &mut ShellHitMap,
+    endpoint: &ClientShellEndpoint,
+    workspace_id: &str,
+    pane_id: &str,
+) {
+    let width = cue.total.min(8);
+    let filled = if cue.state == projects::WorkflowState::Done {
+        width
+    } else {
+        cue.done * width / cue.total
+    };
+    let color = match cue.state {
+        projects::WorkflowState::Running => palette.accent,
+        projects::WorkflowState::Done => palette.green,
+        projects::WorkflowState::Failed => palette.red,
+    };
+    let bar = format!(
+        "{}{} {}/{}",
+        "▰".repeat(usize::from(filled)),
+        "▱".repeat(usize::from(width - filled)),
+        cue.done,
+        cue.total
+    );
+    put_text(
+        buffer,
+        line.x,
+        line.y,
+        line.width,
+        &bar,
+        Style::default().fg(color),
+    );
+    let x = line.x.saturating_add(display_width(&bar));
+    let rest = cue
+        .phase
+        .as_deref()
+        .map(|phase| format!(" · {phase}"))
+        .unwrap_or_default();
+    let rest_width = line.right().saturating_sub(x);
+    put_text(
+        buffer,
+        x,
+        line.y,
+        rest_width,
+        &radar::fit(&rest, rest_width),
+        Style::default().fg(palette.overlay0),
+    );
+    if let Some(doc) = cue.doc.clone() {
+        hits.drovr_workflows.push(WorkflowHit {
+            rect: line,
+            endpoint_id: endpoint.endpoint_id.clone(),
+            workspace_id: workspace_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            doc,
+        });
+    }
 }
 
 /// A structured section header: " ▾ GTM ─────────── ● 3 ". The name in the
@@ -2407,6 +2527,91 @@ mod tests {
                 .endpoint_agents
                 .iter()
                 .all(|(rect, _, _)| !covers(*rect, y)));
+        }
+    }
+
+    #[test]
+    fn workflow_cues_get_a_second_line_and_only_a_view_is_clickable() {
+        let mut endpoints = fixture();
+        let tokens = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let agents = &mut endpoints[0].snapshot.as_mut().unwrap().agents;
+        agents[0].tokens = tokens(&[
+            ("drovr_wf", "running 2/6"),
+            ("drovr_wf_phase", "state hook"),
+            ("drovr_wf_doc", "/tmp/run.md"),
+        ]);
+        // Codex rows ignore Claude hook tokens; a finished run without a view
+        // still shows its line.
+        agents[1].tokens = tokens(&[("drovr_wf", "running 1/2")]);
+        agents[2].tokens = tokens(&[("drovr_wf", "done 6/6"), ("drovr_wf_phase", "done")]);
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let area = Rect::new(0, 0, 44, 24);
+        for structured in [true, false] {
+            let mut buffer = Buffer::empty(area);
+            let mut hits = ShellHitMap::default();
+            let layout = ProjectLayout {
+                structured,
+                ..structured_layout()
+            };
+            let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout, true);
+            let mut y = 0;
+            for row in &rows {
+                let rect = Rect::new(0, y, area.width, row.height());
+                render_row(
+                    &mut buffer,
+                    rect,
+                    row,
+                    &layout,
+                    &endpoints,
+                    &config,
+                    radar::Ground::Dark,
+                    &mut hits,
+                );
+                y += row.height();
+            }
+            let line = |y: u16| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            };
+            let last_line = |pane: &str| {
+                let hit = hits
+                    .drovr_rows
+                    .iter()
+                    .find(|hit| hit.pane_id.as_deref() == Some(pane))
+                    .expect("agent row");
+                (hit.rect, line(hit.rect.bottom() - 1))
+            };
+            let (row, text) = last_line("p1");
+            assert!(
+                text.trim().starts_with("▰▰▱▱▱▱ 2/6 · state hook"),
+                "{structured}: {text:?}"
+            );
+            assert!(line(row.y).contains("Fix auth flow"), "title stays on top");
+            // The count shares the bar's colour; the phase is dimmed.
+            let fg = |symbol: &str| {
+                (0..area.width)
+                    .map(|x| &buffer[(x, row.bottom() - 1)])
+                    .find(|cell| cell.symbol() == symbol)
+                    .map(|cell| cell.fg)
+            };
+            assert_eq!(fg("/"), Some(config.palette.accent));
+            assert_eq!(fg("▰"), Some(config.palette.accent));
+            assert_eq!(fg("·"), Some(config.palette.overlay0));
+            assert!(!last_line("p2").1.contains('▰'), "{structured}");
+            assert!(last_line("p3").1.trim().starts_with("▰▰▰▰▰▰ 6/6 · done"));
+            assert_eq!(hits.drovr_workflows.len(), 1);
+            let cue = &hits.drovr_workflows[0];
+            assert_eq!(
+                (cue.pane_id.as_str(), cue.doc.as_str()),
+                ("p1", "/tmp/run.md")
+            );
+            assert_eq!((cue.rect.y, cue.rect.height), (row.bottom() - 1, 1));
         }
     }
 

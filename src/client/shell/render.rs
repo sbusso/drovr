@@ -354,6 +354,7 @@ pub(super) fn render_shell(
         hits.machines.clear();
         hits.projects.clear();
         hits.drovr_rows.clear();
+        hits.drovr_workflows.clear();
         hits.drovr_drops.clear();
         hits.drovr_view_toggle = Rect::default();
         hits.drovr_filter_toggle = Rect::default();
