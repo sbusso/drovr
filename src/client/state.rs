@@ -555,6 +555,16 @@ impl ClientState {
         } else {
             frame_data
         };
+        // An unchanged frame writes nothing, as in the server's render
+        // stream: every write hides and shows the host cursor, which
+        // flickers it when the shell repaints on a timer.
+        if !self.repaint_pending
+            && graphics.operations.is_empty()
+            && self.pending_native_cleanup.is_empty()
+            && self.blit_encoder.is_current(&frame_data)
+        {
+            return true;
+        }
         let encoded = if self.draw_host_cursor {
             self.blit_encoder
                 .encode_with_suppressed_visible_cursor(&frame_data, self.repaint_pending)

@@ -1886,8 +1886,14 @@ impl ClientShellState {
                         .unwrap_or_default()
                         .to_owned()
                 });
+                // The read repeats every SCREEN_RETRY; only a change repaints.
+                let changed = self
+                    .inbox
+                    .screen
+                    .as_ref()
+                    .is_none_or(|screen| screen.at != at || screen.text != text);
                 self.inbox.screen = Some(ScreenRead { at, text });
-                true
+                changed
             }
             InboxReply::Answer {
                 key,
