@@ -1,6 +1,6 @@
 # drovr: build drovr for macOS and Linux (x86_64 and arm64) and publish the
 # binaries, their SHA-256 checksums and the installer as a GitHub release on
-# every `drovr-v*` tag (e.g. drovr-v0.9.4-1). "drovr promote" pushes that tag.
+# every `drovr-v*` tag (drovr-v<Cargo.toml version>-<n>, e.g. drovr-v0.9.3-1). "drovr promote" pushes that tag.
 # Run it by hand with a tag to rebuild or finish a release; publishing is
 # idempotent (assets are replaced). Upstream herdr workflows are guarded to
 # herdrdev/herdr and do not run on this fork.
@@ -131,8 +131,8 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
-            herdr_version=${TAG#drovr-}
+            herdr_version=${TAG#drovr-v}
             gh release create "$TAG" "${files[@]}" \
               --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
-              --notes "drovr build of $(git rev-parse --short HEAD) on herdr ${herdr_version%-*}. See the README for what differs from herdr."
+              --notes "drovr build of $(git rev-parse --short HEAD), based on herdr/master at version ${herdr_version%-*}. See the README for what differs from herdr."
           fi

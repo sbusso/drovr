@@ -149,29 +149,36 @@ drovr            # instead of `herdr`
 
 It installs to `~/.local/share/drovr/drovr` and leaves your `herdr` install alone.
 Update later with `drovr update`.
-The server keeps running stock herdr; use the matching herdr version on each machine.
+The server keeps running stock herdr. drovr follows herdr's `master` branch, so
+use a herdr build from the same `master` range on each machine.
 
 ## Versioning
-`drovr-v<herdr version>-<n>`, e.g. `drovr-v0.9.3-1` = herdr 0.9.3 + drovr patch set 1.
+`drovr-v<version>-<n>`, where `<version>` is the herdr `Cargo.toml` version on
+`master` at the time and `<n>` counts drovr releases on that version, e.g.
+`drovr-v0.9.3-2`.
 
 ## For maintainers of this fork
 - Fork code lives in `src/client/shell/projects.rs` (model),
   `src/client/shell/drovr_sidebar.rs` (the combined sidebar) and
   `src/client/shell/project_actions.rs` (menus, clicks, drag, keys). Small hooks in
   upstream files are tagged: `grep -rn "drovr fork" src`.
-- **Following herdr is automatic**: *drovr rebase* runs daily. When herdr ships
-  a new stable release it rebases drovr onto it and tracks the result in one
-  issue per herdr release: if the rebase is clean and the tests pass it pushes
-  `rebase/<tag>` and marks the issue ready to ship; on a conflict or a test
-  failure it pushes nothing and the issue lists the conflicting files or links
-  the failing run. *drovr promote* (Actions → Run workflow) ships a ready
-  rebase: it moves `main` with `--force-with-lease`, tags `drovr-<tag>-1` and
-  can be rerun after a partial failure. Conflict resolutions are remembered via
+- **Following herdr is automatic**: drovr follows herdr's `master`, not its
+  stable tags. *drovr rebase* runs daily: when herdr `master` has moved past
+  the merge-base of `main` and herdr `master`, it rebases drovr's own commits
+  onto the new `master` and tracks the result in one issue per herdr commit
+  ("drovr rebase onto herdr <sha>", 12-character sha). If the rebase is clean
+  and the tests pass it pushes `rebase/herdr-<sha>` and marks the issue ready
+  to ship; on a conflict or a test failure it pushes nothing and the issue
+  lists the conflicting files or links the failing run. Issues and branches
+  for older herdr commits are closed or deleted once superseded. *drovr
+  promote* (Actions → Run workflow, input: the sha) ships a ready rebase: it
+  moves `main` with `--force-with-lease`, tags `drovr-v<version>-<n>` and can
+  be rerun after a partial failure. Conflict resolutions are remembered via
   `git rerere` (`.github/rr-cache`).
 - Both workflows need the secret `DROVR_PUSH_TOKEN`: a fine-grained PAT for
   this repository with *Contents* and *Workflows* read/write. `GITHUB_TOKEN`
   cannot push commits that change `.github/workflows`.
-- Manual rebase: `git fetch origin --tags && git rebase --onto v<new> v<old> main`.
+- Manual rebase: `git fetch herdr && git rebase --onto herdr/master $(git merge-base main herdr/master) main`.
 - Release: `git tag drovr-v<ver>-<n> && git push origin drovr-v<ver>-<n>` → the
   "drovr release" workflow builds `drovr-{macos,linux}-{arm64,x86_64}` with
   SHA-256 checksums and publishes them. Run it by hand with a tag to rebuild.

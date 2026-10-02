@@ -1,9 +1,10 @@
-# drovr: ship a ready rebase. Moves main to rebase/<herdr tag> and tags it
-# drovr-<herdr tag>-1; the tag push starts "drovr release", which builds macOS
-# and Linux (x86_64, arm64) binaries and publishes the GitHub release.
+# drovr: ship a ready rebase. Moves main to rebase/herdr-<sha> and tags it
+# drovr-v<Cargo.toml version>-<n> (n = next free number for that version); the
+# tag push starts "drovr release", which builds macOS and Linux (x86_64, arm64)
+# binaries and publishes the GitHub release.
 #
 # main is force-pushed with --force-with-lease against the main commit the
-# rebase replaced (tag drovr-rebase-base-<herdr tag>, written by drovr rebase),
+# rebase replaced (tag drovr-rebase-base-herdr-<sha>, written by drovr rebase),
 # so commits pushed to main after the rebase are never dropped: rerun
 # drovr rebase instead.
 #
@@ -18,8 +19,8 @@ name: drovr promote
 on:
   workflow_dispatch:
     inputs:
-      herdr_tag:
-        description: 'herdr release the ready rebase is based on, e.g. v0.9.4'
+      herdr_sha:
+        description: '12-character herdr/master sha of the ready rebase (rebase/herdr-<sha>)'
         required: true
 
 permissions: {}
@@ -35,15 +36,15 @@ jobs:
       contents: read
       issues: write
     env:
-      HERDR_TAG: ${{ inputs.herdr_tag }}
+      HERDR_SHA: ${{ inputs.herdr_sha }}
       PUSH_TOKEN: ${{ secrets.DROVR_PUSH_TOKEN }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Validate input and token
         run: |
-          if ! [[ "$HERDR_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::herdr_tag must look like v0.9.4, got '$HERDR_TAG'"
+          if ! [[ "$HERDR_SHA" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "::error::herdr_sha must be the 12-character sha from rebase/herdr-<sha>, got '$HERDR_SHA'"
             exit 1
           fi
           if [ -z "$PUSH_TOKEN" ]; then
@@ -59,25 +60,17 @@ jobs:
       - name: Promote
         run: |
           remote="https://x-access-token:${PUSH_TOKEN}@github.com/$GH_REPO.git"
-          tag="drovr-$HERDR_TAG-1"
-          base_tag="drovr-rebase-base-$HERDR_TAG"
+          branch="rebase/herdr-$HERDR_SHA"
+          base_tag="drovr-rebase-base-herdr-$HERDR_SHA"
           git fetch --force --tags "$remote" "+refs/heads/*:refs/remotes/origin/*"
           sha() { git rev-parse --verify --quiet "$1^{commit}" || true; }
 
-          target=$(sha "origin/rebase/$HERDR_TAG")
-          existing_tag=$(sha "refs/tags/$tag")
+          target=$(sha "origin/$branch")
           main=$(sha origin/main)
           if [ -z "$target" ]; then
-            # A previous run may have finished and deleted the branch.
-            target=$existing_tag
-          fi
-          if [ -z "$target" ]; then
-            echo "::error::Neither branch rebase/$HERDR_TAG nor tag $tag exists. Run drovr rebase first."
-            exit 1
-          fi
-          if [ -n "$existing_tag" ] && [ "$existing_tag" != "$target" ]; then
-            echo "::error::Tag $tag already points at $existing_tag, not $target."
-            exit 1
+            # The branch is deleted last, so a previous run finished.
+            echo "Branch $branch is gone: already promoted, or never made (run drovr rebase)."
+            exit 0
           fi
 
           if [ "$main" = "$target" ]; then
@@ -85,38 +78,48 @@ jobs:
           else
             expected=$(sha "refs/tags/$base_tag")
             if [ -z "$expected" ]; then
-              echo "::error::Tag $base_tag (main before the rebase) is missing. Delete branch rebase/$HERDR_TAG and rerun drovr rebase."
+              echo "::error::Tag $base_tag (main before the rebase) is missing. Delete branch $branch and rerun drovr rebase."
               exit 1
             fi
             if [ "$main" != "$expected" ]; then
-              echo "::error::main moved from $expected to $main after the rebase was made. Delete branch rebase/$HERDR_TAG and rerun drovr rebase."
+              echo "::error::main moved from $expected to $main after the rebase was made. Delete branch $branch and rerun drovr rebase."
               exit 1
             fi
-            # The rebase rewrote drovr's commits on top of the new herdr, so
-            # main moves to it (the one intentional force-push).
+            # The rebase rewrote drovr's commits on top of the new herdr/master,
+            # so main moves to it (the one intentional force-push).
             git push --force-with-lease="refs/heads/main:$expected" "$remote" "$target:refs/heads/main"
           fi
 
-          if [ -z "$existing_tag" ]; then
+          tag=$(git tag --points-at "$target" -l 'drovr-v*' | head -1)
+          if [ -n "$tag" ]; then
+            echo "$target is already tagged $tag; rerun drovr release for it if the release is missing"
+          else
+            version=$(git show "$target:Cargo.toml" | sed -n 's/^version = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' | head -1)
+            if [ -z "$version" ]; then
+              echo "::error::Could not read an X.Y.Z version from Cargo.toml at $target."
+              exit 1
+            fi
+            last=$(git tag -l "drovr-v$version-*" | sed "s/^drovr-v$version-//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+            tag="drovr-v$version-$(( ${last:-0} + 1 ))"
             # Pushed with the PAT so that it starts drovr release.
             git push "$remote" "$target:refs/tags/$tag"
-          else
-            echo "tag $tag already exists; rerun drovr release for it if the release is missing"
           fi
 
-          if git ls-remote --exit-code "$remote" "refs/heads/rebase/$HERDR_TAG" >/dev/null; then
-            git push "$remote" --delete "refs/heads/rebase/$HERDR_TAG"
-          fi
           if git ls-remote --exit-code "$remote" "refs/tags/$base_tag" >/dev/null; then
             git push "$remote" --delete "refs/tags/$base_tag"
           fi
+          git push "$remote" --delete "refs/heads/$branch"
           echo "Promoted $target as $tag. Release build: $GITHUB_SERVER_URL/$GH_REPO/actions/workflows/drovr-release.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        id: promote
 
       - name: Close the rebase issue
+        env:
+          TAG: ${{ steps.promote.outputs.tag }}
         run: |
-          title="drovr rebase onto herdr $HERDR_TAG"
+          title="drovr rebase onto herdr $HERDR_SHA"
           gh issue list --state open --limit 100 --json number,title \
             --jq ".[] | select(.title == \"$title\") | .number" \
           | while read -r number; do
-              gh issue close "$number" --comment "Promoted to main and tagged drovr-$HERDR_TAG-1."
+              gh issue close "$number" --comment "Promoted to main${TAG:+ and tagged $TAG}."
             done

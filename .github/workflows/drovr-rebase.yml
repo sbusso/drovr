@@ -1,15 +1,18 @@
-# drovr: follow herdr. Daily, check whether herdrdev published a newer stable
-# release than the one drovr's main is based on. If so, rebase drovr onto it
-# and report the result in one issue per herdr release:
-#   clean (or replayed by rerere) + tests pass -> push branch rebase/<tag> and
-#                                                 mark the issue "ready to ship"
+# drovr: follow herdr/master. Daily, compare drovr main's upstream base (the
+# merge-base of main and herdr/master) with herdr/master. When herdr/master has
+# moved, rebase drovr's own commits (base..main) onto it and report the result
+# in one issue per herdr/master commit, named by its 12-character sha:
+#   clean (or replayed by rerere) + tests pass -> push branch rebase/herdr-<sha>
+#                                                 and mark the issue ready
 #   tests fail -> nothing is pushed; the issue links the failing run
 #   conflict   -> nothing is pushed; the issue lists the conflicting files and
 #                 the upstream commits that touched them
-# The issue is created once and updated on later runs; a comment is added only
-# when the status changes. main is never touched here; "drovr promote" ships a
-# ready rebase. Resolutions recorded with `git rerere` live in .github/rr-cache,
-# so a conflict resolved once is replayed automatically next time.
+# The issue is updated on later runs for the same commit; a comment is added
+# only when the status changes. When herdr/master moves again, open issues for
+# older commits are closed as superseded, and once a newer rebase is ready the
+# older rebase/herdr-* branches are deleted. main is never touched here;
+# "drovr promote" ships a ready rebase. Resolutions recorded with `git rerere`
+# live in .github/rr-cache, so a conflict resolved once is replayed next time.
 #
 # Jobs are split so that upstream code is only built in a job that has no
 # write token: `rebase` and `test` run with contents: read and no persisted
@@ -17,8 +20,8 @@
 #
 # Required secret: DROVR_PUSH_TOKEN, a fine-grained PAT for sbusso/drovr with
 # "Contents: read and write" and "Workflows: read and write". GITHUB_TOKEN
-# cannot push a branch whose commits change .github/workflows, which upstream
-# releases regularly do.
+# cannot push a branch whose commits change .github/workflows, which herdr
+# commits regularly do.
 name: drovr rebase
 
 on:
@@ -39,7 +42,8 @@ jobs:
       contents: read
     outputs:
       status: ${{ steps.rebase.outputs.status || 'skip' }}
-      latest: ${{ steps.find.outputs.latest }}
+      target: ${{ steps.find.outputs.target }}
+      short: ${{ steps.find.outputs.short }}
       base: ${{ steps.find.outputs.base }}
       main_sha: ${{ steps.find.outputs.main_sha }}
     steps:
@@ -49,22 +53,25 @@ jobs:
           ref: main
           persist-credentials: false
 
-      - name: Find upstream release
+      - name: Compare with herdr/master
         id: find
         run: |
-          git remote add upstream https://github.com/herdrdev/herdr.git
-          git fetch --quiet upstream --tags
-          stable() { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1; }
-          latest=$(git tag -l 'v*' | stable)
-          base=$(git tag --merged HEAD -l 'v*' | stable)
-          echo "latest=$latest base=$base"
+          git fetch --quiet --no-tags https://github.com/herdrdev/herdr.git master
+          target=$(git rev-parse FETCH_HEAD)
+          short=$(git rev-parse --short=12 "$target")
+          base=$(git merge-base HEAD "$target")
+          echo "target=$target base=$base main=$(git rev-parse HEAD)"
           {
-            echo "latest=$latest"
+            echo "target=$target"
+            echo "short=$short"
             echo "base=$base"
             echo "main_sha=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
-          if [ -z "$latest" ] || [ -z "$base" ] || [ "$latest" = "$base" ] \
-            || git ls-remote --exit-code origin "refs/heads/rebase/$latest" >/dev/null; then
+          if [ "$base" = "$target" ]; then
+            echo "main already contains herdr/master"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code origin "refs/heads/rebase/herdr-$short" >/dev/null; then
+            echo "rebase/herdr-$short is already waiting to be promoted"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -72,7 +79,8 @@ jobs:
         id: rebase
         if: steps.find.outputs.skip != 'true'
         env:
-          LATEST: ${{ steps.find.outputs.latest }}
+          TARGET: ${{ steps.find.outputs.target }}
+          SHORT: ${{ steps.find.outputs.short }}
           BASE: ${{ steps.find.outputs.base }}
         run: |
           git config user.name "drovr bot"
@@ -81,26 +89,26 @@ jobs:
           git config rerere.autoupdate true
           mkdir -p .git/rr-cache && cp -r .github/rr-cache/. .git/rr-cache/ 2>/dev/null || true
           mkdir -p out
-          git checkout -b "rebase/$LATEST"
-          git rebase --onto "$LATEST" "$BASE" || true
+          git checkout -b "rebase/herdr-$SHORT"
+          git rebase --onto "$TARGET" "$BASE" || true
           # rerere stages known resolutions; keep continuing while that is enough.
           while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
             files=$(git diff --name-only --diff-filter=U)
             if [ -n "$files" ]; then
               {
-                echo "Rebasing drovr onto herdr $LATEST stopped on conflicts. Nothing was pushed."
+                echo "Rebasing drovr onto herdr $SHORT stopped on conflicts. Nothing was pushed."
                 echo
                 echo "Files:"
                 # shellcheck disable=SC2016 # literal backticks for markdown
                 echo "$files" | sed 's/^/- `/;s/$/`/'
                 echo
-                echo "Upstream commits touching them ($BASE..$LATEST):"
+                echo "Upstream commits touching them (${BASE:0:12}..$SHORT):"
                 echo '```'
                 # shellcheck disable=SC2086 # one path per word
-                git log --oneline "$BASE..$LATEST" -- $files
+                git log --oneline "$BASE..$TARGET" -- $files
                 echo '```'
                 echo
-                echo "Resolve locally with \`git rebase --onto $LATEST $BASE main\`,"
+                echo "Resolve locally with \`git fetch herdr && git rebase --onto $TARGET \$(git merge-base main $TARGET) main\`,"
                 echo "then copy .git/rr-cache into .github/rr-cache so it replays next time."
               } > out/conflict.md
               git rebase --abort
@@ -109,8 +117,8 @@ jobs:
             fi
             GIT_EDITOR=true git rebase --continue || true
           done
-          # Only the rebased commits; the receiving jobs fetch $LATEST from upstream.
-          git bundle create out/rebase.bundle "refs/tags/$LATEST..rebase/$LATEST"
+          # Only drovr's rebased commits; the receiving jobs fetch $TARGET from herdr.
+          git bundle create out/rebase.bundle "$TARGET..rebase/herdr-$SHORT"
           echo "status=rebased" >> "$GITHUB_OUTPUT"
 
       - if: steps.rebase.outputs.status != ''
@@ -152,13 +160,14 @@ jobs:
 
       - name: Check out the rebased branch
         env:
-          LATEST: ${{ needs.rebase.outputs.latest }}
+          TARGET: ${{ needs.rebase.outputs.target }}
+          SHORT: ${{ needs.rebase.outputs.short }}
           BUNDLE: ${{ runner.temp }}/rebase/rebase.bundle
         run: |
           git init -q .
-          git fetch -q --no-tags https://github.com/herdrdev/herdr.git "refs/tags/$LATEST:refs/tags/$LATEST"
-          git fetch -q "$BUNDLE" "rebase/$LATEST:rebase/$LATEST"
-          git checkout -q "rebase/$LATEST"
+          git fetch -q --no-tags https://github.com/herdrdev/herdr.git "$TARGET"
+          git fetch -q "$BUNDLE" "rebase/herdr-$SHORT:rebase/herdr-$SHORT"
+          git checkout -q "rebase/herdr-$SHORT"
           git log --oneline -1
 
       - name: Install Rust
@@ -194,7 +203,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      LATEST: ${{ needs.rebase.outputs.latest }}
+      TARGET: ${{ needs.rebase.outputs.target }}
+      SHORT: ${{ needs.rebase.outputs.short }}
       MAIN_SHA: ${{ needs.rebase.outputs.main_sha }}
       REBASE_STATUS: ${{ needs.rebase.outputs.status }}
       TEST_RESULT: ${{ needs.test.result }}
@@ -234,36 +244,47 @@ jobs:
           BUNDLE: ${{ runner.temp }}/rebase/rebase.bundle
         run: |
           git init -q .
-          git fetch -q --no-tags https://github.com/herdrdev/herdr.git "refs/tags/$LATEST:refs/tags/$LATEST"
-          git fetch -q "$BUNDLE" "rebase/$LATEST:rebase/$LATEST"
+          git fetch -q --no-tags https://github.com/herdrdev/herdr.git "$TARGET"
+          git fetch -q "$BUNDLE" "rebase/herdr-$SHORT:rebase/herdr-$SHORT"
           remote="https://x-access-token:${PUSH_TOKEN}@github.com/$GH_REPO.git"
-          git push "$remote" "refs/heads/rebase/$LATEST:refs/heads/rebase/$LATEST"
+          git push "$remote" "refs/heads/rebase/herdr-$SHORT:refs/heads/rebase/herdr-$SHORT"
           # Records the main commit this rebase replaced; promote uses it as
           # the --force-with-lease expectation. Not a drovr-v* tag, so it does
           # not trigger a release.
-          git push --force "$remote" "$MAIN_SHA:refs/tags/drovr-rebase-base-$LATEST"
+          git push --force "$remote" "$MAIN_SHA:refs/tags/drovr-rebase-base-herdr-$SHORT"
+          # Older rebases are superseded by this one.
+          git ls-remote "$remote" 'refs/heads/rebase/herdr-*' 'refs/tags/drovr-rebase-base-herdr-*' \
+            | awk '{print $2}' | { grep -v -e "/rebase/herdr-$SHORT\$" -e "/drovr-rebase-base-herdr-$SHORT\$" || true; } \
+            | while read -r ref; do git push "$remote" --delete "$ref"; done
 
       - name: Update issue
         env:
           STATUS: ${{ steps.status.outputs.status }}
           CONFLICT: ${{ runner.temp }}/rebase/conflict.md
         run: |
-          title="drovr rebase onto herdr $LATEST"
+          title="drovr rebase onto herdr $SHORT"
           case "$STATUS" in
             ready)
               summary="Rebased cleanly, builds and the tests pass: ready to ship."
-              body="Branch \`rebase/$LATEST\` (replacing main at \`$MAIN_SHA\`) builds and the tests pass on Linux and macOS. Ship it from Actions → **drovr promote** with \`$LATEST\`." ;;
+              body="Branch \`rebase/herdr-$SHORT\` (replacing main at \`$MAIN_SHA\`) builds and the tests pass on Linux and macOS. Ship it from Actions → **drovr promote** with \`$SHORT\`." ;;
             test-failed)
               summary="Rebased cleanly, but the build or tests fail."
-              body="The rebase onto herdr $LATEST applied cleanly, but the build or tests failed: $RUN_URL. Nothing was pushed; the next daily run retries." ;;
+              body="The rebase onto herdr $SHORT applied cleanly, but the build or tests failed: $RUN_URL. Nothing was pushed; the next daily run retries." ;;
             conflict)
               summary="Rebase stopped on conflicts."
               body=$(cat "$CONFLICT") ;;
           esac
-          body=$(printf '<!-- drovr-rebase-status: %s -->\n%s\n\nUpstream notes: https://github.com/herdrdev/herdr/releases/tag/%s\nLast run: %s\n' \
-            "$STATUS" "$body" "$LATEST" "$RUN_URL")
-          number=$(gh issue list --state open --limit 100 --json number,title \
-            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          body=$(printf '<!-- drovr-rebase-status: %s -->\n%s\n\nherdr commit: https://github.com/herdrdev/herdr/commit/%s\nLast run: %s\n' \
+            "$STATUS" "$body" "$TARGET" "$RUN_URL")
+          open=$(gh issue list --state open --limit 100 --json number,title \
+            --jq '.[] | select(.title | startswith("drovr rebase onto herdr ")) | "\(.number) \(.title)"')
+          # Issues for older herdr/master commits are superseded by this one.
+          echo "$open" | while read -r n t; do
+            if [ -n "$n" ] && [ "$t" != "$title" ]; then
+              gh issue close "$n" --comment "Superseded by herdr $SHORT: $RUN_URL"
+            fi
+          done
+          number=$(echo "$open" | awk -v t="$title" '{n=$1; $1=""; sub(/^ /, "")} $0 == t {print n; exit}')
           if [ -z "$number" ]; then
             gh issue create --title "$title" --body "$body"
             exit 0
