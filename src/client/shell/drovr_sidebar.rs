@@ -544,19 +544,7 @@ pub(super) fn render_panel(
     );
     hits.workspace_body = body;
     let row_heights = rows.iter().map(Row::height).collect::<Vec<_>>();
-    let gaps = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| match (row, rows.get(index + 1)) {
-            (_, Some(Row::Header { .. })) => 1,
-            (Row::Agent { .. }, Some(Row::Agent { .. }))
-                if !layout.compact && !layout.structured =>
-            {
-                config.agents.row_gap
-            }
-            _ => 0,
-        })
-        .collect::<Vec<_>>();
+    let gaps = row_gaps(&rows, &layout, config.agents.row_gap);
     if reveal_focused {
         if let Some(target) = rows.iter().position(|row| match row {
             Row::Agent { focused, .. } | Row::Workspace { focused, .. } => *focused,
@@ -667,6 +655,31 @@ pub(super) fn render_panel(
         "«",
         Style::default().fg(palette.overlay0),
     );
+}
+
+/// Blank lines after each row. Every view leaves one before a project header;
+/// structured also leaves one after each workspace group (before the next
+/// workspace header), never two in a row; detailed spaces agents by `row_gap`.
+/// Gaps are skipped space, so they get no hit rect.
+fn row_gaps(rows: &[Row], layout: &ProjectLayout, row_gap: u16) -> Vec<u16> {
+    let structured = layout.structured && !layout.compact;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| match (row, rows.get(index + 1)) {
+            (_, Some(Row::Header { .. })) => 1,
+            (Row::Agent { .. } | Row::Workspace { .. }, Some(Row::Workspace { .. }))
+                if structured =>
+            {
+                1
+            }
+            (Row::Agent { .. }, Some(Row::Agent { .. }))
+                if !layout.compact && !layout.structured =>
+            {
+                row_gap
+            }
+            _ => 0,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)] // one render pass; splitting only shuffles args
@@ -968,8 +981,10 @@ pub(super) fn take_spinning() -> bool {
     SPINNING.swap(false, Ordering::Relaxed)
 }
 
-/// Structured rows start one column right of the project header's "▾".
+/// Structured workspace headers start one column right of the project
+/// header's "▾"; their agents sit two columns further in.
 const STRUCTURED_INDENT: u16 = 2;
+const STRUCTURED_AGENT_INDENT: u16 = STRUCTURED_INDENT + 2;
 
 type RightSlot<'a> =
     dyn Fn(Option<usize>, &Option<String>, &Option<String>) -> (String, Style) + 'a;
@@ -1015,7 +1030,7 @@ fn render_structured_row(
             let right = rect
                 .right()
                 .saturating_sub(display_width(&slot) + u16::from(!slot.is_empty()));
-            let mut x = rect.x + STRUCTURED_INDENT;
+            let mut x = rect.x + STRUCTURED_AGENT_INDENT;
             if let Some((mark, color)) =
                 radar::logo(vendor.as_deref(), config.agent_icons, ground, palette)
             {
@@ -1593,15 +1608,12 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut hits = ShellHitMap::default();
         let layout = structured_layout();
-        // Same stacking as render_panel: one line per row, a gap before headers.
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let gaps = row_gaps(&rows, &layout, 0);
+        // Same stacking as render_panel: each row, then its blank lines.
         let mut y = 0;
-        for (index, row) in build_rows(&endpoints, &ClientEndpointId::Local, &layout)
-            .iter()
-            .enumerate()
-        {
-            if index > 0 && matches!(row, Row::Header { .. }) {
-                y += 1;
-            }
+        let mut blanks = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
             let rect = Rect::new(0, y, area.width, row.height());
             render_row(
                 &mut buffer,
@@ -1615,6 +1627,8 @@ mod tests {
                 &mut hits,
             );
             y += row.height();
+            blanks.extend(y..y + gaps[index]);
+            y += gaps[index];
         }
         let line = |y: u16| {
             (0..area.width)
@@ -1652,6 +1666,100 @@ mod tests {
         }
         assert_eq!(hits.drovr_rows.len(), 8);
         assert_eq!(hits.endpoint_agents.len(), 4);
+        // Blank lines are drawn empty and no click target covers them.
+        assert_eq!(blanks.len(), 3);
+        let covers = |rect: Rect, y: u16| rect.y <= y && y < rect.bottom();
+        for y in blanks {
+            assert!(line(y).trim().is_empty(), "{:?}", line(y));
+            assert!(hits.drovr_rows.iter().all(|hit| !covers(hit.rect, y)));
+            assert!(hits.projects.iter().all(|(rect, _)| !covers(*rect, y)));
+            assert!(hits
+                .endpoint_agents
+                .iter()
+                .all(|(rect, _, _)| !covers(*rect, y)));
+        }
+    }
+
+    #[test]
+    fn structured_agents_sit_two_columns_inside_their_workspace_header() {
+        let endpoints = fixture();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let layout = structured_layout();
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        let start = |row: &Row| {
+            let area = Rect::new(0, 0, 34, 1);
+            let mut buffer = Buffer::empty(area);
+            render_row(
+                &mut buffer,
+                area,
+                row,
+                &layout,
+                &endpoints,
+                &config,
+                radar::Ground::Dark,
+                None,
+                &mut ShellHitMap::default(),
+            );
+            (0..area.width)
+                .find(|x| !buffer[(*x, 0)].symbol().trim().is_empty())
+                .expect("row draws something")
+        };
+        let workspace = rows
+            .iter()
+            .find(|row| matches!(row, Row::Workspace { .. }))
+            .expect("workspace header");
+        let agents = rows
+            .iter()
+            .filter(|row| matches!(row, Row::Agent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(start(workspace), STRUCTURED_INDENT);
+        assert!(!agents.is_empty());
+        for agent in agents {
+            assert_eq!(start(agent), start(workspace) + 2);
+        }
+    }
+
+    #[test]
+    fn structured_gaps_follow_each_workspace_group_once() {
+        let endpoints = fixture();
+        let layout = structured_layout();
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        // H GTM, W gtm-rd, A, A | W Code, A | H Other, W scratch | W turfobet.fr, A
+        assert_eq!(
+            row_gaps(&rows, &layout, 0),
+            vec![0, 0, 0, 1, 0, 1, 0, 1, 0, 0]
+        );
+        // Detailed and compact views keep only the gap before a header.
+        for compact in [false, true] {
+            let mut flat = layout.clone();
+            flat.structured = false;
+            flat.compact = compact;
+            let rows = build_rows(&endpoints, &ClientEndpointId::Local, &flat);
+            let gaps = row_gaps(&rows, &flat, 0);
+            for (index, gap) in gaps.iter().enumerate() {
+                let before_header = matches!(rows.get(index + 1), Some(Row::Header { .. }));
+                assert_eq!(*gap, u16::from(before_header));
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_structured_project_shows_only_its_header() {
+        let endpoints = fixture();
+        let mut layout = structured_layout();
+        layout.groups[0].collapsed = true;
+        let rows = build_rows(&endpoints, &ClientEndpointId::Local, &layout);
+        assert_eq!(
+            describe(&rows),
+            vec![
+                "H GTM",
+                "H Other",
+                "W scratch -",
+                "W turfobet.fr mato",
+                "A claude Claude Code settings permissions h1",
+            ]
+        );
+        assert_eq!(row_gaps(&rows, &layout, 0), vec![1, 0, 1, 0, 0]);
     }
     #[test]
     fn redraw_is_requested_only_while_an_agent_works() {
