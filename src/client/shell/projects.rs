@@ -356,9 +356,63 @@ impl ProjectLayout {
         }
     }
 
-    /// Move a workspace one step within its group (materialising rule matches
-    /// into explicit members so the order sticks).
-    pub(super) fn move_member(&mut self, members_in_view: &[String], key: &str, delta: isize) {
+    /// Move a workspace into `group_name` (empty = Other) just before the
+    /// workspace `before`, or last when `before` is `None`. `resolved` lists
+    /// every workspace the group holds right now, in display order. Rule
+    /// matches among them become explicit members so the new order sticks;
+    /// existing members (offline machines, hidden or filtered workspaces) keep
+    /// their place, and only `key` moves.
+    pub(super) fn place(
+        &mut self,
+        key: &str,
+        group_name: &str,
+        before: Option<&str>,
+        resolved: &[String],
+    ) {
+        // Dropping a workspace just before itself leaves everything as is.
+        if before.is_some_and(|before| same_workspace(before, key)) {
+            return;
+        }
+        self.assign(key, group_name);
+        let name = group_name.trim();
+        let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|group| !name.is_empty() && group.name.eq_ignore_ascii_case(name))
+        else {
+            return;
+        };
+        group.members.retain(|member| !same_workspace(member, key));
+        for member in resolved {
+            if !same_workspace(member, key)
+                && !group
+                    .members
+                    .iter()
+                    .any(|existing| same_workspace(existing, member))
+            {
+                group.members.push(member.clone());
+            }
+        }
+        let at = before
+            .and_then(|before| {
+                group
+                    .members
+                    .iter()
+                    .position(|member| same_workspace(member, before))
+            })
+            .unwrap_or(group.members.len());
+        group.members.insert(at, key.to_owned());
+    }
+
+    /// Move a workspace `delta` steps within `group`, whose workspaces are
+    /// `members_in_view` in display order (see [`ProjectLayout::place`]).
+    pub(super) fn move_member(
+        &mut self,
+        group: usize,
+        members_in_view: &[String],
+        key: &str,
+        delta: isize,
+    ) {
         let Some(position) = members_in_view.iter().position(|member| member == key) else {
             return;
         };
@@ -366,17 +420,15 @@ impl ProjectLayout {
         if target < 0 || target as usize >= members_in_view.len() {
             return;
         }
-        let mut members = members_in_view.to_vec();
-        members.swap(position, target as usize);
-        if let Some(group) = self.explicit_group(key).or_else(|| {
-            self.groups.iter().position(|group| {
-                members_in_view
-                    .iter()
-                    .any(|member| group.members.contains(member))
-            })
-        }) {
-            self.groups[group].members = members;
-        }
+        let before = if delta < 0 {
+            members_in_view.get(target as usize)
+        } else {
+            members_in_view.get(target as usize + 1)
+        };
+        let Some(name) = self.groups.get(group).map(|group| group.name.clone()) else {
+            return;
+        };
+        self.place(key, &name, before.map(String::as_str), members_in_view);
     }
 
     /// Move a group one step in display order (pinned groups stay above others).
@@ -481,16 +533,38 @@ pub(super) fn sections(
     (sections, claimed)
 }
 
-/// Visible member keys of the group that owns `key`, in display order.
+/// The group that owns `key` and every workspace it holds, in display order.
 pub(super) fn group_members_in_view(
     layout: &ProjectLayout,
     endpoints: &[ClientShellEndpoint],
     key: &str,
-) -> Vec<String> {
+) -> Option<(usize, Vec<String>)> {
     let (sections, _) = sections(layout, endpoints);
     sections
         .into_iter()
         .find(|section| section.members.iter().any(|member| member.key == key))
+        .map(|section| {
+            (
+                section.group,
+                section
+                    .members
+                    .into_iter()
+                    .map(|member| member.key)
+                    .collect(),
+            )
+        })
+}
+
+/// Every workspace the group named `name` holds, in display order.
+pub(super) fn resolved_members(
+    layout: &ProjectLayout,
+    endpoints: &[ClientShellEndpoint],
+    name: &str,
+) -> Vec<String> {
+    let (sections, _) = sections(layout, endpoints);
+    sections
+        .into_iter()
+        .find(|section| layout.groups[section.group].name == name)
         .map(|section| {
             section
                 .members
@@ -1072,10 +1146,26 @@ pub(super) fn press() -> Option<RowPress> {
         .clone()
 }
 
+/// Drop the row press; true when there was one (the caller repaints).
+pub(super) fn clear_press() -> bool {
+    press_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some()
+}
+
+/// Track the pointer of a pressed row. It becomes a drag once the pointer
+/// leaves the pressed row or moves two columns, so a slightly shaky click
+/// still focuses.
 pub(super) fn drag_to(point: (u16, u16)) -> bool {
     let mut guard = press_store().lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_mut() {
-        Some(press) if press.start != point || press.dragging.is_some() => {
+        Some(press)
+            if press.dragging.is_some()
+                || press.start.1 != point.1
+                || press.start.0.abs_diff(point.0) >= 2 =>
+        {
             press.dragging = Some(point);
             true
         }
@@ -1239,11 +1329,102 @@ mod tests {
             ..ProjectLayout::default()
         };
         let view = vec!["local/x".to_string(), "dev/y".to_string()];
-        layout.move_member(&view, "dev/y", -1);
+        layout.move_member(0, &view, "dev/y", -1);
         assert_eq!(
             layout.groups[0].members,
             vec!["dev/y".to_string(), "local/x".to_string()]
         );
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn reorder_keeps_offline_and_hidden_members() {
+        // gpu/w7 is on an offline machine and local/w3 is filtered out, so
+        // neither is in the view; both must survive a reorder in place.
+        let mut layout = ProjectLayout {
+            groups: vec![group(
+                "A",
+                &["local/w1:a", "gpu/w7:off", "local/w2:b", "local/w3:hid"],
+                &[],
+            )],
+            ..ProjectLayout::default()
+        };
+        let view = strings(&["local/w1:a", "local/w2:b"]);
+        layout.move_member(0, &view, "local/w2:b", -1);
+        assert_eq!(
+            layout.groups[0].members,
+            strings(&["local/w2:b", "local/w1:a", "gpu/w7:off", "local/w3:hid"])
+        );
+        // Drag-drop from another group: lands before the target, keeps the rest.
+        layout.groups.push(group("B", &["dev/w5:c"], &[]));
+        layout.place("dev/w5:c", "A", Some("local/w1:a"), &view);
+        assert_eq!(
+            layout.groups[0].members,
+            strings(&[
+                "local/w2:b",
+                "dev/w5:c",
+                "local/w1:a",
+                "gpu/w7:off",
+                "local/w3:hid"
+            ])
+        );
+        assert!(layout.groups[1].members.is_empty());
+        // Dropped last, and dropped just before itself (no change).
+        layout.place("local/w2:b", "A", None, &view);
+        let last = layout.groups[0].members.clone();
+        assert_eq!(last.last().map(String::as_str), Some("local/w2:b"));
+        layout.place("local/w1:a", "A", Some("local/w1:a"), &view);
+        assert_eq!(layout.groups[0].members, last);
+    }
+
+    #[test]
+    fn rule_only_project_reorders_into_explicit_members() {
+        let mut layout = ProjectLayout {
+            groups: vec![group("A", &[], &["store"])],
+            ..ProjectLayout::default()
+        };
+        let view = strings(&["local/w1:store-a", "dev/w2:store-b", "dev/w3:store-c"]);
+        layout.move_member(0, &view, "dev/w3:store-c", -1);
+        assert_eq!(
+            layout.groups[0].members,
+            strings(&["local/w1:store-a", "dev/w3:store-c", "dev/w2:store-b"])
+        );
+        let mut layout = ProjectLayout {
+            groups: vec![group("A", &[], &["store"])],
+            ..ProjectLayout::default()
+        };
+        layout.move_member(0, &view, "local/w1:store-a", 1);
+        assert_eq!(
+            layout.groups[0].members,
+            strings(&["dev/w2:store-b", "local/w1:store-a", "dev/w3:store-c"])
+        );
+        // Appending a newcomer keeps the rule matches above it.
+        layout.place("x/w9:new", "A", None, &view);
+        assert_eq!(
+            layout.groups[0].members.last().map(String::as_str),
+            Some("x/w9:new")
+        );
+        assert_eq!(layout.groups[0].members.len(), 4);
+    }
+
+    #[test]
+    fn drag_needs_a_small_move_and_clears() {
+        set_press(Some(RowPress {
+            endpoint_id: super::super::ClientEndpointId::Local,
+            workspace_id: "w1".into(),
+            pane_id: None,
+            start: (5, 5),
+            dragging: None,
+        }));
+        assert!(!drag_to((6, 5)));
+        assert!(drag_to((7, 5)));
+        assert!(drag_to((6, 5)));
+        assert!(clear_press());
+        assert!(press().is_none());
+        assert!(!clear_press());
     }
 
     #[test]

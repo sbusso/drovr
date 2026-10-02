@@ -4,6 +4,8 @@
 
 use std::borrow::Cow;
 
+use crossterm::event::{MouseButton, MouseEventKind};
+
 use super::projects;
 use super::*;
 
@@ -384,8 +386,10 @@ impl ClientShellState {
     }
 
     /// Left-button up after a row press. A click focuses the agent/workspace;
-    /// a drag onto a header moves the workspace to that project (or Other), and
-    /// a drag onto another row moves it into that row's project, just above it.
+    /// a drag moves the workspace to where it was dropped (see
+    /// `drovr_sidebar::drop_slots`): a section header appends to that project
+    /// (or Other), a row places it just before that row's workspace. Dropping
+    /// outside the sidebar changes nothing.
     pub(super) fn finish_row_press(
         &mut self,
         point: (u16, u16),
@@ -406,53 +410,53 @@ impl ClientShellState {
             self.focus_or_activate(press.endpoint_id, target, outcome);
             return true;
         }
+        let Some(target) = super::drovr_sidebar::drop_slot_at(&self.hits.drovr_drops, point)
+            .map(|slot| slot.target.clone())
+        else {
+            return true;
+        };
         let Some((key, _, _)) =
             self.workspace_label_and_paths(&press.endpoint_id, &press.workspace_id)
         else {
             return true;
         };
-        if let Some(header) = self.header_at(point) {
-            let name = if header == projects::OTHER {
-                String::new()
-            } else {
-                header
-            };
-            projects::update(|layout| {
-                layout.assign(&key, &name);
+        let name = if target.section == projects::OTHER {
+            // Already in Other: moving within it has no order to keep.
+            if self
+                .workspace_group(&press.endpoint_id, &press.workspace_id)
+                .is_none()
+            {
+                return true;
+            }
+            String::new()
+        } else {
+            target.section
+        };
+        let resolved = projects::resolved_members(&projects::layout(), &self.endpoints, &name);
+        projects::update(|layout| {
+            layout.place(&key, &name, target.before.as_deref(), &resolved);
+            if target.header {
                 if let Some(group) = layout.group_mut(&name) {
                     group.collapsed = false;
                 }
-            });
-            return true;
-        }
-        let Some(target) = self.row_at(point) else {
-            return true;
-        };
-        if target.endpoint_id == press.endpoint_id && target.workspace_id == press.workspace_id {
-            return true;
-        }
-        let target_key = self
-            .workspace_label_and_paths(&target.endpoint_id, &target.workspace_id)
-            .map(|(key, _, _)| key);
-        let group = self.workspace_group(&target.endpoint_id, &target.workspace_id);
-        let endpoints = &self.endpoints;
-        projects::update(|layout| {
-            layout.assign(&key, group.as_deref().unwrap_or(""));
-            let (Some(group), Some(target_key)) = (group.as_deref(), target_key) else {
-                return;
-            };
-            let mut view = projects::group_members_in_view(layout, endpoints, &key);
-            view.retain(|member| member != &key);
-            let position = view
-                .iter()
-                .position(|member| member == &target_key)
-                .unwrap_or(view.len());
-            view.insert(position, key.clone());
-            if let Some(group) = layout.group_mut(group) {
-                group.members = view;
             }
         });
         true
+    }
+
+    /// Drop a row press the release of which never arrived: any mouse event
+    /// other than a left drag/up (or a scroll) means the button is up by now.
+    pub(super) fn drop_stale_row_press(&mut self, kind: MouseEventKind) -> bool {
+        let live = matches!(
+            kind,
+            MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        );
+        !live && projects::clear_press()
     }
 
     /// Left-click on a project header toggles it; the header toggles switch
@@ -590,13 +594,16 @@ impl ClientShellState {
                 }
                 Action::ProjectMoveUp | Action::ProjectMoveDown => {
                     let layout = projects::layout();
-                    let view = projects::group_members_in_view(&layout, &self.endpoints, &key);
                     let delta = if action == Action::ProjectMoveUp {
                         -1
                     } else {
                         1
                     };
-                    projects::update(|layout| layout.move_member(&view, &key, delta));
+                    if let Some((group, view)) =
+                        projects::group_members_in_view(&layout, &self.endpoints, &key)
+                    {
+                        projects::update(|layout| layout.move_member(group, &view, &key, delta));
+                    }
                 }
                 _ => {}
             },
@@ -1078,5 +1085,65 @@ impl ClientShellState {
         actions.extend(self.endpoint_request(&launch.endpoint_id, text));
         actions.extend(self.endpoint_request(&launch.endpoint_id, enter));
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_input::RawInputEvent;
+    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
+
+    fn mouse(kind: MouseEventKind) -> RawInputEvent {
+        RawInputEvent::Mouse(MouseEvent {
+            kind,
+            column: 70,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn press() {
+        projects::set_press(Some(projects::RowPress {
+            endpoint_id: ClientEndpointId::Local,
+            workspace_id: "w1".into(),
+            pane_id: None,
+            start: (2, 3),
+            dragging: Some((2, 6)),
+        }));
+    }
+
+    #[test]
+    fn stale_row_press_is_cleared() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(
+            &crate::config::Config::default(),
+        ));
+        // A lost mouse-up: the next plain move, a new press (any button) or a
+        // focus loss means the button is up, so the old press must not linger.
+        let events: [fn() -> RawInputEvent; 5] = [
+            || mouse(MouseEventKind::Moved),
+            || mouse(MouseEventKind::Down(MouseButton::Left)),
+            || mouse(MouseEventKind::Down(MouseButton::Right)),
+            || RawInputEvent::OuterFocusLost,
+            || {
+                RawInputEvent::Key(crate::input::TerminalKey::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                ))
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            press();
+            state.handle_raw_events(vec![event()]);
+            assert!(projects::press().is_none(), "event {index}");
+        }
+        // A live drag survives drag and scroll events.
+        press();
+        state.handle_raw_events(vec![
+            mouse(MouseEventKind::Drag(MouseButton::Left)),
+            mouse(MouseEventKind::ScrollDown),
+        ]);
+        assert!(projects::press().is_some());
+        projects::clear_press();
     }
 }

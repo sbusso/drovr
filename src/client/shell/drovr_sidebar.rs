@@ -26,6 +26,97 @@ pub(super) struct RowHit {
     pub(super) pane_id: Option<String>,
 }
 
+/// Where a workspace dropped on the sidebar goes: into `section` (a project
+/// name, or [`OTHER`]) just before the workspace `before`, or last.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DropTarget {
+    pub(super) section: String,
+    pub(super) before: Option<String>,
+    /// Dropped on the section header itself.
+    pub(super) header: bool,
+}
+
+/// A band of sidebar rows that resolves to one [`DropTarget`]; `marker` is the
+/// row that shows the insertion line (or the header to highlight).
+#[derive(Clone, Debug)]
+pub(super) struct DropSlot {
+    pub(super) rect: Rect,
+    pub(super) target: DropTarget,
+    pub(super) marker: u16,
+}
+
+/// One drawn row as drop resolution sees it: a section header (`key` None)
+/// or a row of the workspace `key`.
+struct Placed {
+    y: u16,
+    height: u16,
+    section: String,
+    key: Option<String>,
+}
+
+/// Drop bands for the drawn rows, top to bottom down to `bottom`:
+/// - a section header appends to that section;
+/// - a workspace's rows, and the blank lines above them, drop before it;
+/// - the lower half of a section's last workspace, and the blank lines after
+///   it (or after an empty or collapsed header), append to the section.
+fn drop_slots(placed: &[Placed], x: u16, width: u16, bottom: u16) -> Vec<DropSlot> {
+    // Consecutive rows of one workspace form a block.
+    let mut blocks: Vec<(String, Option<String>, u16, u16)> = Vec::new();
+    for row in placed {
+        let end = row.y.saturating_add(row.height);
+        match blocks.last_mut() {
+            Some(block) if row.key.is_some() && block.1 == row.key && block.0 == row.section => {
+                block.3 = end;
+            }
+            _ => blocks.push((row.section.clone(), row.key.clone(), row.y, end)),
+        }
+    }
+    let mut slots = Vec::new();
+    let mut push = |top: u16, end: u16, section: &str, before: Option<&String>, header, marker| {
+        if end > top {
+            slots.push(DropSlot {
+                rect: Rect::new(x, top, width, end - top),
+                target: DropTarget {
+                    section: section.to_owned(),
+                    before: before.cloned(),
+                    header,
+                },
+                marker,
+            });
+        }
+    };
+    for (index, (section, key, top, end)) in blocks.iter().enumerate() {
+        let next = blocks.get(index + 1);
+        let limit = next.map_or(bottom, |next| next.2).max(*end);
+        // The insertion line for "last": the row right after the section.
+        let after = (*end).min(bottom.saturating_sub(1));
+        let Some(key) = key else {
+            push(*top, *end, section, None, true, *top);
+            push(*end, limit, section, None, false, after);
+            continue;
+        };
+        let marker = top.saturating_sub(1).max(placed[0].y);
+        match next {
+            Some((next_section, Some(next_key), next_top, _)) if next_section == section => {
+                push(*top, *end, section, Some(key), false, marker);
+                let next_marker = next_top.saturating_sub(1);
+                push(*end, limit, section, Some(next_key), false, next_marker);
+            }
+            _ => {
+                let split = top + (end - top).div_ceil(2);
+                push(*top, split, section, Some(key), false, marker);
+                push(split, limit, section, None, false, after);
+            }
+        }
+    }
+    slots
+}
+
+/// The drop band under `point`, if any (outside the sidebar there is none).
+pub(super) fn drop_slot_at(slots: &[DropSlot], point: (u16, u16)) -> Option<&DropSlot> {
+    slots.iter().find(|slot| super::contains(slot.rect, point))
+}
+
 enum Row {
     Header {
         key: String,
@@ -465,8 +556,35 @@ pub(super) fn render_panel(
     if area.height < 3 || area.width < 8 {
         return;
     }
+    render_panel_with(
+        buffer,
+        area,
+        config,
+        &projects::layout(),
+        endpoints,
+        active_endpoint_id,
+        workspace_scroll,
+        reveal_focused,
+        ground,
+        hits,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // one render pass; a struct would only shuffle these
+fn render_panel_with(
+    buffer: &mut Buffer,
+    area: Rect,
+    config: &ClientShellConfig,
+    layout: &ProjectLayout,
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    workspace_scroll: &mut usize,
+    reveal_focused: bool,
+    ground: radar::Ground,
+    hits: &mut ShellHitMap,
+) {
+    let palette = &config.palette;
     let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
-    let layout = projects::layout();
 
     // Header: filter toggle (left) and view toggle (right).
     let filter = if layout.active_only {
@@ -490,7 +608,7 @@ pub(super) fn render_panel(
             .add_modifier(Modifier::BOLD),
     );
     // Attention counter: how many agents need you; click = next one (prefix+u).
-    let (needing, blocked) = attention_count(endpoints, &layout);
+    let (needing, blocked) = attention_count(endpoints, layout);
     hits.drovr_attention = Rect::default();
     if needing > 0 {
         let counter = format!(" ● {needing}");
@@ -535,16 +653,17 @@ pub(super) fn render_panel(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = build_rows(endpoints, active_endpoint_id, &layout);
+    let rows = build_rows(endpoints, active_endpoint_id, layout);
+    // One blank, inert line between the toggles and the first section.
     let body = Rect::new(
         inner.x,
-        inner.y + 1,
+        inner.y + 2,
         inner.width,
-        inner.height.saturating_sub(2),
+        inner.height.saturating_sub(3),
     );
     hits.workspace_body = body;
     let row_heights = rows.iter().map(Row::height).collect::<Vec<_>>();
-    let gaps = row_gaps(&rows, &layout, config.agents.row_gap);
+    let gaps = row_gaps(&rows, layout, config.agents.row_gap);
     if reveal_focused {
         if let Some(target) = rows.iter().position(|row| match row {
             Row::Agent { focused, .. } | Row::Workspace { focused, .. } => *focused,
@@ -568,8 +687,18 @@ pub(super) fn render_panel(
         .saturating_sub(metrics.offset_from_bottom);
     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
     let width = body.width.saturating_sub(u16::from(show_scrollbar));
-    let drag_point = projects::press().and_then(|press| press.dragging);
+    let mut section = String::new();
+    let sections = rows
+        .iter()
+        .map(|row| {
+            if let Row::Header { key, .. } = row {
+                section.clone_from(key);
+            }
+            section.clone()
+        })
+        .collect::<Vec<_>>();
 
+    let mut placed = Vec::new();
     let mut y = body.y;
     for (index, row) in rows.iter().enumerate().skip(*workspace_scroll) {
         let height = row_heights[index];
@@ -577,11 +706,32 @@ pub(super) fn render_panel(
             break;
         }
         let rect = Rect::new(body.x, y, width, height);
-        render_row(
-            buffer, rect, row, &layout, endpoints, config, ground, drag_point, hits,
-        );
+        render_row(buffer, rect, row, layout, endpoints, config, ground, hits);
+        let key = match row {
+            Row::Header { .. } => None,
+            Row::Agent {
+                endpoint,
+                workspace_id,
+                ..
+            }
+            | Row::Workspace {
+                endpoint,
+                workspace_id,
+                ..
+            } => row_workspace_key(&endpoints[*endpoint], workspace_id),
+        };
+        if key.is_some() || matches!(row, Row::Header { .. }) {
+            placed.push(Placed {
+                y,
+                height,
+                section: sections[index].clone(),
+                key,
+            });
+        }
         y = y.saturating_add(height).saturating_add(gaps[index]);
     }
+    hits.drovr_drops = drop_slots(&placed, body.x, width, body.bottom());
+    draw_drag_feedback(buffer, body.x, width, endpoints, config, hits);
     if show_scrollbar {
         let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
         hits.workspace_scrollbar = track;
@@ -691,7 +841,6 @@ fn render_row(
     endpoints: &[ClientShellEndpoint],
     config: &ClientShellConfig,
     ground: radar::Ground,
-    drag_point: Option<(u16, u16)>,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -754,9 +903,6 @@ fn render_row(
             count,
             usage,
         } => {
-            if drag_point.is_some_and(|point| super::contains(rect, point)) {
-                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
-            }
             let marker = if *collapsed { "▸" } else { "▾" };
             let pin = if *pinned { "★ " } else { "" };
             let other = key == OTHER;
@@ -968,6 +1114,87 @@ fn render_row(
                 pane_id: None,
             });
         }
+    }
+}
+
+fn row_workspace_key(endpoint: &ClientShellEndpoint, workspace_id: &str) -> Option<String> {
+    endpoint
+        .snapshot
+        .as_deref()?
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .map(|workspace| projects::workspace_key(endpoint, workspace))
+}
+
+/// While a row is dragged: show the dragged workspace's rows reversed, and
+/// where it would land, either the target header highlighted or an accent
+/// insertion line (carrying the workspace's name on a blank line).
+fn draw_drag_feedback(
+    buffer: &mut Buffer,
+    x: u16,
+    width: u16,
+    endpoints: &[ClientShellEndpoint],
+    config: &ClientShellConfig,
+    hits: &ShellHitMap,
+) {
+    let Some(press) = projects::press() else {
+        return;
+    };
+    let Some(point) = press.dragging else {
+        return;
+    };
+    let palette = &config.palette;
+    for hit in &hits.drovr_rows {
+        if hit.endpoint_id == press.endpoint_id && hit.workspace_id == press.workspace_id {
+            buffer.set_style(hit.rect, Style::default().add_modifier(Modifier::REVERSED));
+        }
+    }
+    let Some(slot) = drop_slot_at(&hits.drovr_drops, point) else {
+        return;
+    };
+    let line = Rect::new(x, slot.marker, width, 1);
+    if slot.target.header {
+        buffer.set_style(
+            line,
+            Style::default()
+                .bg(palette.active_row_bg)
+                .add_modifier(Modifier::UNDERLINED),
+        );
+        return;
+    }
+    let blank =
+        (line.x..line.right()).all(|column| buffer[(column, line.y)].symbol().trim().is_empty());
+    for column in line.x..line.right() {
+        let cell = &mut buffer[(column, line.y)];
+        if cell.symbol().trim().is_empty() {
+            cell.set_symbol("─");
+            cell.set_fg(palette.accent);
+        }
+    }
+    let label = endpoints
+        .iter()
+        .find(|endpoint| endpoint.endpoint_id == press.endpoint_id)
+        .and_then(|endpoint| endpoint.snapshot.as_deref())
+        .and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == press.workspace_id)
+        })
+        .map(|workspace| workspace.label.clone());
+    if let (true, Some(label)) = (blank, label) {
+        let room = line.width.saturating_sub(4);
+        put_text(
+            buffer,
+            line.x + 2,
+            line.y,
+            room,
+            &radar::fit(&format!(" {label} "), room),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 }
 
@@ -1623,7 +1850,6 @@ mod tests {
                 &endpoints,
                 &config,
                 radar::Ground::Dark,
-                None,
                 &mut hits,
             );
             y += row.height();
@@ -1697,7 +1923,6 @@ mod tests {
                 &endpoints,
                 &config,
                 radar::Ground::Dark,
-                None,
                 &mut ShellHitMap::default(),
             );
             (0..area.width)
@@ -1779,7 +2004,6 @@ mod tests {
                     endpoints,
                     &config,
                     radar::Ground::Dark,
-                    None,
                     &mut ShellHitMap::default(),
                 );
             }
@@ -1824,7 +2048,6 @@ mod tests {
             &endpoints,
             &config,
             radar::Ground::Dark,
-            None,
             &mut ShellHitMap::default(),
         );
         let line = (0..area.width)
@@ -1832,5 +2055,199 @@ mod tests {
             .collect::<String>();
         assert!(line.contains("turfobet.fr"), "{line:?}");
         assert!(line.contains("gpu-bo…"), "{line:?}");
+    }
+
+    fn placed(y: u16, section: &str, key: Option<&str>) -> Placed {
+        Placed {
+            y,
+            height: 1,
+            section: section.into(),
+            key: key.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn drop_targets_cover_headers_rows_gaps_and_other() {
+        // 0 H A | 1 W a, 2-3 agents | 4 gap | 5 W b, 6 agent | 7 gap |
+        // 8 H Other | 9 W c | 10 W d | 11.. empty body down to 14.
+        let rows = vec![
+            placed(0, "A", None),
+            placed(1, "A", Some("a")),
+            placed(2, "A", Some("a")),
+            placed(3, "A", Some("a")),
+            placed(5, "A", Some("b")),
+            placed(6, "A", Some("b")),
+            placed(8, OTHER, None),
+            placed(9, OTHER, Some("c")),
+            placed(10, OTHER, Some("d")),
+        ];
+        let slots = drop_slots(&rows, 0, 20, 14);
+        let at = |y: u16| {
+            drop_slot_at(&slots, (3, y)).map(|slot| {
+                (
+                    slot.target.section.clone(),
+                    slot.target.before.clone(),
+                    slot.target.header,
+                    slot.marker,
+                )
+            })
+        };
+        let target = |section: &str, before: Option<&str>, header: bool, marker: u16| {
+            Some((section.to_owned(), before.map(Into::into), header, marker))
+        };
+        // Header: append to that section, highlight the header itself.
+        assert_eq!(at(0), target("A", None, true, 0));
+        assert_eq!(at(8), target(OTHER, None, true, 8));
+        // Any row of a workspace (header or agent): before that workspace.
+        for y in 1..=3 {
+            assert_eq!(at(y), target("A", Some("a"), false, 0));
+        }
+        // The blank line between two workspaces: before the lower one.
+        assert_eq!(at(4), target("A", Some("b"), false, 4));
+        // Last workspace: upper half before it, lower half and the gap after
+        // the section append (the line under the section shows the marker).
+        assert_eq!(at(5), target("A", Some("b"), false, 4));
+        assert_eq!(at(6), target("A", None, false, 7));
+        assert_eq!(at(7), target("A", None, false, 7));
+        // Other: same rules; a one-row last workspace keeps "before it".
+        assert_eq!(at(9), target(OTHER, Some("c"), false, 8));
+        assert_eq!(at(10), target(OTHER, Some("d"), false, 9));
+        assert_eq!(at(12), target(OTHER, None, false, 11));
+        // Outside the body or the sidebar: nothing (the drop is cancelled).
+        assert_eq!(at(14), None);
+        assert!(drop_slot_at(&slots, (25, 1)).is_none());
+        // A collapsed (header-only) section takes drops on its trailing gap.
+        let slots = drop_slots(&[placed(0, "A", None), placed(2, "B", None)], 0, 20, 4);
+        let section = |y| drop_slot_at(&slots, (0, y)).map(|slot| slot.target.clone());
+        assert_eq!(
+            section(1),
+            Some(DropTarget {
+                section: "A".into(),
+                before: None,
+                header: false
+            })
+        );
+        assert!(section(2).is_some_and(|target| target.header && target.section == "B"));
+    }
+
+    #[test]
+    fn blank_line_separates_toggles_from_the_first_section_in_every_view() {
+        let endpoints = fixture();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        for (compact, structured) in [(false, false), (true, false), (false, true)] {
+            let mut layout = structured_layout();
+            layout.compact = compact;
+            layout.structured = structured;
+            let area = Rect::new(0, 0, 35, 30);
+            let mut buffer = Buffer::empty(area);
+            let mut hits = ShellHitMap::default();
+            let mut scroll = 0;
+            render_panel_with(
+                &mut buffer,
+                area,
+                &config,
+                &layout,
+                &endpoints,
+                &ClientEndpointId::Local,
+                &mut scroll,
+                true,
+                radar::Ground::Dark,
+                &mut hits,
+            );
+            let view = (compact, structured);
+            assert_eq!(hits.drovr_filter_toggle.y, 0, "{view:?}");
+            assert_eq!(hits.workspace_body.y, 2, "{view:?}");
+            assert_eq!(hits.workspace_body.height, 27, "{view:?}");
+            let first = hits.projects.first().map(|(rect, _)| rect.y);
+            assert_eq!(first, Some(2), "{view:?}");
+            let line = (0..area.width.saturating_sub(1))
+                .map(|x| buffer[(x, 1)].symbol().to_owned())
+                .collect::<String>();
+            assert!(line.trim().is_empty(), "{view:?} {line:?}");
+            let covers = |rect: Rect| rect.y <= 1 && 1 < rect.bottom();
+            assert!(hits.drovr_rows.iter().all(|hit| !covers(hit.rect)));
+            assert!(hits.projects.iter().all(|(rect, _)| !covers(*rect)));
+            assert!(hits.drovr_drops.iter().all(|slot| !covers(slot.rect)));
+            assert!(drop_slot_at(&hits.drovr_drops, (3, 1)).is_none());
+            // Every drawn row still resolves to a drop target below the line.
+            for hit in &hits.drovr_rows {
+                assert!(
+                    drop_slot_at(&hits.drovr_drops, (hit.rect.x + 1, hit.rect.y)).is_some(),
+                    "{view:?}"
+                );
+            }
+            assert_eq!(scroll, 0, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn dragging_an_agent_row_targets_its_workspace() {
+        let endpoints = fixture();
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let layout = structured_layout();
+        let area = Rect::new(0, 0, 35, 30);
+        let mut buffer = Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        render_panel_with(
+            &mut buffer,
+            area,
+            &config,
+            &layout,
+            &endpoints,
+            &ClientEndpointId::Local,
+            &mut 0,
+            false,
+            radar::Ground::Dark,
+            &mut hits,
+        );
+        let p2 = hits
+            .drovr_rows
+            .iter()
+            .find(|hit| hit.pane_id.as_deref() == Some("p2"))
+            .expect("agent row");
+        let target = drop_slot_at(&hits.drovr_drops, (2, p2.rect.y)).expect("drop slot");
+        assert_eq!(target.target.section, "GTM");
+        assert_eq!(target.target.before.as_deref(), Some("local/w1:gtm-rd"));
+        // The last agent row of the section appends to it.
+        let p3 = hits
+            .drovr_rows
+            .iter()
+            .find(|hit| hit.pane_id.as_deref() == Some("p3"))
+            .expect("agent row");
+        let last = drop_slot_at(&hits.drovr_drops, (2, p3.rect.y)).expect("drop slot");
+        assert_eq!(
+            (last.target.section.as_str(), &last.target.before),
+            ("GTM", &None)
+        );
+        // While dragging gtm-rd onto the blank line under the section, that
+        // line shows an accent insertion marker carrying the workspace name.
+        let gap = p3.rect.y + 1;
+        projects::set_press(Some(projects::RowPress {
+            endpoint_id: ClientEndpointId::Local,
+            workspace_id: "w1".into(),
+            pane_id: None,
+            start: (2, 3),
+            dragging: Some((2, gap)),
+        }));
+        let mut buffer = Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        render_panel_with(
+            &mut buffer,
+            area,
+            &config,
+            &layout,
+            &endpoints,
+            &ClientEndpointId::Local,
+            &mut 0,
+            false,
+            radar::Ground::Dark,
+            &mut hits,
+        );
+        projects::clear_press();
+        let line = (0..area.width)
+            .map(|x| buffer[(x, gap)].symbol().to_owned())
+            .collect::<String>();
+        assert!(line.starts_with("── gtm-rd ──"), "{line:?}");
+        assert_eq!(buffer[(0, gap)].fg, config.palette.accent);
     }
 }

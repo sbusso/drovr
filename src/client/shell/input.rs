@@ -170,6 +170,15 @@ impl ClientShellState {
                 push_host_theme_update(&mut outcome.requests, update);
             }
             match event {
+                // drovr fork: Esc cancels a sidebar row drag.
+                RawInputEvent::Key(key)
+                    if key.code == KeyCode::Esc
+                        && key.kind != crossterm::event::KeyEventKind::Release
+                        && super::projects::press().is_some() =>
+                {
+                    super::projects::clear_press();
+                    outcome.repaint = true;
+                }
                 RawInputEvent::Key(key) => self.handle_key(key, &mut outcome),
                 RawInputEvent::Text(text) => {
                     let text = text.into_string();
@@ -252,6 +261,7 @@ impl ClientShellState {
                 }
                 RawInputEvent::OuterFocusLost => {
                     outcome.repaint |= self.clear_link_hover();
+                    outcome.repaint |= super::projects::clear_press();
                     self.outer_focused = Some(false);
                     self.release_input_leases(&mut outcome);
                     outcome
