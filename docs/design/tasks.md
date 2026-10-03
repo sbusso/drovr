@@ -458,8 +458,9 @@ Gate (`gate(&[Criterion]) -> Gate`): passes when every criterion is
 `passed`. A task with no criteria passes. Failed criteria are reported before
 open ones.
 
-A human move sets `auto_status = 0` on that task. Starting a new attempt
-sets it back to 1. The task view has an `auto` chip that toggles it.
+A human move sets `auto_status = 0` on that task, except a send back with an
+open attempt, which sets it to 1 so the agent's signals move the task again.
+Starting a new attempt sets it back to 1. The task view has an `auto` chip that toggles it.
 
 Every status change writes an event entry: `event_type = "status"`, `body =
 "{from} → {to}"` plus ` ({actor})` for agent and auto moves, plus `: {note}`
@@ -1087,7 +1088,8 @@ Code:
   the inbox's generic keys (Esc blur, close).
 - `handle_inbox_mouse`: border drag and header view labels first; then, in
   Tasks, `self.handle_tasks_mouse(mouse, outcome) -> bool`.
-- The view is remembered in the session only.
+- The view is remembered in the session only, while the panel is open:
+  `prefix i` on a closed panel opens it on the Inbox view.
 - `open_tasks_panel(project, outcome)` (B): sets `filter =
   Project(project)`, `view = Tasks`, opens and focuses the panel.
 
@@ -1279,11 +1281,16 @@ Regions from top to bottom:
    with `project_actions::open_local_editor(pane_id, path)` (a split under
    a local pane: the live attempt's pane when it is local, else the focused
    local pane; no local pane = status line `open a local pane to edit`). The
-   panel remembers `(path, mtime, version)`; on each mtime change it saves
-   the body with `expected_version = version` and takes the new version. On
-   `stale` it does not save: the file stays, and the status line says
-   `AC-12 changed while you edited; your text is in {path}`. The file is
-   deleted after a successful save once the editor pane is gone.
+   panel remembers `(path, mtime, base)`, `base` being the description the
+   edit started from; on each mtime change it saves the body when the stored
+   description still equals `base` (version bumps from usage copies or
+   moves do not refuse it) and takes the saved body as the new `base`.
+   Otherwise (`stale`) it does not save: the file stays, and the status line
+   says `AC-12 changed while you edited; your text is in {path}; e reopens
+   it`. After a refused or failed save, `e` reopens that file instead of
+   writing the description over it, and its next save replaces the
+   description. The file is deleted after a successful save once the view
+   closes.
 5. Criteria: `Criteria 2/3`, then one line each: mark (`✓` green, `✗` red,
    `○` `overlay0`), text (passed text `overlay0`), `chk` suffix when
    `check_cmd` is set, `e` at the right edge when there is evidence. Click a
@@ -1324,7 +1331,9 @@ Regions from top to bottom:
    shows `archive` (sets `archived`; the card leaves the Done lane).
 
 Every input (title, note, reply, send-back note, composer) keeps its text
-when the write fails; it clears only on Ok.
+when the write fails; it clears only on Ok or Esc. A click elsewhere, or
+leaving the view, closes the input but keeps its text, and the same input
+(same purpose and task) opens with it again.
 
 Keys: `Esc` back, `m` move, `e` edit description, `1`-`8` rule, `r` reply,
 `a` accept, `b` send back, `t` next tab, `s` start, `p` focus pane, `c`
@@ -1557,12 +1566,17 @@ Start in the card menu. All of it is C's `launch_task` / `launch_task_on`.
    to working and sets `workspace_key` and `auto_status = 1`. A launch not
    found within 60 s is dropped with the notice `{id}: workspace did not
    appear on {machine}`.
-6. First prompt. When the pane's agent is detected (agent status not
-   `None`), or 5 s after `typed_at`, whichever comes first, send
+6. First prompt. When the pane's agent is detected and not blocked (a
+   trust or login dialog is answered first), send
    `Method::AgentPrompt { target: pane_id, text, wait: None }` (the call the
    inbox uses for replies) with
    `Work on drovr task {id}: {name}. Read {context path} first. Report with
-   drovr task (skill drovr-tasks).` Then the launch is removed.
+   drovr task (skill drovr-tasks).` Then the launch is removed. herdr's
+   `agent.prompt` refuses a pane without a detected, unblocked agent, so
+   there is no timed fallback: with no ready agent 90 s after `typed_at`,
+   the launch ends the attempt it opened (`release`, note `no agent started
+   in its pane`) and shows `{id}: no agent started in {pane key} (`cc`);
+   prompt not sent`.
 
 Several launches may be pending at once; each is matched by its own label
 and `known` set.
@@ -1577,7 +1591,9 @@ pinned notes change and an attempt is live on that machine, through one
 `TaskJob::WriteFiles` per machine (local machine: the same job on
 `/bin/sh`). The snapshot `R/tasks/{id}.json` of section 6.3 is written in
 the same job. `tick_tasks` notices the change through `data_version` and
-compares `tasks.version` per live task with the version it last wrote.
+compares `tasks.version` per live task with the version it last wrote. A
+failed file job forgets the versions written on that machine, so the next
+reload writes them again.
 
 ### 5.3 Worktree or workspace removed
 
@@ -1586,6 +1602,13 @@ machine's snapshot for 30 s while that machine stays Online with the same
 `boot_id`, the client ends the attempt as `stopped` with the note
 `workspace closed` and, if the task is working or blocked and
 `auto_status = 1`, moves it to ready.
+
+herdr reuses workspace ids after a restart, so a task's `workspace_key`
+does not outlive its workspace: the same 30 s rule clears it on every
+linked task (live or not), and a move into `done` or `cancelled` clears it
+at once. A live task without a key (a local db-mode `drovr task start`) is
+linked to its pane's workspace on the next reload. Ceiling: a workspace
+closed while no client runs keeps its links until its id is reused.
 
 An offline machine, a reconnect, or a new `boot_id` (server restart) resets
 the 30 s clock for every attempt on that machine; none of them ends an
@@ -1730,7 +1753,8 @@ is the same path):
 ```
 R/task-outbox/{pane_id}/epoch          6 random [a-z0-9] chars, created with seq
 R/task-outbox/{pane_id}/seq            last allocated seq (text integer)
-R/task-outbox/{pane_id}/.lock/         mkdir lock around seq allocation
+R/task-outbox/{pane_id}/.lock/         mkdir lock around seq allocation and
+                                       the op file write
 R/task-outbox/{pane_id}/{seq}.json     one OutboxOp, one line, written as
                                        .{seq}.tmp then renamed
 R/task-reply/{pane_id}-{epoch}-{seq}.json  OpResult plus "exit", written by the client
@@ -1747,9 +1771,11 @@ epoch with seq starting at 1; because `apply_once`'s source is
 
 Remote CLI in outbox mode:
 
-1. Allocate seq (mkdir lock, retry every 20 ms up to 2 s, stale lock older
-   than 10 s removed), create `epoch` when missing, write `{seq}.json` with
-   `v = OUTBOX_V`, fsync, rename.
+1. Under the mkdir lock (retry every 20 ms up to 2 s, stale lock older
+   than 10 s removed): create `epoch` when missing, allocate seq, write
+   `{seq}.json` with `v = OUTBOX_V`, fsync, rename. The op file lands before
+   the lock goes, so files appear in seq order and a pull never records an
+   applied seq above an op not yet on disk.
 2. Ring: `herdr pane report-metadata $HERDR_PANE_ID --source drovr-task
    --seq {unix nanos} --token drovr_tq={epoch}.{seq}|{unix}`
    (`$HERDR_BIN_PATH` or `herdr`). A failed ring is ignored: the sweep
@@ -1802,7 +1828,8 @@ pub(crate) fn receive_task_job(&mut self, done: TaskJobDone) -> bool; // true = 
 `receive_task_job` like `InboxReply`. At most one job per machine is in
 flight (`TaskRuntime.busy: HashSet<String>`).
 
-When to pull, per remote machine:
+When to pull, per remote machine and for this Mac (an agent drovr did not
+launch queues to the local outbox until `tasks.db` exists):
 
 - an agent's `drovr_tq` value changed since the last pull (in-memory map
   `pane_key -> token value`);
@@ -1866,8 +1893,8 @@ attempt and whose task has `auto_status = 1`. It reads the same
 - Blocked caused by an open decision is left alone: a working signal does not
   move a task with an open decision.
 - "doing" is the CLI's alias for working (`Status::parse`).
-- Manual override: any human move sets `auto_status = 0`; the `auto` chip or
-  a new start sets it back.
+- Manual override: any human move but a send back with an open attempt
+  sets `auto_status = 0`; the `auto` chip or a new start sets it back.
 - `tick_tasks` runs from `tick_drovr` (100 ms timer) whether the panel is
   open or not. Its own cadence: sync on every call (it only reads
   snapshots, and writes on a change); `data_version` check and decision
@@ -2168,8 +2195,9 @@ Builder C (`task_launch`, `task_sync`, `task_ingest` inline tests):
   cwd, and the env map of section 5.1 (no typed `export`).
 - two launches pending at once each find their own workspace and type
   `cc` once.
-- the first prompt goes out as `AgentPrompt` when the agent is detected,
-  else after 5 s.
+- the first prompt goes out as `AgentPrompt` when the agent is detected
+  and not blocked; with no ready agent after 90 s the attempt ends and a
+  notice says the prompt was not sent.
 - an offline machine, a reconnect and a new boot id do not end attempts;
   a workspace missing for 30 s on an online machine with the same boot id
   does.
