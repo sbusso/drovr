@@ -60,7 +60,6 @@ herdr's `config.toml`.
  ▾ GTM ──────────────── ● 1 · 3   ← section: needs you · agents
    gtm-rd
      ✓ Fix auth flow in gateway
-                                  ← agent_gap
      ? Review PR 42
 
    scratch                        ← no agents: dimmed
@@ -69,7 +68,7 @@ herdr's `config.toml`.
 In the structured view a section header carries a thin rule and, on the
 right, how many of its agents need you (`● n`, only when some do) and how
 many agents it shows; a collapsed section keeps both counts. Agents of one
-workspace are one blank row apart (`agent_gap = 1`, set `0` to stack them),
+workspace stack with no blank row (`agent_gap = 1` puts one between them),
 and workspaces without agents are dimmed (`show_empty_workspaces = false`
 hides them). Both go under `[ui.sidebar]` in herdr's `config.toml`.
 

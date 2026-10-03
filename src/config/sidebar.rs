@@ -500,7 +500,7 @@ impl Default for SidebarConfig {
             agent_icons: AgentIconsConfig::default(),
             banner: true,
             show_empty_workspaces: true,
-            agent_gap: 1,
+            agent_gap: 0,
         }
     }
 }

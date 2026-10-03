@@ -3380,13 +3380,13 @@ mod tests {
         );
         assert!(describe(&rows).contains(&"W scratch -".to_owned()));
         let config: crate::config::Config =
-            toml::from_str("[ui.sidebar]\nshow_empty_workspaces = false\nagent_gap = 0\n")
+            toml::from_str("[ui.sidebar]\nshow_empty_workspaces = false\nagent_gap = 1\n")
                 .expect("valid config");
         assert!(!config.ui.sidebar.show_empty_workspaces);
-        assert_eq!(config.ui.sidebar.agent_gap, 0);
+        assert_eq!(config.ui.sidebar.agent_gap, 1);
         let defaults = crate::config::Config::default().ui.sidebar;
         assert!(defaults.show_empty_workspaces);
-        assert_eq!(defaults.agent_gap, 1);
+        assert_eq!(defaults.agent_gap, 0);
     }
 
     /// The fixture with hook tokens: p1 (claude, gtm-rd) runs a tool, p2
