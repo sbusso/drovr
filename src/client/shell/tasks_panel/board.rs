@@ -420,6 +420,10 @@ pub(super) fn draw(
             }
         }
     }
+    // An open input is the first row: keep it on screen while it takes keys.
+    if matches!(plan.rows.first(), Some(Row::Input)) {
+        scroll = 0;
+    }
     state.scroll = scroll;
     let inner = right.saturating_sub(left);
     let ctx = Ctx {

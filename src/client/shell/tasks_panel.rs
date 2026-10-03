@@ -273,6 +273,22 @@ pub(super) enum Purpose {
     Composer(String),
 }
 
+impl Purpose {
+    /// What a text left by a click away is kept under; None for the filter,
+    /// which applies as it is typed.
+    fn stash_key(&self) -> Option<String> {
+        Some(match self {
+            Self::New => "new".into(),
+            Self::Filter => return None,
+            Self::Title { id, .. } => format!("title:{id}"),
+            Self::AddCriterion(id) => format!("criterion:{id}"),
+            Self::Reply { id, decision } => format!("reply:{id}:{decision}"),
+            Self::SendBack(id) => format!("send-back:{id}"),
+            Self::Composer(id) => format!("note:{id}"),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Input {
     pub(super) purpose: Purpose,
@@ -336,6 +352,9 @@ pub(super) struct TasksState {
     /// The `/` text filter.
     text: Option<String>,
     pub(super) input: Option<Input>,
+    /// Text of inputs closed by a click away or by leaving the view, by
+    /// [`Purpose::stash_key`]; reopening the same input restores it.
+    stash: HashMap<String, String>,
     status: Option<(String, Instant)>,
     hover: Option<String>,
     tab: DetailTab,
@@ -397,10 +416,25 @@ impl TasksState {
     }
 
     fn open_input(&mut self, purpose: Purpose, text: &str) {
+        let kept = purpose.stash_key().and_then(|key| self.stash.remove(&key));
         self.input = Some(Input {
+            editor: NoteEditor::new(kept.as_deref().unwrap_or(text)),
             purpose,
-            editor: NoteEditor::new(text),
         });
+    }
+
+    /// Closes the input without losing its text: only Enter (Ok) and Esc
+    /// drop what was typed.
+    fn put_input_aside(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let text = input.editor.text();
+        if let Some(key) = input.purpose.stash_key() {
+            if !text.trim().is_empty() {
+                self.stash.insert(key, text);
+            }
+        }
     }
 
     /// Whether `lane` is folded on the board.
@@ -418,7 +452,7 @@ impl TasksState {
     fn close_view(&mut self) {
         self.open = None;
         self.detail = None;
-        self.input = None;
+        self.put_input_aside();
         self.to_decision = false;
         self.follow = true;
     }
@@ -933,7 +967,7 @@ impl ClientShellState {
 
     /// Back to the board. The loaded key keeps its scope so the reload is
     /// not a move: a workspace filter with one task would reopen it.
-    fn close_task_view(&mut self) {
+    pub(super) fn close_task_view(&mut self) {
         self.finish_task_edit();
         let state = &mut self.inbox.tasks;
         state.close_view();
@@ -2026,15 +2060,19 @@ impl ClientShellState {
                 outcome.repaint = true;
                 if on_new {
                     if self.inbox.tasks.project().is_some() {
+                        // The New input is drawn on the board only.
+                        if self.inbox.tasks.open.is_some() {
+                            self.close_task_view();
+                        }
                         self.inbox.tasks.open_input(Purpose::New, "");
                     }
                     return true;
                 }
                 if let Some(hit) = hit {
-                    // A click elsewhere closes the input (a failed write
-                    // already kept its text on screen until now).
+                    // A click elsewhere closes the input; its text comes
+                    // back when the same input opens again.
                     if hit != Hit::Composer {
-                        self.inbox.tasks.input = None;
+                        self.inbox.tasks.put_input_aside();
                     }
                     self.click_task_hit(hit, point, outcome);
                 }

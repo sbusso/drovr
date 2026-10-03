@@ -773,3 +773,89 @@ fn a_refused_editor_save_is_reopened_not_overwritten() {
     assert_eq!(task(&id).body, "mine again");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn new_from_a_task_view_goes_back_to_the_board_with_the_input_shown() {
+    let id = add("Viewed", Status::Ready, None, &[]);
+    let mut state = tasks_shell();
+    let mut outcome = ClientShellInput::default();
+    state.open_task_view(&id, &mut outcome);
+    render(&mut state, 80, 20);
+    let new = state.inbox.tasks.hits.new;
+    click(&mut state, (new.x, new.y));
+    assert!(state.inbox.tasks.open.is_none(), "back on the board");
+    type_text(&mut state, "seen task");
+    let lines = text_lines(&render(&mut state, 80, 20));
+    assert!(lines.iter().any(|l| l.contains("seen task")), "{lines:?}");
+}
+
+#[test]
+fn a_board_input_shows_while_the_board_is_scrolled() {
+    let ids: Vec<String> = (0..14)
+        .map(|n| add(&format!("Card {n}"), Status::Ready, None, &[]))
+        .collect();
+    let mut state = tasks_shell();
+    state.inbox.tasks.selected = ids.last().cloned();
+    state.inbox.tasks.follow = true;
+    render(&mut state, 80, 16);
+    assert!(
+        state.inbox.tasks.scroll > 0,
+        "the last card scrolled into view"
+    );
+    key(&mut state, KeyCode::Char('n'));
+    type_text(&mut state, "typed in view");
+    let lines = text_lines(&render(&mut state, 80, 16));
+    assert!(
+        lines.iter().any(|l| l.contains("typed in view")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn the_chip_close_leaves_the_task_view_too() {
+    let id = add("Viewed", Status::Ready, None, &[]);
+    let mut state = tasks_shell();
+    let mut outcome = ClientShellInput::default();
+    state.open_task_view(&id, &mut outcome);
+    let lines = text_lines(&render(&mut state, 80, 20));
+    assert!(lines[1].contains("Acme ✕"), "{lines:?}");
+    // The chip starts at the left pad of the line under the header.
+    click(&mut state, (2, 1));
+    assert!(state.inbox.filter.is_none());
+    assert!(state.inbox.tasks.open.is_none());
+}
+
+#[test]
+fn a_click_away_keeps_the_typed_note_for_the_same_input() {
+    let id = add("Noted", Status::Ready, None, &[]);
+    let mut state = tasks_shell();
+    let mut outcome = ClientShellInput::default();
+    state.open_task_view(&id, &mut outcome);
+    render(&mut state, 80, 24);
+    let composer = hit_point(&state, &Hit::Composer);
+    click(&mut state, composer);
+    type_text(&mut state, "half a note");
+    let back = hit_point(&state, &Hit::Back);
+    click(&mut state, back);
+    assert!(state.inbox.tasks.input.is_none());
+    state.open_task_view(&id, &mut outcome);
+    render(&mut state, 80, 24);
+    let composer = hit_point(&state, &Hit::Composer);
+    click(&mut state, composer);
+    let text = state
+        .inbox
+        .tasks
+        .input
+        .as_ref()
+        .map(|input| input.editor.text());
+    assert_eq!(text.as_deref(), Some("half a note"));
+}
+
+#[test]
+fn the_inbox_key_opens_a_closed_panel_on_the_inbox() {
+    let mut state = tasks_shell();
+    let mut outcome = ClientShellInput::default();
+    state.close_inbox(&mut outcome);
+    state.toggle_inbox(&mut outcome);
+    assert_eq!(state.inbox.view, PanelView::Inbox);
+}

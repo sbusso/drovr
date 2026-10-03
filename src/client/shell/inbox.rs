@@ -1241,6 +1241,10 @@ impl ClientShellState {
         if self.inbox.open && self.inbox.focused {
             self.close_inbox(outcome);
         } else {
+            // The inbox key opens the inbox; an open panel keeps its view.
+            if !self.inbox.open {
+                self.inbox.view = PanelView::Inbox;
+            }
             self.open_inbox_panel(outcome);
             self.ensure_inbox_selection();
         }
@@ -2266,6 +2270,9 @@ impl ClientShellState {
                     return true;
                 }
                 if super::contains(hits.chip, point) {
+                    // The view belongs to the dropped project: back to the
+                    // project list, as Esc on the board does.
+                    self.close_task_view();
                     self.inbox.filter = None;
                     self.refresh_tasks(true);
                     return true;
