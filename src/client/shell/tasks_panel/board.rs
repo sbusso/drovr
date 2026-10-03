@@ -561,7 +561,8 @@ fn lane_header(
     )
 }
 
-/// The project list: one line per section with its lane counts.
+/// The overview: each section with its lane counts, then its workspaces,
+/// each with its task or `+ track`. A workspace is the task.
 pub(super) fn draw_projects(
     state: &mut TasksState,
     palette: &Palette,
@@ -572,24 +573,20 @@ pub(super) fn draw_projects(
     let right = body.right().saturating_sub(1);
     let dim = Style::default().fg(palette.overlay0).bg(palette.sidebar_bg);
     if state.counts.is_empty() {
-        put(
-            buffer,
-            left,
-            body.y,
-            right,
-            "No sections yet. Add one from the sidebar.",
-            dim,
-        );
+        put(buffer, left, body.y, right, "No workspaces yet.", dim);
         return;
     }
+    let accent = Style::default().fg(palette.accent).bg(palette.sidebar_bg);
+    let text = Style::default().fg(palette.text).bg(palette.sidebar_bg);
     let mut hits = Vec::new();
-    for (offset, (name, counts)) in state
-        .counts
-        .iter()
-        .enumerate()
-        .take(usize::from(body.height))
-    {
-        let y = body.y + offset as u16;
+    let mut y = body.y;
+    let bottom = body.bottom();
+    // Ceiling: no scrolling; rows past the bottom are cut. Upgrade path:
+    // reuse the board's scroll state when overviews outgrow one screen.
+    for (name, counts) in &state.counts {
+        if y >= bottom {
+            break;
+        }
         let selected = state.selected_project.as_ref() == Some(name);
         let bg = if selected {
             palette.active_row_bg
@@ -613,13 +610,42 @@ pub(super) fn draw_projects(
             y,
             name_right.max(left),
             &cut(name, name_right.saturating_sub(left)),
-            Style::default()
-                .fg(palette.text)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD),
+            text.bg(bg).add_modifier(Modifier::BOLD),
         );
         put(buffer, x + 2, y, right, &summary, dim.bg(bg));
         hits.push((row, Hit::Project(name.clone())));
+        y += 1;
+        for (index, workspace) in state.overview.iter().enumerate() {
+            if &workspace.project != name {
+                continue;
+            }
+            if y >= bottom {
+                break;
+            }
+            let (label, style, hit) = match &workspace.task {
+                Some((id, status)) => (
+                    format!("{id} {}", status.as_str()),
+                    dim,
+                    Hit::Card(id.clone()),
+                ),
+                None => ("+ track".to_owned(), accent, Hit::TrackRow(index)),
+            };
+            let label_x = right.saturating_sub(display_width(&label));
+            let ws_left = left + 2;
+            put(
+                buffer,
+                ws_left,
+                y,
+                label_x.saturating_sub(1).max(ws_left),
+                &cut(&workspace.label, label_x.saturating_sub(ws_left + 1)),
+                text,
+            );
+            let end = put(buffer, label_x, y, right, &label, style);
+            if end > label_x {
+                hits.push((Rect::new(label_x, y, end - label_x, 1), hit));
+            }
+            y += 1;
+        }
     }
     state.hits.items.extend(hits);
 }

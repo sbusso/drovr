@@ -151,6 +151,75 @@ pub(super) enum Scope {
     Workspace(String),
 }
 
+/// One workspace on the overview and the task it is, if tracked.
+#[derive(Clone, Debug)]
+pub(super) struct OverviewRow {
+    pub(super) project: String,
+    pub(super) endpoint_id: ClientEndpointId,
+    pub(super) workspace_id: String,
+    pub(super) label: String,
+    /// (display id, status) of its open or newest task.
+    pub(super) task: Option<(String, Status)>,
+}
+
+/// Every workspace on every machine, by section in sidebar order then
+/// Other, with the task linked to it. Ceiling: one store query per refresh
+/// over all tasks with a workspace link; fine for hundreds of tasks.
+fn overview(endpoints: &[ClientShellEndpoint]) -> Vec<OverviewRow> {
+    let layout = projects::layout();
+    let (sections, claimed) = projects::sections(&layout, endpoints);
+    let linked: Vec<(String, String, Status)> = tasks::read_store(|store| {
+        store.list(&TaskFilter {
+            include_archived: false,
+            ..TaskFilter::default()
+        })
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|card| {
+        let key = card.task.workspace_key.clone()?;
+        Some((key, card.task.display_id, card.task.status))
+    })
+    .collect();
+    let row = |project: &str, endpoint: &ClientShellEndpoint, index: usize| {
+        let workspace = endpoint.snapshot.as_deref()?.workspaces.get(index)?;
+        let key = projects::workspace_key(endpoint, workspace);
+        // Prefer an open task; the store lists open lanes first.
+        let task = linked
+            .iter()
+            .filter(|(linked, _, _)| projects::same_workspace(linked, &key))
+            .min_by_key(|(_, _, status)| matches!(status, Status::Done | Status::Cancelled))
+            .map(|(_, id, status)| (id.clone(), *status));
+        Some(OverviewRow {
+            project: project.to_owned(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            workspace_id: workspace.workspace_id.clone(),
+            label: workspace.label.clone(),
+            task,
+        })
+    };
+    let mut rows = Vec::new();
+    for section in &sections {
+        let name = &layout.groups[section.group].name;
+        let project = if name == OTHER { OTHER_PROJECT } else { name };
+        for member in section.members.iter().filter(|member| !member.hidden) {
+            rows.extend(row(project, &endpoints[member.endpoint], member.index));
+        }
+    }
+    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+        let count = endpoint
+            .snapshot
+            .as_deref()
+            .map_or(0, |snapshot| snapshot.workspaces.len());
+        for index in 0..count {
+            if !claimed.contains(&(endpoint_index, index)) {
+                rows.extend(row(OTHER_PROJECT, endpoint, index));
+            }
+        }
+    }
+    rows
+}
+
 /// The task project of workspaces in no section.
 const OTHER_PROJECT: &str = "Other";
 
@@ -231,6 +300,8 @@ pub(super) enum Hit {
     Composer,
     /// Make a task of the filtered workspace, linked to it.
     Track,
+    /// `+ track` on a workspace row of the overview (index into it).
+    TrackRow(usize),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -346,6 +417,8 @@ pub(super) struct TasksState {
     selected: Option<String>,
     /// The project list's selected row.
     selected_project: Option<String>,
+    /// The overview: every section's workspaces and their tasks.
+    pub(super) overview: Vec<OverviewRow>,
     scroll: usize,
     follow: bool,
     view_scroll: usize,
@@ -820,16 +893,17 @@ impl ClientShellState {
                 }
             }
         }
-        let names: Vec<String> = if scope == Scope::All {
-            let layout = projects::layout();
-            layout
-                .display_order()
-                .into_iter()
-                .map(|index| layout.groups[index].name.clone())
-                .collect()
+        let overview = if scope == Scope::All {
+            overview(&self.endpoints)
         } else {
             Vec::new()
         };
+        let mut names: Vec<String> = Vec::new();
+        for row in &overview {
+            if !names.contains(&row.project) {
+                names.push(row.project.clone());
+            }
+        }
         let open = state.open.clone();
         let auto_open = moved && open.is_none() && matches!(scope, Scope::Workspace(_));
         let result =
@@ -842,7 +916,13 @@ impl ClientShellState {
                 state.data_version = Some(loaded.version);
                 state.cards = loaded.cards;
                 state.totals = loaded.totals;
-                state.counts = loaded.counts;
+                // No database yet reads as empty: the sections still show.
+                state.counts = if loaded.counts.is_empty() {
+                    names.iter().map(|name| (name.clone(), [0; 6])).collect()
+                } else {
+                    loaded.counts
+                };
+                state.overview = overview;
                 state.decisions = loaded.decisions;
                 state.pane_tasks = loaded.pane_tasks;
                 if let Some(single) = loaded.single {
@@ -865,14 +945,7 @@ impl ClientShellState {
     /// `+ track`: a workspace is the task, so make one named after the
     /// filtered workspace, in its section (or Other), linked to it; its
     /// status then follows the workspace's agent.
-    fn track_workspace(&mut self) {
-        let Some(InboxFilter::Workspace {
-            endpoint_id,
-            workspace_id,
-        }) = self.inbox.filter.clone()
-        else {
-            return;
-        };
+    fn track_workspace(&mut self, endpoint_id: ClientEndpointId, workspace_id: String) {
         let Some((key, label, project)) = self
             .endpoints
             .iter()
@@ -2163,7 +2236,20 @@ impl ClientShellState {
                 self.card_button(&card, at, outcome);
             }
             Hit::FilterClear => self.inbox.tasks.text = None,
-            Hit::Track => self.track_workspace(),
+            Hit::Track => {
+                if let Some(InboxFilter::Workspace {
+                    endpoint_id,
+                    workspace_id,
+                }) = self.inbox.filter.clone()
+                {
+                    self.track_workspace(endpoint_id, workspace_id);
+                }
+            }
+            Hit::TrackRow(index) => {
+                if let Some(row) = self.inbox.tasks.overview.get(index).cloned() {
+                    self.track_workspace(row.endpoint_id, row.workspace_id);
+                }
+            }
             Hit::Back => self.close_task_view(),
             Hit::StatusChip => self.open_move_menu(&id, at),
             Hit::Auto => {

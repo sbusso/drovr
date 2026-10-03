@@ -890,3 +890,34 @@ fn track_makes_a_linked_task_of_a_workspace_without_one() {
         .as_deref()
         .is_some_and(|key| key.starts_with(&prefix)));
 }
+
+#[test]
+fn the_overview_lists_workspaces_and_tracks_one_in_a_click() {
+    let mut state = shell();
+    state.inbox.open = true;
+    state.inbox.focused = true;
+    state.inbox.view = PanelView::Tasks;
+    state.inbox.filter = None;
+    state.refresh_tasks(true);
+    let lines = text_lines(&render(&mut state, 60, 12));
+    assert!(
+        lines.iter().any(|line| line.contains("Other")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("client-shell") && line.contains("+ track")),
+        "{lines:#?}"
+    );
+    let track = hit_point(&state, &Hit::TrackRow(0));
+    click(&mut state, track);
+    state.inbox.filter = None;
+    state.refresh_tasks(true);
+    let lines = text_lines(&render(&mut state, 60, 12));
+    let tracked = lines
+        .iter()
+        .find(|line| line.contains("client-shell"))
+        .expect("workspace row");
+    assert!(tracked.contains("OTH-1"), "{lines:#?}");
+}
