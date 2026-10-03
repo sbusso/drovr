@@ -129,8 +129,25 @@ pub(super) struct ProjectLayout {
         skip_serializing_if = "super::inbox::InboxSettings::is_default"
     )]
     pub(super) inbox: super::inbox::InboxSettings,
+    /// The Tasks view of the panel (`tasks_panel.rs`).
+    #[serde(default, skip_serializing_if = "TasksSettings::is_default")]
+    pub(super) tasks: TasksSettings,
     #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
     pub(super) groups: Vec<ProjectGroup>,
+}
+
+/// `[tasks]` in `sidebar.toml`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(super) struct TasksSettings {
+    /// Board lanes collapsed by hand, as `"{project}:{lane}"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) collapsed: Vec<String>,
+}
+
+impl TasksSettings {
+    pub(super) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 struct Store {

@@ -612,6 +612,14 @@ impl InboxTab {
     }
 }
 
+/// The two views of the right panel (docs/design/tasks.md, section 4.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PanelView {
+    #[default]
+    Inbox,
+    Tasks,
+}
+
 /// The item a read or an answer belongs to: a pane, its state and request.
 type ItemAt = (ItemKey, u64, String);
 
@@ -701,6 +709,12 @@ pub(super) struct InboxHits {
     keys: Vec<(Rect, ItemKey, char)>,
     /// "more" / "less" labels: a click shows or hides the detail.
     details: Vec<(Rect, ItemKey)>,
+    /// `Inbox` and `Tasks` on the header line.
+    views: Vec<(Rect, PanelView)>,
+    /// Open decision rows, by task display id.
+    decisions: Vec<(Rect, String)>,
+    /// Task ids on hook items, by display id.
+    task_ids: Vec<(Rect, String)>,
     /// Screen width and the columns right of the sidebar, for dragging.
     cols: u16,
     main: (u16, u16),
@@ -754,6 +768,12 @@ pub(crate) struct InboxState {
     /// The `$EDITOR` file of a closed editor: `$EDITOR` may still run, so
     /// the file stays and the editor reloads it when it opens again.
     externals: HashMap<ItemKey, (std::path::PathBuf, Option<std::time::SystemTime>)>,
+    /// `Inbox` or `Tasks`, for this session only.
+    pub(super) view: PanelView,
+    /// The Tasks view (`tasks_panel.rs`).
+    pub(super) tasks: super::tasks_panel::TasksState,
+    /// A selected decision row (task display id); no item is selected then.
+    pub(super) selected_decision: Option<String>,
 }
 
 impl InboxState {
@@ -839,6 +859,9 @@ impl InboxState {
 
     fn select(&mut self, key: Option<ItemKey>) {
         self.follow = true;
+        if key.is_some() {
+            self.selected_decision = None;
+        }
         if self.selected != key {
             self.selected = key;
             self.detail = false;
@@ -1126,6 +1149,37 @@ fn snooze_label(step: usize) -> &'static str {
     }
 }
 
+/// Open decisions the Waiting and All tabs list (docs/design/tasks.md 4.5),
+/// filtered by the panel filter.
+fn listed_decisions(
+    inbox: &InboxState,
+    endpoints: &[ClientShellEndpoint],
+) -> Vec<crate::tasks::OpenDecision> {
+    if inbox.tab == InboxTab::Done {
+        return Vec::new();
+    }
+    inbox
+        .tasks
+        .decisions
+        .iter()
+        .filter(|decision| match &inbox.filter {
+            None => true,
+            Some(InboxFilter::Project(project)) => &decision.project == project,
+            Some(InboxFilter::Workspace {
+                endpoint_id,
+                workspace_id,
+            }) => decision
+                .pane_key
+                .as_deref()
+                .and_then(|key| super::tasks_panel::find_agent(endpoints, key))
+                .is_some_and(|(endpoint, agent)| {
+                    &endpoint.endpoint_id == endpoint_id && &agent.workspace_id == workspace_id
+                }),
+        })
+        .cloned()
+        .collect()
+}
+
 // ------------------------------------------------------------------ shell
 
 impl ClientShellState {
@@ -1151,7 +1205,7 @@ impl ClientShellState {
         outcome.resize = true;
     }
 
-    fn open_inbox_panel(&mut self, outcome: &mut ClientShellInput) {
+    pub(super) fn open_inbox_panel(&mut self, outcome: &mut ClientShellInput) {
         if !self.inbox.open {
             self.inbox.open = true;
             self.inbox.scroll = 0;
@@ -1224,6 +1278,14 @@ impl ClientShellState {
 
     /// Keep the selection on a listed item (the first when it left).
     fn ensure_inbox_selection(&mut self) {
+        if self.inbox.selected_decision.as_ref().is_some_and(|id| {
+            listed_decisions(&self.inbox, &self.endpoints)
+                .iter()
+                .any(|decision| &decision.display_id == id)
+        }) {
+            return;
+        }
+        self.inbox.selected_decision = None;
         let items = self.visible_inbox_items();
         if !items
             .iter()
@@ -1234,19 +1296,65 @@ impl ClientShellState {
         }
     }
 
+    /// `j` / `k`: decision rows come first, then the items.
     fn move_inbox_selection(&mut self, delta: isize) {
+        let decisions: Vec<String> = listed_decisions(&self.inbox, &self.endpoints)
+            .into_iter()
+            .map(|decision| decision.display_id)
+            .collect();
         let items = self.visible_inbox_items();
-        if items.is_empty() {
+        let total = decisions.len() + items.len();
+        if total == 0 {
             return;
         }
-        let current = items
-            .iter()
-            .position(|item| Some(&item.key) == self.inbox.selected.as_ref());
+        let current = match &self.inbox.selected_decision {
+            Some(id) => decisions.iter().position(|other| other == id),
+            None => items
+                .iter()
+                .position(|item| Some(&item.key) == self.inbox.selected.as_ref())
+                .map(|index| decisions.len() + index),
+        };
         let next = match current {
-            Some(index) => index.saturating_add_signed(delta).min(items.len() - 1),
+            Some(index) => index.saturating_add_signed(delta).min(total - 1),
             None => 0,
         };
-        self.inbox.select(Some(items[next].key.clone()));
+        match decisions.get(next) {
+            Some(id) => self.select_inbox_decision(id.clone()),
+            None => self
+                .inbox
+                .select(Some(items[next - decisions.len()].key.clone())),
+        }
+    }
+
+    fn select_inbox_decision(&mut self, id: String) {
+        self.inbox.select(None);
+        self.inbox.selected_decision = Some(id);
+    }
+
+    /// A decision row: the Tasks view on that task, scrolled to the card.
+    fn open_decision_row(&mut self, id: &str, outcome: &mut ClientShellInput) {
+        self.inbox.selected_decision = Some(id.to_owned());
+        self.open_task_decision(id, outcome);
+    }
+
+    /// The task view's waiting line: the Inbox view on that item.
+    pub(super) fn show_inbox_item(&mut self, key: ItemKey) {
+        self.inbox.view = PanelView::Inbox;
+        self.inbox.tab = InboxTab::Waiting;
+        self.inbox.scroll = 0;
+        self.inbox.select(Some(key));
+    }
+
+    /// `shift+tab`: Inbox <-> Tasks.
+    fn toggle_panel_view(&mut self, outcome: &mut ClientShellInput) {
+        self.inbox.view = match self.inbox.view {
+            PanelView::Inbox => PanelView::Tasks,
+            PanelView::Tasks => PanelView::Inbox,
+        };
+        if self.inbox.view == PanelView::Tasks {
+            self.refresh_tasks(true);
+        }
+        outcome.repaint = true;
     }
 
     fn inbox_jump(&mut self, key: &ItemKey, outcome: &mut ClientShellInput) {
@@ -1416,6 +1524,9 @@ impl ClientShellState {
         if !self.inbox.open {
             return;
         }
+        // The task cache feeds both views (decision rows, task ids).
+        self.refresh_tasks(false);
+        outcome.repaint |= self.inbox.tasks.take_changed();
         let now = Instant::now();
         self.inbox.answering.retain(|_, answer| {
             answer
@@ -1789,6 +1900,9 @@ impl ClientShellState {
         if !(self.inbox.open && self.inbox.focused) {
             return false;
         }
+        if self.inbox.view == PanelView::Tasks {
+            return self.insert_task_text(text);
+        }
         match self.inbox.compose.as_mut() {
             Some(compose) => {
                 compose.editor.insert(text);
@@ -1988,6 +2102,24 @@ impl ClientShellState {
             return;
         }
         let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
+        if code == KeyCode::BackTab && modifiers.is_empty() && !self.inbox.tasks.editing() {
+            self.toggle_panel_view(outcome);
+            return;
+        }
+        if self.inbox.view == PanelView::Tasks {
+            if self.handle_tasks_key(key, outcome) {
+                return;
+            }
+            if code == KeyCode::Esc && modifiers.is_empty() {
+                outcome.repaint = true;
+                if self.inbox.hits.overlay {
+                    self.close_inbox(outcome);
+                } else {
+                    self.blur_inbox();
+                }
+            }
+            return;
+        }
         let plain = modifiers.difference(KeyModifiers::SHIFT).is_empty();
         if !plain {
             return;
@@ -2038,6 +2170,11 @@ impl ClientShellState {
                 };
                 self.dismiss_done(|item| !item.kind.waiting() && state.admits(item), outcome);
                 self.ensure_inbox_selection();
+            }
+            KeyCode::Enter if self.inbox.selected_decision.is_some() => {
+                if let Some(id) = self.inbox.selected_decision.clone() {
+                    self.open_decision_row(&id, outcome);
+                }
             }
             _ => {
                 let Some(item) = selected else {
@@ -2095,10 +2232,45 @@ impl ClientShellState {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) && self.blur_inbox() {
                 outcome.repaint = true;
             }
-            if self.inbox.hover.take().is_some() {
+            if self.inbox.hover.take().is_some() | self.inbox.tasks.clear_hover() {
                 outcome.repaint = true;
             }
             return false;
+        }
+        let view_hit = hits
+            .views
+            .iter()
+            .find(|(rect, _)| super::contains(*rect, point))
+            .map(|(_, view)| *view);
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && !super::contains(hits.border, point)
+        {
+            if let Some(view) = view_hit {
+                self.inbox.focus(Instant::now());
+                if self.inbox.view != view {
+                    self.toggle_panel_view(outcome);
+                }
+                outcome.repaint = true;
+                return true;
+            }
+        }
+        if self.inbox.view == PanelView::Tasks {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.inbox.focus(Instant::now());
+                outcome.repaint = true;
+                if super::contains(hits.border, point) {
+                    self.inbox.dragging = true;
+                    self.inbox.width = self.inbox.share(&projects::layout());
+                    return true;
+                }
+                if super::contains(hits.chip, point) {
+                    self.inbox.filter = None;
+                    self.refresh_tasks(true);
+                    return true;
+                }
+            }
+            self.handle_tasks_mouse(mouse, outcome);
+            return true;
         }
         let row = hits
             .rows
@@ -2141,6 +2313,23 @@ impl ClientShellState {
                 } else if super::contains(hits.chip, point) {
                     self.inbox.filter = None;
                     self.ensure_inbox_selection();
+                } else if let Some((_, id)) = hits
+                    .decisions
+                    .iter()
+                    .chain(&hits.task_ids)
+                    .find(|(rect, _)| super::contains(*rect, point))
+                {
+                    let id = id.clone();
+                    if hits.decisions.iter().any(|(_, other)| *other == id)
+                        && !hits
+                            .task_ids
+                            .iter()
+                            .any(|(rect, _)| super::contains(*rect, point))
+                    {
+                        self.open_decision_row(&id, outcome);
+                    } else {
+                        self.open_task_view(&id, outcome);
+                    }
                 } else if let Some((_, key, ch)) = hits
                     .keys
                     .iter()
@@ -2278,6 +2467,10 @@ pub(super) fn render(
     cols: u16,
     main: (u16, u16),
 ) {
+    if inbox.view == PanelView::Tasks {
+        render_tasks(inbox, endpoints, palette, buffer, area, overlay, cols, main);
+        return;
+    }
     let layout = projects::layout();
     let items = collect(
         endpoints,
@@ -2290,11 +2483,19 @@ pub(super) fn render(
         .filter(|item| inbox.admits(item))
         .cloned()
         .collect();
-    if !visible
-        .iter()
-        .any(|item| Some(&item.key) == inbox.selected.as_ref())
+    let decisions = listed_decisions(inbox, endpoints);
+    if !inbox
+        .selected_decision
+        .as_ref()
+        .is_some_and(|id| decisions.iter().any(|d| &d.display_id == id))
     {
-        inbox.select(visible.first().map(|item| item.key.clone()));
+        inbox.selected_decision = None;
+        if !visible
+            .iter()
+            .any(|item| Some(&item.key) == inbox.selected.as_ref())
+        {
+            inbox.select(visible.first().map(|item| item.key.clone()));
+        }
     }
     // A new state or prompt on the expanded item closes its detail, so it
     // never shows another prompt's screen or waits on a read never sent.
@@ -2310,13 +2511,17 @@ pub(super) fn render(
     let waiting = items
         .iter()
         .filter(|item| item.kind.waiting() && !item.marked && !inbox.answered(item))
-        .count();
+        .count()
+        + decisions.len();
     let done = items
         .iter()
         .filter(|item| !item.kind.waiting() && !item.marked && !inbox.answered(item))
         .count();
+    let pane_tasks = inbox.tasks.pane_tasks.clone();
     let view = View {
         items: &visible,
+        decisions: &decisions,
+        pane_tasks: &pane_tasks,
         waiting,
         done,
         state: inbox,
@@ -2338,10 +2543,169 @@ pub(super) fn render(
     };
 }
 
+/// The Tasks view: the panel chrome and header here, the rest in
+/// `tasks_panel::render`.
+#[allow(clippy::too_many_arguments)]
+fn render_tasks(
+    inbox: &mut InboxState,
+    endpoints: &[ClientShellEndpoint],
+    palette: &Palette,
+    buffer: &mut Buffer,
+    area: Rect,
+    overlay: bool,
+    cols: u16,
+    main: (u16, u16),
+) {
+    let mut hits = chrome(buffer, area, inbox.focused, palette);
+    let mut body = Rect::default();
+    if area.width >= 4 && area.height >= 3 {
+        let left = area.x + 2;
+        let right = area.right().saturating_sub(1);
+        let dim = Style::default().fg(palette.overlay0).bg(palette.sidebar_bg);
+        let mut y = area.y;
+        let x = view_labels(buffer, &mut hits, left, y, right, PanelView::Tasks, palette);
+        let scope = super::tasks_panel::scope_of(inbox.filter.as_ref(), endpoints);
+        let new_label = "+ new";
+        let new_x = right.saturating_sub(display_width(new_label));
+        inbox.tasks.hits.new = Rect::default();
+        if let super::tasks_panel::Scope::Project(project) = &scope {
+            let text =
+                super::tasks_panel::cut(&format!(" · {project}"), new_x.saturating_sub(x + 1));
+            put(buffer, x, y, new_x, &text, dim);
+            let accent = Style::default().fg(palette.accent).bg(palette.sidebar_bg);
+            put(buffer, new_x, y, right, new_label, accent);
+            inbox.tasks.hits.new = Rect::new(new_x, y, display_width(new_label), 1);
+        }
+        y += 1;
+        if let Some(filter) = &inbox.filter {
+            let label = match filter {
+                InboxFilter::Project(project) if project == OTHER => "Other".to_owned(),
+                InboxFilter::Project(project) => project.clone(),
+                InboxFilter::Workspace {
+                    endpoint_id,
+                    workspace_id,
+                } => endpoints
+                    .iter()
+                    .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+                    .and_then(|endpoint| endpoint.snapshot.as_deref())
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|workspace| &workspace.workspace_id == workspace_id)
+                    })
+                    .map_or_else(|| workspace_id.clone(), |w| w.label.clone()),
+            };
+            let chip = Style::default().fg(palette.text).bg(palette.surface0);
+            let end = put(buffer, left, y, right, &format!(" {label} ✕ "), chip);
+            hits.chip = Rect::new(left, y, end - left, 1);
+            y += 1;
+        }
+        body = Rect::new(
+            area.x + 1,
+            y,
+            area.width - 1,
+            area.bottom().saturating_sub(y),
+        );
+    }
+    super::tasks_panel::render(
+        &mut inbox.tasks,
+        endpoints,
+        inbox.filter.as_ref(),
+        inbox.focused,
+        palette,
+        buffer,
+        body,
+    );
+    inbox.hits = InboxHits {
+        cols,
+        main,
+        overlay,
+        ..hits
+    };
+}
+
+/// Clears the panel and draws its left border (the resize handle, accent
+/// while the panel has focus); returns the hits with the area and border.
+fn chrome(buffer: &mut Buffer, area: Rect, focused: bool, palette: &Palette) -> InboxHits {
+    let hits = InboxHits {
+        area,
+        border: Rect::new(area.x, area.y, 1, area.height),
+        ..InboxHits::default()
+    };
+    let base = Style::default().fg(palette.text).bg(palette.sidebar_bg);
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.reset();
+                cell.set_symbol(" ").set_style(base);
+            }
+        }
+    }
+    let border_style = if focused {
+        Style::default()
+            .fg(palette.accent)
+            .bg(palette.sidebar_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(palette.surface_dim)
+            .bg(palette.sidebar_bg)
+    };
+    for y in area.y..area.bottom() {
+        if let Some(cell) = buffer.cell_mut((area.x, y)) {
+            cell.set_symbol("│").set_style(border_style);
+        }
+    }
+    hits
+}
+
+/// `Inbox  Tasks` at the start of the header line, the active view in the
+/// accent; returns the end column.
+fn view_labels(
+    buffer: &mut Buffer,
+    hits: &mut InboxHits,
+    left: u16,
+    y: u16,
+    right: u16,
+    active: PanelView,
+    palette: &Palette,
+) -> u16 {
+    let accent = Style::default()
+        .fg(palette.accent)
+        .bg(palette.sidebar_bg)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(palette.overlay0).bg(palette.sidebar_bg);
+    let mut x = left;
+    for (n, (label, view)) in [("Inbox", PanelView::Inbox), ("Tasks", PanelView::Tasks)]
+        .into_iter()
+        .enumerate()
+    {
+        if n > 0 {
+            x = put(buffer, x, y, right, "  ", dim);
+        }
+        let start = x;
+        x = put(
+            buffer,
+            x,
+            y,
+            right,
+            label,
+            if view == active { accent } else { dim },
+        );
+        hits.views.push((Rect::new(start, y, x - start, 1), view));
+    }
+    x
+}
+
 // ------------------------------------------------------------------ drawing
 
 struct View<'a> {
     items: &'a [Item],
+    /// Open decision rows, drawn above the items.
+    decisions: &'a [crate::tasks::OpenDecision],
+    /// "machine/pane_id" -> task display id.
+    pane_tasks: &'a HashMap<String, String>,
     waiting: usize,
     done: usize,
     state: &'a InboxState,
@@ -2355,6 +2719,8 @@ struct View<'a> {
 #[derive(Clone, Debug, PartialEq)]
 enum Line {
     Group(String),
+    /// An open decision row (index into `View.decisions`).
+    Decision(usize),
     Main(usize),
     Meta(usize),
     /// A question's options: one row per confirmed option (the option's
@@ -2376,17 +2742,46 @@ fn item_color(kind: ItemKind, palette: &Palette) -> ratatui::style::Color {
     }
 }
 
+fn group_name(project: &str) -> String {
+    if project == OTHER {
+        "Other".to_owned()
+    } else {
+        project.to_owned()
+    }
+}
+
 fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut group = None;
+    // Decision rows come first; grouped, at the top of their project's group
+    // (a project with decisions only gets its group at the top).
+    let decisions_of = |project: &str| -> Vec<Line> {
+        view.decisions
+            .iter()
+            .enumerate()
+            .filter(|(_, decision)| decision.project == project)
+            .map(|(index, _)| Line::Decision(index))
+            .collect()
+    };
+    if view.grouped {
+        let mut seen: Vec<&str> = Vec::new();
+        for decision in view.decisions {
+            let project = decision.project.as_str();
+            if seen.contains(&project) || view.items.iter().any(|item| item.project == project) {
+                continue;
+            }
+            seen.push(project);
+            lines.push(Line::Group(group_name(project)));
+            lines.extend(decisions_of(project));
+        }
+    } else {
+        lines.extend((0..view.decisions.len()).map(Line::Decision));
+    }
     for (index, item) in view.items.iter().enumerate() {
         if view.grouped && group.as_ref() != Some(&item.project) {
             group = Some(item.project.clone());
-            lines.push(Line::Group(if item.project == OTHER {
-                "Other".to_owned()
-            } else {
-                item.project.clone()
-            }));
+            lines.push(Line::Group(group_name(&item.project)));
+            lines.extend(decisions_of(&item.project));
         }
         lines.push(Line::Main(index));
         if narrow {
@@ -2482,50 +2877,33 @@ fn lines_for(view: &View, narrow: bool) -> Vec<Line> {
 fn draw(buffer: &mut Buffer, area: Rect, view: &View) -> (InboxHits, usize) {
     let palette = view.palette;
     let state = view.state;
-    let mut hits = InboxHits {
-        area,
-        ..InboxHits::default()
-    };
     if area.width < 4 || area.height < 3 {
-        return (hits, 0);
+        return (
+            InboxHits {
+                area,
+                ..InboxHits::default()
+            },
+            0,
+        );
     }
-    let base = Style::default().fg(palette.text).bg(palette.sidebar_bg);
+    let mut hits = chrome(buffer, area, state.focused, palette);
     let dim = Style::default().fg(palette.overlay0).bg(palette.sidebar_bg);
     let accent = Style::default()
         .fg(palette.accent)
         .bg(palette.sidebar_bg)
         .add_modifier(Modifier::BOLD);
-    for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.reset();
-                cell.set_symbol(" ").set_style(base);
-            }
-        }
-    }
-    // Left border: the resize handle; accent while the inbox has focus.
-    let border_style = if state.focused {
-        accent
-    } else {
-        Style::default()
-            .fg(palette.surface_dim)
-            .bg(palette.sidebar_bg)
-    };
-    for y in area.y..area.bottom() {
-        if let Some(cell) = buffer.cell_mut((area.x, y)) {
-            cell.set_symbol("│").set_style(border_style);
-        }
-    }
-    hits.border = Rect::new(area.x, area.y, 1, area.height);
     let left = area.x + 2;
     let right = area.right().saturating_sub(1);
     let narrow = area.width < NARROW_WIDTH;
 
-    // Header: title and counts, tabs, grouping.
+    // Header: the view labels, counts (dropped first when narrow), tabs,
+    // grouping.
     let mut y = area.y;
-    let mut x = put(buffer, left, y, right, "Inbox", accent);
-    let counts = format!("  {} waiting · {} done", view.waiting, view.done);
-    put(buffer, x, y, right, &counts, dim);
+    let mut x = view_labels(buffer, &mut hits, left, y, right, PanelView::Inbox, palette);
+    if right.saturating_sub(left) >= 60 {
+        let counts = format!("  {} waiting · {} done", view.waiting, view.done);
+        put(buffer, x, y, right, &counts, dim);
+    }
     let group_label = if narrow { "≡" } else { "≡ group" };
     let group_x = right.saturating_sub(display_width(group_label));
     put(
@@ -2623,7 +3001,7 @@ fn draw(buffer: &mut Buffer, area: Rect, view: &View) -> (InboxHits, usize) {
     // The list.
     let list = Rect::new(area.x + 1, y, area.width - 1, footer_top.saturating_sub(y));
     hits.list = list;
-    if view.items.is_empty() {
+    if view.items.is_empty() && view.decisions.is_empty() {
         let text = match state.tab {
             InboxTab::Waiting => "Nothing is waiting on you.",
             InboxTab::Done => "Nothing finished to review.",
@@ -2667,7 +3045,7 @@ fn draw(buffer: &mut Buffer, area: Rect, view: &View) -> (InboxHits, usize) {
 
 fn line_item(line: &Line) -> Option<usize> {
     match line {
-        Line::Group(_) => None,
+        Line::Group(_) | Line::Decision(_) => None,
         Line::Main(index)
         | Line::Meta(index)
         | Line::Options(index, _)
@@ -2698,12 +3076,16 @@ fn draw_line(
         }
     };
     let Some(index) = line_item(line) else {
-        if let Line::Group(name) = line {
-            let style = Style::default()
-                .fg(palette.subtext0)
-                .bg(palette.sidebar_bg)
-                .add_modifier(Modifier::BOLD);
-            put(buffer, left, y, right, name, style);
+        match line {
+            Line::Group(name) => {
+                let style = Style::default()
+                    .fg(palette.subtext0)
+                    .bg(palette.sidebar_bg)
+                    .add_modifier(Modifier::BOLD);
+                put(buffer, left, y, right, name, style);
+            }
+            Line::Decision(index) => draw_decision_row(buffer, view, *index, left, right, y, hits),
+            _ => {}
         }
         return;
     };
@@ -2773,6 +3155,15 @@ fn draw_line(
                 .add_modifier(Modifier::BOLD);
             let mut x = put(buffer, text, y, right, item.kind.glyph(), glyph);
             x = put(buffer, x, y, right, " ", base);
+            // The task of the pane's live attempt, before the workspace.
+            let pane_key = format!("{}/{}", item.machine.to_lowercase(), item.key.pane_id);
+            if let Some(task) = view.pane_tasks.get(&pane_key) {
+                let start = x;
+                x = put(buffer, x, y, right, task, dim);
+                hits.task_ids
+                    .push((Rect::new(start, y, x - start, 1), task.clone()));
+                x = put(buffer, x, y, right, " ", base);
+            }
             let name_start = x;
             let name_style = if item.marked {
                 dim
@@ -2924,8 +3315,52 @@ fn draw_line(
             hits.jumps
                 .push((Rect::new(x, y, end - x, 1), item.key.clone()));
         }
-        Line::Group(_) => {}
+        Line::Group(_) | Line::Decision(_) => {}
     }
+}
+
+/// `? AC-12 Which table holds decisions?          3m`: one open decision.
+fn draw_decision_row(
+    buffer: &mut Buffer,
+    view: &View,
+    index: usize,
+    left: u16,
+    right: u16,
+    y: u16,
+    hits: &mut InboxHits,
+) {
+    let palette = view.palette;
+    let decision = &view.decisions[index];
+    let selected = view.state.selected_decision.as_ref() == Some(&decision.display_id);
+    let bg = if selected {
+        palette.active_row_bg
+    } else {
+        palette.sidebar_bg
+    };
+    let row = Rect::new(left.saturating_sub(1), y, right.saturating_sub(left) + 2, 1);
+    buffer.set_style(row, Style::default().bg(bg));
+    hits.decisions.push((row, decision.display_id.clone()));
+    let text = left + 1;
+    let ask = Style::default()
+        .fg(palette.yellow)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(palette.overlay0).bg(bg);
+    let base = Style::default().fg(palette.text).bg(bg);
+    let mut x = put(buffer, text, y, right, "?", ask);
+    x = put(buffer, x + 1, y, right, &decision.display_id, dim);
+    let age = super::tasks_panel::age(&decision.decision.created_at, agent_signal::unix_now());
+    let age_x = right.saturating_sub(display_width(&age));
+    let title_right = age_x.saturating_sub(1);
+    put(
+        buffer,
+        x + 1,
+        y,
+        title_right,
+        &super::tasks_panel::cut(&decision.decision.title, title_right.saturating_sub(x + 1)),
+        base,
+    );
+    put(buffer, age_x, y, right, &age, dim);
 }
 
 /// Draws an answer key as `<key> <label>`, the key in the accent colour,
@@ -3157,6 +3592,8 @@ mod tests {
         let draw_with = |items: &[Item], state: &InboxState| {
             let view = View {
                 items,
+                decisions: &[],
+                pane_tasks: &HashMap::new(),
                 waiting: items.len(),
                 done: 0,
                 state,
@@ -3221,8 +3658,11 @@ mod tests {
             ..InboxState::default()
         };
         let palette = Palette::catppuccin();
+        let empty = HashMap::new();
         let view = View {
             items: &items,
+            decisions: &[],
+            pane_tasks: &empty,
             waiting: 0,
             done: 1,
             state: &state,

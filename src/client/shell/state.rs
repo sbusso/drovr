@@ -633,6 +633,16 @@ pub(super) enum ClientContextMenuAction {
     InboxDismissDoneInProject,
     InboxSnooze,
     InboxMute,
+    /// drovr fork: task card and task view menus (docs/design/tasks.md 4.2).
+    TaskOpen,
+    TaskStart,
+    TaskFocusPane,
+    TaskMoveMenu,
+    TaskCopyId,
+    TaskMove(crate::tasks::Status),
+    TaskKind(Option<crate::tasks::Kind>),
+    TaskPriority(crate::tasks::Priority),
+    TaskOnMachine(usize),
 }
 
 #[derive(Debug)]
@@ -701,6 +711,11 @@ pub(super) enum ClientContextMenuTarget {
         key: super::inbox::ItemKey,
         waiting: bool,
         muted: bool,
+    },
+    /// drovr: a task card or the task view (docs/design/tasks.md 4.2).
+    Task {
+        display_id: String,
+        menu: super::tasks_panel::TaskMenu,
     },
 }
 

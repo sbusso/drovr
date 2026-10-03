@@ -23,6 +23,7 @@ pub(super) fn items_for(target: &ClientContextMenuTarget) -> Vec<ClientContextMe
             | ClientContextMenuTarget::Agent { .. } => {
                 super::project_actions::project_menu_items(target)
             }
+            ClientContextMenuTarget::Task { menu, .. } => super::tasks_panel::task_menu_items(menu),
             ClientContextMenuTarget::Workspace { is_git: false, .. } => {
                 vec![item("Rename", Action::Rename), item("Close", Action::Close)]
             }
@@ -240,6 +241,10 @@ impl ClientShellState {
                 action,
                 outcome,
             ),
+            ClientContextMenuTarget::Task {
+                display_id,
+                menu: task_menu,
+            } => self.activate_task_menu(display_id, task_menu, action, (menu.x, menu.y), outcome),
             target => self.activate_project_action(target, action, (menu.x, menu.y), outcome),
         }
         outcome.repaint = true;

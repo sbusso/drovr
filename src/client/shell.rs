@@ -44,6 +44,10 @@ mod scroll;
 mod settings;
 mod state;
 mod surface_patch;
+// drovr fork: tasks (docs/design/tasks.md). task_launch is Builder C's;
+// this branch carries a stub of the functions the panel calls.
+mod task_launch;
+mod tasks_panel;
 mod text_editor;
 mod word_selection;
 mod worktrees;
