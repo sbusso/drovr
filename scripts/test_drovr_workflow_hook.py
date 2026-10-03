@@ -99,7 +99,7 @@ class WorkflowHookTests(unittest.TestCase):
         with open(transcript, "a") as handle:
             handle.write(note("w1", "failed"))
             handle.write('{"partial": ')
-        status, task, new_offset = wf.scan_transcript(transcript, "r1", "w1", offset)
+        status, task, new_offset, _ = wf.scan_transcript(transcript, "r1", "w1", offset)
         self.assertEqual((status, task), ("failed", "w1"))
         self.assertLess(new_offset, os.path.getsize(transcript), "partial line is read next time")
 
@@ -114,6 +114,15 @@ class WorkflowHookTests(unittest.TestCase):
             handle.write(launch("r9", "w9"))
             handle.write(note("w2", "completed"))
         self.assertEqual(wf.scan_transcript(transcript, "r1", "w1", 0)[:2], ("completed", "w2"))
+
+    def test_scan_sees_the_next_prompt(self):
+        line = lambda kind: json.dumps({"type": "user", "origin": {"kind": kind},
+                                        "message": {"content": "next task"}}) + "\n"
+        transcript = self.write("t.jsonl", line("task-notification"))
+        self.assertFalse(wf.scan_transcript(transcript, "r1", "w1", 0)[3])
+        with open(transcript, "a") as handle:
+            handle.write(line("human"))
+        self.assertTrue(wf.scan_transcript(transcript, "r1", "w1", 0)[3])
 
     def test_launch_ignores_other_tool_results(self):
         # No pane, or a result that is not an async launch: nothing runs.

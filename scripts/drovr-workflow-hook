@@ -29,7 +29,7 @@ DOC_DIR = os.path.expanduser("~/.cache/drovr/workflows")
 SOURCE = "drovr-wf"
 POLL_S = 3
 # The cue stays this long after the run ends, then the tokens are cleared.
-LINGER_S = 600
+LINGER_S = 600  # or until the user sends the next prompt
 # A run whose journal has not changed for this long is treated as gone
 # (the session was closed and took the workflow with it).
 STALE_S = 3 * 3600
@@ -180,13 +180,14 @@ def write_doc(path, text):
 
 
 def scan_transcript(transcript, run_id, task_id, offset):
-    """(status or None, task id, new offset) from the session transcript.
-    A task notification gives the workflow task's final status. A later
-    launch of the same run (a resume after a stop) replaces the task id and
-    clears that status."""
+    """(status or None, task id, new offset, prompted) from the session
+    transcript. A task notification gives the workflow task's final status.
+    A later launch of the same run (a resume after a stop) replaces the task
+    id and clears that status. `prompted` says the user sent a prompt."""
     if not transcript or not task_id:
-        return None, task_id, offset
+        return None, task_id, offset, False
     status = None
+    prompted = False
     try:
         with open(transcript, "rb") as handle:
             handle.seek(offset)
@@ -202,9 +203,22 @@ def scan_transcript(transcript, run_id, task_id, offset):
                     relaunched = relaunch_task(raw, run_id)
                     if relaunched and relaunched != task_id:
                         task_id, status = relaunched, None
+                elif b'"human"' in raw:
+                    prompted = prompted or is_prompt(raw)
     except OSError:
         pass
-    return status, task_id, offset
+    return status, task_id, offset, prompted
+
+
+def is_prompt(raw):
+    """Whether one transcript line is a prompt the user typed."""
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return False
+    origin = entry.get("origin")
+    return entry.get("type") == "user" and isinstance(origin, dict) \
+        and origin.get("kind") == "human"
 
 
 def relaunch_task(raw, run_id):
@@ -232,13 +246,16 @@ def watch(run):
     ended = None
     last_cue = None
     last_change = time.time()
-    # After the run ends, keep polling for LINGER_S: a resume of the same run
-    # shows as running again. Then clear the tokens.
+    # After the run ends, keep polling for LINGER_S or until the next prompt:
+    # a resume of the same run shows as running again. Then clear the tokens.
     while time.time() - started < MAX_S and not (ended and time.time() - ended > LINGER_S):
         try:
             if pane_run(pane) not in (run_id, None):
                 return  # a newer run took over the pane
-            status, new_task, offset = scan_transcript(run.get("transcript"), run_id, task_id, offset)
+            status, new_task, offset, prompted = scan_transcript(
+                run.get("transcript"), run_id, task_id, offset)
+            if ended and prompted:
+                break  # the user moved on to the next task
             if new_task != task_id:
                 task_id, state, ended, last_change = new_task, "running", None, time.time()
             if status and not ended:
