@@ -1330,8 +1330,6 @@ impl ClientShellState {
         outcome.repaint |= projects::expire_peek();
         self.tick_inbox(outcome);
         self.tick_tasks(outcome);
-        // Advance the structured view's spinner while an agent works.
-        outcome.repaint |= super::drovr_sidebar::take_spinning();
         outcome.repaint |= super::drovr_sidebar::take_clock_tick();
     }
 

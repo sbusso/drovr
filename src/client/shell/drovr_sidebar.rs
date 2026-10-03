@@ -1571,35 +1571,6 @@ fn draw_drag_feedback(
     }
 }
 
-/// Set when a structured render draws a working agent (its spinner).
-static SPINNING: AtomicBool = AtomicBool::new(false);
-
-/// Whether the last render drew a spinner, clearing the mark. The client's
-/// 100 ms timer repaints while this holds; the repaint sets it again for as
-/// long as an agent works, so nothing repaints once none does.
-pub(super) fn take_spinning() -> bool {
-    if !SPINNING.load(Ordering::Relaxed) {
-        return false;
-    }
-    // Repaint only when the frame changes: every repaint hides and shows the
-    // host cursor, which flickers it in the focused agent pane.
-    let frame = radar::spin_index(now_ms());
-    if SPIN_FRAME.swap(frame, Ordering::Relaxed) == frame {
-        return false;
-    }
-    SPINNING.store(false, Ordering::Relaxed);
-    true
-}
-
-/// The spinner frame of the last spinner repaint.
-static SPIN_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-
-fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis())
-}
-
 /// Set when a render shows an agent whose elapsed time or stuck check
 /// depends on the clock (see [`take_clock_tick`]).
 static CLOCK: AtomicBool = AtomicBool::new(false);
@@ -1717,15 +1688,10 @@ fn render_structured_row(
             if bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            // A working agent showing what it does has no spinner to animate.
-            if *tone == radar::Tone::Working && doing.is_none() {
-                SPINNING.store(true, Ordering::Relaxed);
-            }
-            let now_ms = now_ms();
             let text = match doing {
                 Some((doing, _)) => format!("▸ {doing}"),
                 None => [
-                    radar::lead(*tone, now_ms),
+                    radar::lead(*tone),
                     kept.then_some("⚑"),
                     Some(title.as_str()),
                 ]
@@ -2737,39 +2703,6 @@ mod tests {
         );
         assert_eq!(row_gaps(&rows, &layout, 0, 0), vec![1, 0, 1, 0, 0]);
     }
-    #[test]
-    fn redraw_is_requested_only_while_an_agent_works() {
-        let config = ClientShellConfig::from_config(&crate::config::Config::default());
-        let layout = structured_layout();
-        let draw = |endpoints: &[ClientShellEndpoint]| {
-            let area = Rect::new(0, 0, 34, 1);
-            for row in build_rows(endpoints, &ClientEndpointId::Local, &layout, true)
-                .iter()
-                .filter(|row| matches!(row, Row::Agent { .. }))
-            {
-                render_row(
-                    &mut Buffer::empty(area),
-                    area,
-                    row,
-                    &layout,
-                    endpoints,
-                    &config,
-                    radar::Ground::Dark,
-                    &mut ShellHitMap::default(),
-                );
-            }
-            take_spinning()
-        };
-        let mut endpoints = fixture();
-        assert!(!draw(&endpoints));
-        if let Some(snapshot) = endpoints[0].snapshot.as_deref_mut() {
-            snapshot.agents[1].agent_status = AgentStatus::Working;
-        }
-        assert!(draw(&endpoints));
-        // Taken once per tick: no new render, no new request.
-        assert!(!take_spinning());
-    }
-
     #[test]
     fn structured_header_caps_the_machine_tag_on_narrow_sidebars() {
         let mut endpoints = fixture();
