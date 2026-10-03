@@ -22,9 +22,11 @@ use crate::tasks::{self, Actor, CheckState, Decision, EntryKind, NewAttempt, Tas
 const APPEAR_WITHIN: Duration = Duration::from_secs(60);
 /// The probe and the context file must be done within this.
 const PREPARE_WITHIN: Duration = Duration::from_secs(90);
-/// The first prompt goes out this long after typing the command at the
-/// latest, even when no agent was detected.
-const PROMPT_AFTER: Duration = Duration::from_secs(5);
+/// The agent must show in the pane within this long after the command was
+/// queued (a remote bridge setup, a slow shell rc and a cold start count),
+/// else the launch gives up. herdr's agent.prompt refuses a pane without a
+/// detected, unblocked agent, so the prompt waits for one.
+const AGENT_WITHIN: Duration = Duration::from_secs(90);
 /// The command typed into the root pane (the user's Claude alias).
 const AGENT_COMMAND: &str = "cc";
 const HARNESS: &str = "claude";
@@ -483,23 +485,34 @@ impl ClientShellState {
                 self.find_launch_pane(index, outcome);
             }
             LaunchStage::Prompt => {
-                let (endpoint_id, pane_id) = match &launch.pane {
-                    Some((_, _, pane_id)) => (launch.endpoint_id.clone(), pane_id.clone()),
+                let (endpoint_id, pane_key, pane_id) = match &launch.pane {
+                    Some((_, pane_key, pane_id)) => (
+                        launch.endpoint_id.clone(),
+                        pane_key.clone(),
+                        pane_id.clone(),
+                    ),
                     None => return,
                 };
-                let detected = self
+                // Ready: detected and not blocked (a trust or login dialog
+                // answers first; agent.prompt refuses a blocked agent).
+                let ready = self
                     .endpoint_by_id(&endpoint_id)
                     .and_then(|endpoint| endpoint.snapshot.as_deref())
                     .is_some_and(|snapshot| {
-                        snapshot
-                            .agents
-                            .iter()
-                            .any(|agent| agent.pane_id == pane_id && agent.agent.is_some())
+                        snapshot.agents.iter().any(|agent| {
+                            agent.pane_id == pane_id
+                                && agent.agent.is_some()
+                                && agent.agent_status != crate::api::schema::AgentStatus::Blocked
+                        })
                     });
-                let late = launch
-                    .typed_at
-                    .is_some_and(|at| at.elapsed() >= PROMPT_AFTER);
-                if !detected && !late {
+                if !ready {
+                    if launch
+                        .typed_at
+                        .is_some_and(|at| at.elapsed() >= AGENT_WITHIN)
+                    {
+                        let launch = self.task_rt.launches.remove(index);
+                        self.give_up_launch(&launch.display_id, &pane_key);
+                    }
                     return;
                 }
                 let launch = self.task_rt.launches.remove(index);
@@ -522,6 +535,31 @@ impl ClientShellState {
                 );
             }
         }
+    }
+
+    /// No agent came up in the launch's pane: the attempt the launch opened
+    /// ends (sync skips a pane without an agent, so it would stay open), and
+    /// a notice says the prompt was not sent.
+    fn give_up_launch(&mut self, display_id: &str, pane_key: &str) {
+        let result = tasks::with_store(|store| {
+            let open = store.task_detail(display_id)?.and_then(|detail| {
+                detail
+                    .attempts
+                    .into_iter()
+                    .find(|attempt| attempt.ended_at.is_none())
+            });
+            if open.is_some_and(|attempt| attempt.pane_key.as_deref() == Some(pane_key)) {
+                store.release(display_id, "no agent started in its pane", &Actor::Auto)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::debug!(%error, task = %display_id, "cannot end the attempt");
+        }
+        self.task_rt.dirty = true;
+        self.push_task_notice(format!(
+            "{display_id}: no agent started in {pane_key} (`{AGENT_COMMAND}`); prompt not sent"
+        ));
     }
 
     /// Wait stage: the new workspace (label match, id not known before) and
@@ -1091,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_prompt_waits_for_the_agent_or_five_seconds() {
+    fn the_first_prompt_waits_for_a_ready_agent_and_gives_up_without_one() {
         let mut state = shell();
         let (a, b) = two_waiting(&mut state);
         with_workspaces(
@@ -1130,14 +1168,29 @@ mod tests {
                 format!("Work on drovr task {a}: First. Read /s/tasks/{a}.md first. Report with drovr task (skill drovr-tasks).")
             )]
         );
-        // p2 has no agent: its prompt goes 5 s after typing.
+        // p2's agent is blocked (a trust dialog): no prompt yet.
+        let mut snapshot = state.snapshot.as_deref().cloned().expect("snapshot");
+        let mut blocked = snapshot.agents[0].clone();
+        blocked.pane_id = "p2".into();
+        blocked.workspace_id = "w2".into();
+        blocked.agent_status = AgentStatus::Blocked;
+        snapshot.agents.push(blocked);
+        state.set_snapshot(Box::new(snapshot.clone()));
+        assert!(prompts(&tick(&mut state)).is_empty(), "blocked agent");
+        // Still no ready agent after AGENT_WITHIN: no prompt, the attempt
+        // ends, a notice says so.
         for launch in &mut state.task_rt.launches {
-            launch.typed_at = Some(Instant::now() - PROMPT_AFTER);
+            launch.typed_at = Some(Instant::now() - AGENT_WITHIN);
         }
-        let sent = prompts(&tick(&mut state));
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, "p2");
+        assert!(prompts(&tick(&mut state)).is_empty());
         assert!(state.task_rt.launches.is_empty());
+        let detail = tasks::with_store(|store| store.task_detail(&b))
+            .expect("read")
+            .expect("task");
+        assert_eq!(detail.task.status, Status::Ready);
+        assert!(detail.attempts.iter().all(|a| a.ended_at.is_some()));
+        let notice = state.visible_endpoint_notice.as_ref().expect("notice");
+        assert!(notice.body.contains("prompt not sent"), "{}", notice.body);
     }
 
     #[test]
