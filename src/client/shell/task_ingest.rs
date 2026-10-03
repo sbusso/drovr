@@ -667,6 +667,14 @@ impl ClientShellState {
         result: Result<String, String>,
     ) -> bool {
         let mut repaint = false;
+        if result.is_err() {
+            // The context files and snapshots of this machine may be old:
+            // forget them so the next reload writes them again.
+            self.task_rt
+                .written
+                .retain(|_, (written_on, _)| written_on != machine);
+            self.task_rt.dirty = true;
+        }
         let root = result.as_ref().ok().map(|out| out.trim().to_owned());
         let mut failed = Vec::new();
         for launch in self

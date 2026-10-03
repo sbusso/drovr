@@ -1310,6 +1310,22 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_file_job_writes_the_context_again() {
+        let id = live_task(Status::Ready, &[]);
+        let mut state = shell(Vec::new());
+        tick(&mut state);
+        assert!(state.task_rt.written.contains_key(&id));
+        state.receive_task_job(super::super::task_ingest::TaskJobDone {
+            machine: "local".into(),
+            kind: "write",
+            result: Err("ssh timed out".into()),
+        });
+        assert!(!state.task_rt.written.contains_key(&id));
+        tick(&mut state);
+        assert!(state.task_rt.written.contains_key(&id), "queued again");
+    }
+
+    #[test]
     fn a_local_ring_pulls_the_local_outbox() {
         // An agent drovr did not launch queues to the local outbox before
         // tasks.db exists; its ring must reach a pull on this machine.
