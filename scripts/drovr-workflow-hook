@@ -6,14 +6,14 @@ follows the run and reports its progress to herdr as pane metadata tokens
 (visible to every drovr client):
   drovr_wf      "<state> <done>/<total>": state is running, done or failed;
                 done counts finished phases of the script's meta.phases
-  drovr_wf_phase  the current phase's detail, else its title ("state hook"),
-                or how the run ended
+  drovr_wf_phase  "<finished>/<started> agents", or "starting", with a
+                "failed · " prefix when the run failed
   drovr_wf_doc  path of a Markdown view of the run (phases, agents, results),
                 which the drovr sidebar opens in the doc pane on click
   drovr_wf_run  the run id, so a newer run in the pane replaces this one
 The watcher reads the run's journal.jsonl every few seconds, ends when the
-session transcript reports the workflow's task as finished, and clears the
-tokens a while later. Never fails the agent: any error exits 0.
+session transcript reports the workflow's task as finished, follows a resume
+of the same run, and clears the tokens a while later. Never fails the agent: any error exits 0.
 
 Install: drovr-install-hooks (registers it in ~/.claude/settings.json).
 """
@@ -163,16 +163,12 @@ def render(run, desc, phases, agents, state, started):
                 if len(summary) > 600:
                     summary = summary[:600].rstrip() + "…"
                 lines += [f"### {agent['label']}", "", summary, ""]
-    if state == "done":
-        phase = "done"
-    elif current is None:
-        phase = "starting"
-    else:
-        # The detail says what the phase does; a title like "Step 2" only
-        # repeats the count shown beside it.
-        title, detail = phases[current]
-        phase = detail or title
-        phase = f"failed in {phase}" if state == "failed" else phase
+    # The sidebar shows phases in the bar and agents beside it; the current
+    # phase's name is in the view.
+    finished = sum(a["result"] is not None for a in agents.values())
+    phase = f"{finished}/{len(agents)} agents" if agents else "starting"
+    if state == "failed":
+        phase = f"failed · {phase}"
     return "\n".join(lines).rstrip() + "\n", (f"{state} {done}/{total}", phase)
 
 
@@ -183,12 +179,13 @@ def write_doc(path, text):
     os.replace(tmp, path)
 
 
-def end_status(transcript, task_id, offset):
-    """(status or None, new offset): the workflow task's final status from a
-    task notification in the session transcript."""
+def scan_transcript(transcript, run_id, task_id, offset):
+    """(status or None, task id, new offset) from the session transcript.
+    A task notification gives the workflow task's final status. A later
+    launch of the same run (a resume after a stop) replaces the task id and
+    clears that status."""
     if not transcript or not task_id:
-        return None, offset
-    marker = f"<task-id>{task_id}</task-id>".encode()
+        return None, task_id, offset
     status = None
     try:
         with open(transcript, "rb") as handle:
@@ -197,49 +194,78 @@ def end_status(transcript, task_id, offset):
                 if not raw.endswith(b"\n"):
                     break
                 offset += len(raw)
-                if marker in raw:
+                if f"<task-id>{task_id}</task-id>".encode() in raw:
                     found = END_RE.search(raw.decode("utf-8", "replace"))
                     if found:
                         status = found.group(1)
+                elif b"async_launched" in raw and run_id.encode() in raw:
+                    relaunched = relaunch_task(raw, run_id)
+                    if relaunched and relaunched != task_id:
+                        task_id, status = relaunched, None
     except OSError:
         pass
-    return status, offset
+    return status, task_id, offset
+
+
+def relaunch_task(raw, run_id):
+    """The task id of a Workflow launch result for `run_id` in one line."""
+    try:
+        result = json.loads(raw).get("toolUseResult")
+    except ValueError:
+        return None
+    if isinstance(result, dict) and result.get("runId") == run_id \
+            and result.get("status") == "async_launched":
+        return result.get("taskId")
+    return None
 
 
 def watch(run):
     pane = run["pane"]
+    run_id = run["run_id"]
     journal = os.path.join(run["dir"], "journal.jsonl")
-    doc = os.path.join(DOC_DIR, f"{run['run_id']}.md")
+    doc = os.path.join(DOC_DIR, f"{run_id}.md")
     desc, phases = script_meta(run.get("script") or "")
     started = run["started"]
     offset = run.get("offset", 0)
+    task_id = run.get("task_id")
     state = "running"
+    ended = None
     last_cue = None
     last_change = time.time()
-    while time.time() - started < MAX_S:
-        if pane_run(pane) not in (run["run_id"], None):
-            return  # a newer run took over the pane
-        status, offset = end_status(run.get("transcript"), run.get("task_id"), offset)
-        if status:
-            state = "done" if status == "completed" else "failed"
+    # After the run ends, keep polling for LINGER_S: a resume of the same run
+    # shows as running again. Then clear the tokens.
+    while time.time() - started < MAX_S and not (ended and time.time() - ended > LINGER_S):
         try:
-            last_change = max(last_change, os.path.getmtime(journal))
-        except OSError:
+            if pane_run(pane) not in (run_id, None):
+                return  # a newer run took over the pane
+            status, new_task, offset = scan_transcript(run.get("transcript"), run_id, task_id, offset)
+            if new_task != task_id:
+                task_id, state, ended, last_change = new_task, "running", None, time.time()
+            if status and not ended:
+                state = "done" if status == "completed" else "failed"
+            try:
+                last_change = max(last_change, os.path.getmtime(journal))
+            except OSError:
+                pass
+            if state == "running" and time.time() - last_change > STALE_S:
+                state = "failed"
+            if state != "running" and not ended:
+                ended = time.time()
+            if not ended or last_cue is None or last_cue[0].split()[0] == "running":
+                text, cue = render(run, desc, phases, read_journal(journal), state, started)
+                write_doc(doc, text)
+                if cue != last_cue:
+                    report(pane, {"drovr_wf": cue[0], "drovr_wf_phase": cue[1], "drovr_wf_doc": doc,
+                                  "drovr_wf_run": run_id})
+                    last_cue = cue
+        except Exception:  # noqa: BLE001 - a slow herdr call must not stop the watcher
             pass
-        if state == "running" and time.time() - last_change > STALE_S:
-            state = "failed"
-        text, cue = render(run, desc, phases, read_journal(journal), state, started)
-        write_doc(doc, text)
-        if cue != last_cue:
-            report(pane, {"drovr_wf": cue[0], "drovr_wf_phase": cue[1], "drovr_wf_doc": doc,
-                          "drovr_wf_run": run["run_id"]})
-            last_cue = cue
-        if state != "running":
-            break
         time.sleep(POLL_S)
-    time.sleep(LINGER_S)
-    if pane_run(pane) == run["run_id"]:
-        report(pane, clear=("drovr_wf", "drovr_wf_phase", "drovr_wf_doc", "drovr_wf_run"))
+    try:
+        if pane_run(pane) == run_id:
+            report(pane, clear=("drovr_wf", "drovr_wf_phase", "drovr_wf_doc", "drovr_wf_run"))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def launch(hook):

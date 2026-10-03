@@ -115,9 +115,9 @@ Install the hook on every machine where agents run:
 
 ### Workflow progress
 When a Claude Code agent runs a background workflow, its sidebar row gets a
-second line with the progress: `▰▰▰▱▱▱ 3/6 · sidebar signals`. The bar and the
-count show the finished phases of the workflow script; the text after them is
-the current phase's detail, or its title when it has none. The colour shows the
+second line with the progress: `▰▰▰▱▱▱ 3/6 · 7/9 agents`. The bar and the
+first count show the finished phases of the workflow script; the second count
+shows the finished agents out of those started so far. The colour shows the
 state: the accent colour while it runs, green when it is done, red when it
 failed. Click the line to open a live view of the run in the document pane:
 the phases, each agent and its status, and the results of finished agents.

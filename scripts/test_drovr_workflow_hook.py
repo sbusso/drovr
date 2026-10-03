@@ -71,37 +71,49 @@ class WorkflowHookTests(unittest.TestCase):
         desc, phases = wf.script_meta(self.write("demo.js", SCRIPT))
         agents = wf.read_journal(self.write("journal.jsonl", "".join(json.dumps(e) + "\n" for e in JOURNAL)))
         text, cue = wf.render({"name": "demo"}, desc, phases, agents, "running", 0)
-        self.assertEqual(cue, ("running 1/3", "Build"))
+        self.assertEqual(cue, ("running 1/3", "1/2 agents"))
         self.assertIn("- ✓ **Plan** — outline", text)
         self.assertIn("- ▸ **Build**", text)
         self.assertIn("- · **Review** — two lenses", text)
         self.assertIn("| builder | Build | running |", text)
         self.assertIn("### planner\n\nWrote the plan.", text)
         _, cue = wf.render({"name": "demo"}, desc, phases, agents, "failed", 0)
-        self.assertEqual(cue, ("failed 1/3", "failed in Build"))
+        self.assertEqual(cue, ("failed 1/3", "failed · 1/2 agents"))
         _, cue = wf.render({"name": "demo"}, desc, phases, agents, "done", 0)
-        self.assertEqual(cue, ("done 3/3", "done"))
+        self.assertEqual(cue, ("done 3/3", "1/2 agents"))
         _, cue = wf.render({"name": "demo"}, desc, phases, {}, "running", 0)
         self.assertEqual(cue, ("running 0/3", "starting"))
         planning = {"a": {"label": "planner", "phase": "Plan", "result": None}}
         _, cue = wf.render({"name": "demo"}, desc, phases, planning, "running", 0)
-        self.assertEqual(cue, ("running 0/3", "outline"))
+        self.assertEqual(cue, ("running 0/3", "0/1 agents"))
 
-    def test_end_status_reads_only_this_task_after_the_offset(self):
+    def test_scan_reads_only_this_task_after_the_offset(self):
         note = lambda task, status: json.dumps({"type": "attachment", "attachment": {
             "prompt": f"<task-notification>\n<task-id>{task}</task-id>\n<status>{status}</status>"}}) + "\n"
         transcript = self.write("t.jsonl", note("w1", "completed"))
         offset = os.path.getsize(transcript)
         with open(transcript, "a") as handle:
             handle.write(note("other", "completed"))
-        self.assertEqual(wf.end_status(transcript, "w1", offset)[0], None)
-        self.assertEqual(wf.end_status(transcript, "w1", 0)[0], "completed")
+        self.assertEqual(wf.scan_transcript(transcript, "r1", "w1", offset)[0], None)
+        self.assertEqual(wf.scan_transcript(transcript, "r1", "w1", 0)[0], "completed")
         with open(transcript, "a") as handle:
             handle.write(note("w1", "failed"))
             handle.write('{"partial": ')
-        status, new_offset = wf.end_status(transcript, "w1", offset)
-        self.assertEqual(status, "failed")
+        status, task, new_offset = wf.scan_transcript(transcript, "r1", "w1", offset)
+        self.assertEqual((status, task), ("failed", "w1"))
         self.assertLess(new_offset, os.path.getsize(transcript), "partial line is read next time")
+
+    def test_scan_follows_a_resume_of_the_same_run(self):
+        note = lambda task, status: json.dumps({"attachment": {
+            "prompt": f"<task-id>{task}</task-id><status>{status}</status>"}}) + "\n"
+        launch = lambda run, task: json.dumps({"toolUseResult": {
+            "status": "async_launched", "runId": run, "taskId": task}}) + "\n"
+        transcript = self.write("t.jsonl", note("w1", "killed") + launch("r1", "w2"))
+        self.assertEqual(wf.scan_transcript(transcript, "r1", "w1", 0)[:2], (None, "w2"))
+        with open(transcript, "a") as handle:
+            handle.write(launch("r9", "w9"))
+            handle.write(note("w2", "completed"))
+        self.assertEqual(wf.scan_transcript(transcript, "r1", "w1", 0)[:2], ("completed", "w2"))
 
     def test_launch_ignores_other_tool_results(self):
         # No pane, or a result that is not an async launch: nothing runs.
