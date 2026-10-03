@@ -78,7 +78,11 @@ impl TaskJob {
     /// The shell script of a shell job.
     fn script(&self) -> Option<String> {
         match self {
-            Self::Pull { panes, applied, .. } => Some(pull_script(panes.as_deref(), applied)),
+            Self::Pull {
+                machine,
+                panes,
+                applied,
+            } => Some(pull_script(machine == "local", panes.as_deref(), applied)),
             Self::WriteFiles { script, .. } => Some(script.clone()),
             Self::Probe { .. } => Some(PROBE_SCRIPT.to_owned()),
             Self::Api { .. } => None,
@@ -185,9 +189,10 @@ pub(super) fn parse_probe(result: &Result<String, String>) -> Option<u32> {
     words.next().is_none().then_some(version)
 }
 
-/// The tasks root on this Mac: `state_dir()/drovr`.
+/// The tasks root on this Mac: where the local CLI queues ops
+/// (`state_dir()/drovr` unless `$DROVR_TASK_OUTBOX_DIR`).
 pub(super) fn local_root() -> PathBuf {
-    crate::config::state_dir().join("drovr")
+    crate::tasks::outbox::root()
 }
 
 /// The `R=...` line for a machine's scripts.
@@ -202,7 +207,11 @@ pub(super) fn root_line(local: bool) -> String {
 /// Prints `{pane}\t{epoch}\t{seq}\t{json}` for each op file above the
 /// applied seq of its (pane, epoch), in numeric order per pane, at most
 /// [`PULL_LIMIT`] lines. `panes` None lists every pane directory (a sweep).
-pub(super) fn pull_script(panes: Option<&[String]>, applied: &[(String, String, u64)]) -> String {
+pub(super) fn pull_script(
+    local: bool,
+    panes: Option<&[String]>,
+    applied: &[(String, String, u64)],
+) -> String {
     let dirs = match panes {
         None => r#""$O"/*/"#.to_owned(),
         Some(panes) => panes
@@ -241,7 +250,7 @@ for d in {dirs}; do
   done
 done
 "#,
-        root = REMOTE_ROOT,
+        root = root_line(local),
     )
 }
 
@@ -627,9 +636,10 @@ impl ClientShellState {
             *slot = (*slot).max(*seq);
         }
         // Snapshots and context files of the tasks the ops changed.
+        let local = machine == "local";
         for id in &result.changed {
             if let Ok(Some(detail)) = tasks::read_store(|store| store.task_detail(id)) {
-                task_files(&mut result.script, &detail, false);
+                task_files(&mut result.script, &detail, local);
                 self.task_rt
                     .written
                     .insert(id.clone(), (machine.to_owned(), detail.task.version));
@@ -644,7 +654,7 @@ impl ClientShellState {
         }
         if !result.script.is_empty() {
             self.task_rt
-                .queue_write(machine, result.script.finish(false), None);
+                .queue_write(machine, result.script.finish(local), None);
         }
         repaint | !result.changed.is_empty()
     }
@@ -760,6 +770,7 @@ mod tests {
     #[test]
     fn pull_script_quotes_paths_sorts_numerically_and_caps() {
         let script = pull_script(
+            false,
             Some(&["p1".into(), "p 2".into()]),
             &[("p1".into(), "k3f9q2".into(), 7)],
         );
@@ -768,7 +779,7 @@ mod tests {
         assert!(script.contains("sort -n"));
         assert!(script.contains("-lt 200"));
         assert!(script.starts_with(REMOTE_ROOT));
-        let sweep = pull_script(None, &[]);
+        let sweep = pull_script(false, None, &[]);
         assert!(sweep.contains(r#"for d in "$O"/*/; do"#), "{sweep}");
 
         let root = temp_root("pull");
@@ -791,7 +802,7 @@ mod tests {
         std::fs::write(root.join("task-outbox/p1/.13.tmp"), "{}").expect("tmp");
         let out = sh(
             &root,
-            &pull_script(None, &[("p1".into(), "k3f9q2".into(), 7)]),
+            &pull_script(false, None, &[("p1".into(), "k3f9q2".into(), 7)]),
         );
         let pulled = parse_pull(&out);
         let seqs: Vec<(String, u64)> = pulled.iter().map(|p| (p.pane.clone(), p.seq)).collect();
@@ -808,18 +819,18 @@ mod tests {
         );
         assert_eq!(pulled[0].json, lines[7].1);
         // Only listed panes.
-        let out = sh(&root, &pull_script(Some(&["p2".into()]), &[]));
+        let out = sh(&root, &pull_script(false, Some(&["p2".into()]), &[]));
         assert_eq!(parse_pull(&out).len(), 1);
         // Cap.
         let many: Vec<(u64, String)> = (1..=205)
             .map(|seq| (seq, op_line("e1", seq, "p9", "AC-1", "x")))
             .collect();
         outbox(&root, "p9", "e1", &many);
-        let out = sh(&root, &pull_script(Some(&["p9".into()]), &[]));
+        let out = sh(&root, &pull_script(false, Some(&["p9".into()]), &[]));
         assert_eq!(parse_pull(&out).len(), 200);
         // No outbox at all: nothing, exit 0.
         let empty = temp_root("pull-empty");
-        assert_eq!(sh(&empty, &pull_script(None, &[])), "");
+        assert_eq!(sh(&empty, &pull_script(false, None, &[])), "");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
     }

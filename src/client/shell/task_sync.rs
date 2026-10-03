@@ -366,10 +366,73 @@ impl ClientShellState {
             Ok((live, linked)) => {
                 self.task_rt.live = live;
                 self.task_rt.linked = linked;
+                self.link_live_tasks();
             }
             Err(error) => tracing::debug!(%error, "cannot read live tasks"),
         }
         true
+    }
+
+    /// Links a live task started without a workspace (a local db-mode
+    /// `drovr task start`) to the workspace of its attempt's pane, so the
+    /// workspace filter and the gone-workspace check see it.
+    fn link_live_tasks(&mut self) {
+        let mut links = Vec::new();
+        for live in &self.task_rt.live {
+            if live.workspace_key.is_some() {
+                continue;
+            }
+            let Some(key) = live
+                .pane_key
+                .as_deref()
+                .and_then(|pane_key| self.pane_workspace_key(pane_key))
+            else {
+                continue;
+            };
+            links.push((live.display_id.clone(), key));
+        }
+        for (display_id, key) in links {
+            match tasks::with_store(|store| store.link_workspace(&display_id, Some(&key))) {
+                Ok(()) => {
+                    if let Some(live) = self
+                        .task_rt
+                        .live
+                        .iter_mut()
+                        .find(|live| live.display_id == display_id)
+                    {
+                        live.workspace_key = Some(key);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, task = %display_id, "cannot link the task's workspace");
+                }
+            }
+        }
+    }
+
+    /// `machine/w7:label` of the workspace holding the pane of `pane_key`.
+    fn pane_workspace_key(&self, pane_key: &str) -> Option<String> {
+        let (machine, pane_id) = pane_key.split_once('/')?;
+        let endpoint_id = self.endpoint_for_machine(machine)?;
+        let endpoint = self.endpoint_by_id(&endpoint_id)?;
+        let snapshot = endpoint.snapshot.as_deref()?;
+        let workspace_id = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .map(|pane| &pane.workspace_id)
+            .or_else(|| {
+                snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane_id)
+                    .map(|agent| &agent.workspace_id)
+            })?;
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace_id == workspace_id)
+            .map(|workspace| projects::workspace_key(endpoint, workspace))
     }
 
     /// Section 4.5's notice: `{id} asks: {title}` once per new open decision
@@ -497,7 +560,9 @@ impl ClientShellState {
                 endpoint.endpoint_id.is_local(),
                 endpoint.bridge.is_some(),
             ));
-            if online && !endpoint.endpoint_id.is_local() {
+            // Local rings too: an agent drovr did not launch queues to the
+            // local outbox until tasks.db exists.
+            if online {
                 for agent in endpoint
                     .snapshot
                     .as_deref()
@@ -531,8 +596,8 @@ impl ClientShellState {
                 }
             }
             let mut swept = previous.and_then(|previous| previous.swept);
-            if online && !local && bridged {
-                if changed && previous.is_none_or(|previous| !previous.online) {
+            if online && (local || bridged) {
+                if !local && changed && previous.is_none_or(|previous| !previous.online) {
                     self.task_rt.queue_probe(&machine);
                 }
                 if changed
@@ -1207,6 +1272,64 @@ mod tests {
         tasks::with_store(|store| store.move_task(&other, Status::Cancelled, &Actor::Human, None))
             .expect("cancel");
         assert_eq!(key(&other), None);
+    }
+
+    #[test]
+    fn a_start_without_a_workspace_is_linked_to_its_panes_workspace() {
+        let id = tasks::with_store(|store| {
+            let task = store.create_task(
+                &NewTask {
+                    project: "Acme".into(),
+                    title: Some("Started by hand".into()),
+                    ..NewTask::default()
+                },
+                &Actor::Human,
+            )?;
+            // What a local db-mode `drovr task start` writes.
+            store.start_attempt(
+                &task.display_id,
+                &NewAttempt {
+                    harness: "claude".into(),
+                    machine: "local".into(),
+                    workspace_key: None,
+                    pane_key: Some("local/pane_1".into()),
+                    session_id: None,
+                },
+                &Actor::Agent("claude@local".into()),
+            )?;
+            Ok(task.display_id)
+        })
+        .expect("task");
+        let mut state = shell(Vec::new());
+        tick(&mut state);
+        let key = tasks::with_store(|store| store.task(&id))
+            .expect("read")
+            .expect("task")
+            .workspace_key;
+        assert_eq!(key.as_deref(), Some("local/ws_1:client-shell"));
+    }
+
+    #[test]
+    fn a_local_ring_pulls_the_local_outbox() {
+        // An agent drovr did not launch queues to the local outbox before
+        // tasks.db exists; its ring must reach a pull on this machine.
+        let mut state = shell(vec![agent(
+            "pane_1",
+            AgentStatus::Working,
+            &[("drovr_tq", "k3f9q2.1|1".into())],
+        )]);
+        let out = tick(&mut state);
+        let pull = out.actions.iter().find_map(|action| match action {
+            ClientShellAction::TaskJob {
+                route: crate::client::shell::inbox::ApiRoute::Local,
+                job: TaskJob::Pull { machine, .. },
+            } if machine == "local" => Some(()),
+            _ => None,
+        });
+        assert!(pull.is_some(), "{:?}", out.actions);
+        let script = super::super::task_ingest::pull_script(true, None, &[]);
+        let root = super::super::task_ingest::local_root();
+        assert!(script.contains(&*root.to_string_lossy()), "{script}");
     }
 
     #[test]

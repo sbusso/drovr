@@ -958,6 +958,11 @@ mod tests {
             .actions
             .iter()
             .filter_map(|a| match a {
+                // The local outbox sweep runs on its own machine slot.
+                ClientShellAction::TaskJob {
+                    job: super::super::task_ingest::TaskJob::Pull { machine, .. },
+                    ..
+                } if machine == "local" => None,
                 ClientShellAction::TaskJob { job, .. } => Some(match job {
                     super::super::task_ingest::TaskJob::Probe { .. } => "probe",
                     super::super::task_ingest::TaskJob::Pull { .. } => "pull",
