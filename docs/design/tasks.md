@@ -1,9 +1,33 @@
 # Tasks: per-project board and task view
 
-Status: draft 1, 2026-10-03. Contract for three parallel builders (A, B, C).
+Status: draft 2, 2026-10-03. Contract for three parallel builders (A, B, C).
 Inputs: the workspace and workspace-herdr copies from mato (schema, spec
-sections 5-15, 25-26 and 43, apps/tui, packages/herdr-plugin),
-docs/reports/2026-10-02-mato-projects.md and docs/design/inbox-pane.md.
+sections 5-15, 25-26 and 43, apps/tui, packages/herdr-plugin, apps/web
+features/task), docs/reports/2026-10-02-mato-projects.md and
+docs/design/inbox-pane.md.
+
+Changes in draft 2 (review against the code on drovr-main):
+
+- Open decisions are inbox rows (Waiting tab) and raise a notice; inbox rows of
+  a pane that runs a task show the task id (section 4.5).
+- Task view gains the waiting line, a pinned header and composer, and
+  optimistic concurrency on title and body (`tasks.version`), so an agent's
+  edit and a human's `$EDITOR` session cannot overwrite each other silently.
+- Writers use `BEGIN IMMEDIATE`; migrations run under one immediate
+  transaction and refuse a database newer than the binary; a backup is taken
+  before each migration and once a day (section 2.1).
+- Start-task passes `DROVR_TASK`, `DROVR_TASK_MODE`, `DROVR_TASKS_DB` and
+  `DROVR_AGENT` through `workspace.create`'s `env` (stock 0.9.3 supports it)
+  instead of typed `export` text, keeps its own pending launches, and sends
+  the first prompt and relays with `agent.prompt` like inbox replies.
+- The outbox carries a format version and a per-directory epoch, the client
+  sweeps every remote outbox once a minute (ops of closed panes are not lost),
+  and all SSH work runs on a background thread (section 6.3).
+- Remote rollout, probing and version skew (section 6.6).
+- An offline machine never ends attempts (section 5.3).
+- Exact step-0 list, including the shell files that carry the new menu
+  targets, the background job and the loop event; builders work in separate
+  worktrees and merge A, B, C (section 7).
 
 ## 1. Scope
 
@@ -18,10 +42,15 @@ In scope for v1:
 - The task view: header (id, status, auto flag, agent), title, description,
   acceptance criteria with check state and evidence, notes thread, attempts
   linked to agents, workspaces and panes on any machine, artifacts (documents
-  open in the doc pane), and one open decision card.
+  open in the doc pane), one open decision card, and a waiting line that says
+  what the task waits on (an inbox item on its pane, or an open decision).
+- Open decisions in the inbox's Waiting tab, and the task id on inbox rows of
+  task panes (section 4.5).
 - Start a task: create a workspace in the project's section on a chosen
   machine, start Claude with a context file and a first prompt, link both.
 - `drovr task` CLI for agents and for the user, plus skill `drovr-tasks`.
+  `drovr task verify` runs criterion check commands in the agent's pane and
+  records the verdict with the output as evidence.
 - Status follows agent signals (working, waiting, finished), with a manual
   override per task.
 - Remote agents (mato) report through an outbox the client pulls over the
@@ -39,9 +68,17 @@ Left out of v1:
   machine (see section 5 for the upgrade path).
 - Rich artifact renderers (diff viewer, images). Documents open in the doc
   pane; links and other files open with the system opener on the Mac only.
-- Decision rows in the inbox list. v1 shows decisions on the board card and in
-  the task view; the inbox keeps its hook-based items unchanged.
+- Answering a decision inside the inbox row. A decision row opens the task
+  view on its decision card (one click); the existing hook-based inbox items
+  are unchanged.
+- Sidebar changes. `drovr_sidebar.rs` has uncommitted work from another
+  session; the task id reaches the sidebar through the workspace label
+  (`AC-12 Spec decision requests`) only.
 - Drag and drop. Moves use the status chip menu.
+- Running criterion checks from the panel. Agents run them with
+  `drovr task verify` in their own pane, on their own machine.
+- Tasks on Windows machines (the outbox and the context file need a POSIX
+  shell over the SSH bridge). Start on a Windows endpoint is refused.
 - A stored inbox or events table. Status changes are written as event
   entries in the task thread.
 
@@ -66,12 +103,53 @@ Path, in this order:
 Under `cfg(test)` the client's shared handle never opens a file: it is a
 thread-local in-memory store (section 3.4).
 
+A task pane started by drovr always gets `DROVR_TASKS_DB` set to the absolute
+path the client uses (section 5.1). Without it, a `cargo run` debug client
+(`herdr-dev` state dir) and the release `drovr` an agent runs (`herdr` state
+dir) would use two different files.
+
 Connection settings: `journal_mode=WAL`, `synchronous=NORMAL`,
 `foreign_keys=ON`. `busy_timeout` is 250 ms in the client and 5000 ms in the
-CLI. A busy error in the client shows the toast `tasks db busy, retry`.
+CLI.
 
-Only the Mac (the client machine) has a database. A remote machine never
-creates one; `drovr task` there writes an outbox (section 6.3).
+Concurrent writers. The client, every local `drovr task` process, and a second
+drovr client on the same Mac may write at once. Rules:
+
+- Every write method runs inside `BEGIN IMMEDIATE ... COMMIT` (the `write`
+  helper of section 3.3). A deferred transaction that reads and then writes
+  can fail with `SQLITE_BUSY_SNAPSHOT` without waiting for the busy timeout;
+  an immediate one takes the write lock first and waits.
+- Reads are plain statements outside a transaction, or one deferred
+  transaction when they read several tables for one result (`task_detail`,
+  `list`), so a reader never sees half of a concurrent write.
+- Allocation (`next_number`, `entries.seq`, `position`) happens inside the
+  writer's immediate transaction, never from a value read before it.
+- A busy error after the timeout is `StoreError::Busy`. The client then
+  keeps whatever the user typed (the composer, the one-line input, the
+  `$EDITOR` file) and shows the notice `tasks db busy, try again`; nothing
+  is retried in a loop on the UI thread. The CLI exits 1 with `tasks db busy`.
+- A write to the current value (a move to the current status, the same
+  patch) is a no-op that returns Ok without an event entry, so two clients
+  applying the same automatic move write it once.
+
+Creation. The client opens an existing file at start-up but creates the file
+only on its first write (a task, a project row, an import). Reads against a
+missing file return empty results. A drovr client started on another machine
+therefore does not create a second store just by opening the panel; a
+store there exists only if the user creates tasks there.
+
+Only the Mac (the client machine the user creates tasks on) has a database.
+`drovr task` on a remote machine writes an outbox (section 6.3).
+
+Backups. Before a migration (section 2.5) the store writes
+`{path}.v{version}.bak`. On the client's first write of each day it runs
+`VACUUM INTO '{path}.{yyyymmdd}.bak'` (skipped when that file exists) and
+deletes daily `.bak` files beyond the newest 7. A backup failure is logged
+with `tracing::warn!` and does not block the write. Restoring is a manual
+copy over `tasks.db` with every drovr process stopped.
+
+Timestamps are written without fractional seconds (section 2.2), so text
+comparison of two timestamps orders them; no code parses them.
 
 ### 2.2 Ids and time
 
@@ -80,9 +158,12 @@ creates one; `drovr task` there writes an outbox (section 6.3).
   `AC-12`. The CLI and the panel use display ids only.
 - `number` comes from `projects.next_number`, allocated in the same
   transaction as the insert.
-- Timestamps are RFC 3339 UTC text (`time::OffsetDateTime::now_utc()` with
+- Timestamps are RFC 3339 UTC text (`time::OffsetDateTime::now_utc()`
+  with the nanoseconds set to 0, formatted with
   `time::format_description::well_known::Rfc3339`), for example
-  `2026-10-03T08:15:02Z`.
+  `2026-10-03T08:15:02Z`. One helper, `tasks::now_text() -> String`, makes
+  them. Imported timestamps are cut to whole seconds and rewritten in this
+  form. The existing `time` features (`formatting`) are enough.
 - `ext_id` holds a source id on import (workspace ULID) and makes the import
   idempotent.
 
@@ -102,13 +183,15 @@ is the sidebar `ProjectGroup.name`.
   `ClientRenameTarget::ProjectRename` in project_actions.rs (around line 940).
   If `new` already names another project row, the rename of the section still
   happens and the store returns `Refused { code: "project_exists" }`; the
-  client shows the message as a toast and the tasks stay under the old name
+  client shows the message as a notice (`push_task_notice`) and the tasks stay under the old name
   until the user renames again.
 - Deleting a section leaves its project row and tasks. They reappear when a
   section with the same name exists again, and `drovr task list --project
   NAME` still lists them.
 - The OTHER section (`projects::OTHER`) has no tasks. The Tasks view shows
-  `Add this workspace to a section to track tasks.`
+  `Add this workspace to a section to track tasks.` `ensure_project` returns
+  `Invalid` for an empty name or a name that starts with `\0` (OTHER's
+  internal name), so no caller can create it by mistake.
 
 ### 2.4 Links to workspaces and panes
 
@@ -127,9 +210,33 @@ attempt whose `pane_key` matches.
 ### 2.5 Schema (migration v1)
 
 Migrations live in `src/tasks/schema.rs` as `const MIGRATIONS: &[&str]`,
-append-only, index = version - 1. `migrate(conn)` creates `migrations` if
-needed and applies every missing version in its own transaction, inserting
-`(version, applied_at)`.
+append-only, index = version - 1. A published migration is never edited; a
+change is a new entry. Until the first build that writes a real file ships,
+v1 may still change (this draft changed it).
+
+`migrate(conn: &mut Connection, path: Option<&Path>) -> StoreResult<()>`:
+
+1. `BEGIN IMMEDIATE` (waits for the busy timeout, so a CLI and the client
+   starting together migrate once: the second one finds the versions
+   applied).
+2. `CREATE TABLE IF NOT EXISTS migrations (...)`, then
+   `SELECT COALESCE(MAX(version), 0)` inside the same transaction.
+3. Found version above `MIGRATIONS.len()`: roll back and return
+   `StoreError::TooNew { found, known }`. The CLI prints
+   `tasks db is version {found}; this drovr knows {known}. Update drovr.` and
+   exits 1; the panel shows the same text in place of the board and makes no
+   writes.
+4. Found version >= 1 and below `MIGRATIONS.len()`, and no file
+   `{path}.v{found}.bak` yet: roll back, run
+   `VACUUM INTO '{path}.v{found}.bak'` (it cannot run inside a transaction),
+   then start again at step 1. The second pass finds the backup and goes on.
+   In-memory stores (`path = None`) skip the backup.
+5. Apply each missing version in order and insert `(version, applied_at)`,
+   all in that one immediate transaction, then commit. A failure rolls back
+   every version of this run.
+
+`TaskStore::open` runs `migrate` before returning; nothing else creates
+tables.
 
 ```sql
 CREATE TABLE migrations (
@@ -164,6 +271,7 @@ CREATE TABLE tasks (
   workspace_key TEXT,
   auto_status INTEGER NOT NULL DEFAULT 1,
   position REAL NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
   ext_id TEXT UNIQUE,
   status_since TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -257,6 +365,7 @@ CREATE TABLE decisions (
   ruled_at TEXT,
   surface TEXT,
   expires_at TEXT,
+  wait_until TEXT,
   created_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX idx_decisions_one_open ON decisions(task_id)
@@ -274,7 +383,18 @@ Column rules the store enforces (not the schema):
 - `entries.seq` is `COALESCE(MAX(seq), 0) + 1` per task, inside the insert.
 - `tasks.position`: a new task or a moved task lands at the end of its lane
   (`MAX(position) + 1024`, or 1024). `reorder` sets the midpoint of its
-  neighbours.
+  neighbours; when the gap between them is below `1e-6` it first renumbers
+  the lane to 1024, 2048, ... in the same transaction.
+- `tasks.version` goes up by 1 on every write to the task row (any column),
+  in the same statement (`version = version + 1`). `update_task` with
+  `TaskPatch.expected_version = Some(v)` and a row at another version
+  returns `Refused { code: "stale" }` and writes nothing. The panel always
+  passes the version it loaded; the CLI passes none (agents append, they do
+  not hold a draft open).
+- `decisions.wait_until`: set by `decide --wait` to now + the wait timeout;
+  the client relays a ruling into the agent's pane only when `wait_until` is
+  NULL or past (section 5.4), so a waiting CLI and a typed relay never
+  deliver the same ruling twice.
 - `status_since` changes on every status change. `closed_at` is set on entry
   into done or cancelled and cleared on leaving them.
 - `criteria.evidence` and `entries.body` are cut to 20 000 bytes on a char
@@ -319,6 +439,20 @@ message), used by both the CLI and the panel:
 - `no_attempt`: `{id} has no open attempt`
 - `project_exists`: `a project named {name} already exists`
 - `not_found`: `no task {id}`
+- `stale`: `{id} changed since you opened it` (section 2.5, `version`)
+- `decision_ruled`: `that decision was already answered`
+
+Attempts and closing:
+
+- A human move into `done` or `cancelled` ends an open attempt in the same
+  transaction: outcome `succeeded` when the task came from `review`, else
+  `stopped` with the note `closed by you`. It also withdraws an open
+  decision.
+- `release` ends the open attempt as `stopped` with the note and moves the
+  task to `ready`.
+- A human move to `ready` from `review` (send back) keeps an open attempt
+  open: the agent continues in the same pane after the relay of section 5.4,
+  and its next working signal moves the task back to `working`.
 
 Gate (`gate(&[Criterion]) -> Gate`): passes when every criterion is
 `passed`. A task with no criteria passes. Failed criteria are reported before
@@ -329,7 +463,14 @@ sets it back to 1. The task view has an `auto` chip that toggles it.
 
 Every status change writes an event entry: `event_type = "status"`, `body =
 "{from} → {to}"` plus ` ({actor})` for agent and auto moves, plus `: {note}`
-when a note was given.
+when a note was given. Exception: `Auto` moves between `working` and
+`blocked` write no entry (a permission prompt every few minutes would bury
+the thread); they still update `status_since`.
+
+Decisions write entries too: `event_type = "decision"`, body
+`asked: {title}` on request, `answered: {label or text} ({surface})` on a
+ruling, `withdrawn` or `expired`. The thread therefore shows the decision
+where it happened, as the workspace task page does.
 
 ### 2.7 Import from workspace
 
@@ -437,6 +578,9 @@ pub(crate) enum Actor {
     Auto,           // author "drovr"
 }
 
+/// RFC 3339 UTC, whole seconds (section 2.2).
+pub(crate) fn now_text() -> String;
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Project { pub id: i64, pub key: String, pub name: String, pub next_number: i64 }
 
@@ -455,6 +599,7 @@ pub(crate) struct Task {
     pub workspace_key: Option<String>,
     pub auto_status: bool,
     pub position: f64,
+    pub version: i64,
     pub status_since: String,
     pub created_at: String,
     pub updated_at: String,
@@ -566,7 +711,19 @@ pub(crate) struct Decision {
     pub ruled_at: Option<String>,
     pub surface: Option<String>,   // "panel" | "cli" | "expiry"
     pub expires_at: Option<String>,
+    pub wait_until: Option<String>,
     pub created_at: String,
+}
+
+/// An open decision with what the inbox row and the notice draw.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct OpenDecision {
+    pub decision: Decision,
+    pub display_id: String,
+    pub task_name: String,
+    pub project: String,
+    /// Pane of the task's open attempt, if any ("machine/pane_id").
+    pub pane_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -583,12 +740,15 @@ pub(crate) struct TaskDetail {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TaskFilter {
     pub project: Option<String>,        // section name
-    /// Matches on the `machine/{workspace_id}:` prefix, so a renamed
-    /// workspace still matches (same rule as projects::same_workspace).
+    /// A `machine/{workspace_id}:` prefix (the caller builds it from the
+    /// endpoint label and the workspace id), so a renamed workspace still
+    /// matches. The store compares `substr(workspace_key, 1, len) = prefix`,
+    /// not LIKE (`_` in ids would be a wildcard).
     pub workspace_key: Option<String>,
-    pub statuses: Vec<Status>,          // empty = all except archived
-    pub include_archived: bool,
+    pub statuses: Vec<Status>,          // empty = every status
+    pub include_archived: bool,         // false: archived_at IS NULL only
     pub done_limit: Option<u32>,        // newest N done/cancelled by closed_at
+    pub text: Option<String>,           // case-insensitive, in name or display id
 }
 
 #[derive(Clone, Debug, Default)]
@@ -610,6 +770,9 @@ pub(crate) struct TaskPatch {
     pub priority: Option<Priority>,
     pub auto_status: Option<bool>,
     pub archived: Option<bool>,
+    /// The version the editor loaded; a different row version is refused
+    /// with `stale` (section 2.5). None: no check (CLI).
+    pub expected_version: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -638,6 +801,7 @@ pub(crate) struct NewDecision {
     pub allow_text: bool,
     pub default_choice: Option<String>,
     pub expires_at: Option<String>,
+    pub wait_until: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -653,6 +817,7 @@ pub(crate) enum StoreError {
     NotFound(String),           // display id or row id as text
     Refused(Refusal),
     Invalid(String),            // bad input, message for the user
+    TooNew { found: i64, known: i64 },  // schema newer than this binary
 }
 impl std::fmt::Display for StoreError { .. }
 impl std::error::Error for StoreError {}
@@ -671,7 +836,11 @@ impl TaskStore {
     pub(crate) fn default_path() -> PathBuf;
     /// Opens or creates the file (and its directory), sets pragmas, migrates.
     pub(crate) fn open(path: &Path, busy_ms: u32) -> StoreResult<TaskStore>;
+    /// Same, but Ok(None) when the file does not exist (nothing is created).
+    pub(crate) fn open_existing(path: &Path, busy_ms: u32) -> StoreResult<Option<TaskStore>>;
     pub(crate) fn open_in_memory() -> StoreResult<TaskStore>;
+    /// Daily `VACUUM INTO` backup of section 2.1; no-op when today's exists.
+    pub(crate) fn backup_daily(&self) -> StoreResult<()>;
     /// PRAGMA data_version; changes when another connection commits.
     pub(crate) fn data_version(&self) -> StoreResult<i64>;
 
@@ -728,6 +897,10 @@ impl TaskStore {
     pub(crate) fn rule_decision(&self, decision_id: i64, ruling: &Ruling, surface: &str, actor: &Actor) -> StoreResult<Decision>;
     pub(crate) fn withdraw_decision(&self, display_id: &str, actor: &Actor) -> StoreResult<()>;
     pub(crate) fn decision(&self, decision_id: i64) -> StoreResult<Option<Decision>>;
+    /// Open decisions, oldest first; `project` = section name, None = all.
+    pub(crate) fn open_decisions(&self, project: Option<&str>) -> StoreResult<Vec<OpenDecision>>;
+    /// `decide --wait` in db mode: sets or clears `wait_until`.
+    pub(crate) fn set_decision_wait(&self, decision_id: i64, wait_until: Option<&str>) -> StoreResult<()>;
     /// Rules expired open decisions with their default, else marks them expired.
     /// Returns the ids it changed.
     pub(crate) fn expire_decisions(&self, now: &str) -> StoreResult<Vec<i64>>;
@@ -747,27 +920,48 @@ impl TaskStore {
 pub(crate) struct ImportReport { pub tasks: u32, pub projects: u32, pub skipped: u32 }
 ```
 
-Every write method runs in one transaction, bumps `tasks.updated_at`, and
-writes the event entries listed in 2.6. Refusals never leave partial writes.
+Every write method runs in one immediate transaction (section 2.1), bumps
+`tasks.updated_at` and `tasks.version`, and writes the event entries listed
+in 2.6. Refusals never leave partial writes.
+
+Methods take `&self`. rusqlite's `transaction_with_behavior` needs `&mut`,
+so every write goes through one private helper:
+
+```rust
+/// BEGIN IMMEDIATE; f; COMMIT on Ok, ROLLBACK on Err (also when f panics,
+/// through a drop guard).
+fn write<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> StoreResult<R>) -> StoreResult<R>;
+```
 
 ### 3.4 Shared handle (`src/tasks/mod.rs`)
 
 ```rust
-/// Runs `f` with the process-wide store. Opens default_path() with
-/// busy_ms = 250 on first use. Under cfg(test) the store is a thread-local
-/// TaskStore::open_in_memory().
+/// Writes. Runs `f` with the process-wide store, opening (and creating)
+/// default_path() with busy_ms = 250 on first use, then backup_daily().
+/// Under cfg(test) the store is a thread-local TaskStore::open_in_memory().
 pub(crate) fn with_store<R>(f: impl FnOnce(&TaskStore) -> StoreResult<R>) -> StoreResult<R>;
+/// Reads. Same handle, but when the file does not exist yet it returns
+/// Ok(R::default()) without creating it.
+pub(crate) fn read_store<R: Default>(f: impl FnOnce(&TaskStore) -> StoreResult<R>) -> StoreResult<R>;
 ```
 
 Release builds keep the store in `OnceLock<Mutex<Option<TaskStore>>>`; an open
-failure is returned on every call and retried at most once per 10 s.
+failure is returned on every call and retried at most once per 10 s. Only the
+client's UI thread uses this handle; background jobs (section 6.3) open their
+own connection with `TaskStore::open(path, 5000)` and drop it when done.
 
 ### 3.5 Ops (`src/tasks/ops.rs`)
 
 One enum serves the local CLI, the outbox and the client. Serialized with
-`#[serde(tag = "op", rename_all = "snake_case")]`. `task: None` means "the
-task of this pane" (resolved by `apply` from `OpContext.pane_key`, then from
-`$DROVR_TASK` for the local CLI).
+`#[serde(tag = "op", rename_all = "snake_case")]`. The CLI fills `task` from
+the argument, else from `$DROVR_TASK`, before it applies or queues the op.
+`task: None` reaches `apply` only when neither was given; `apply` then
+resolves it from `OpContext.pane_key` (`task_for_pane`), else returns
+`Invalid("no task id: pass ID or set DROVR_TASK")`.
+
+`TaskOp` is append-only once the outbox format ships: a new variant or field
+is added with `#[serde(default)]`; nothing is renamed or removed. A new
+variant needs `OUTBOX_V` to go up (section 6.3).
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -789,9 +983,14 @@ pub(crate) enum TaskOp {
     Release { task: Option<String>, note: String },
     Decide { task: Option<String>, title: String, summary: String,
              choices: Vec<Choice>, default_choice: Option<String>,
-             allow_text: bool, expires_at: Option<String> },
+             allow_text: bool, expires_at: Option<String>,
+             /// `--wait`: seconds the CLI waits; the store sets wait_until.
+             #[serde(default)] wait_secs: Option<u32> },
     Withdraw { task: Option<String> },
 }
+
+/// Outbox format version; the client accepts ops with `v <= OUTBOX_V`.
+pub(crate) const OUTBOX_V: u32 = 1;
 
 pub(crate) struct OpContext {
     pub actor: Actor,
@@ -809,9 +1008,28 @@ pub(crate) struct OpResult {
     pub decision_id: Option<i64>,
 }
 
-/// One outbox file (section 6.3).
+/// One outbox file (section 6.3). `epoch` names the outbox directory's
+/// counter (section 6.3); `source` for `apply_once` is
+/// "{machine}/{pane}/{epoch}".
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct OutboxOp { pub seq: u64, pub ts: u64, pub pane: String, pub op: TaskOp }
+pub(crate) struct OutboxOp {
+    pub v: u32,
+    pub epoch: String,
+    pub seq: u64,
+    pub ts: u64,
+    pub pane: String,
+    pub op: TaskOp,
+}
+
+/// `apply` result to CLI exit code: ok 0; Refused 3; NotFound 4;
+/// Invalid 2; Busy, Sqlite, TooNew 1. The outbox reply carries the code.
+pub(crate) fn exit_code(result: &StoreResult<OpResult>) -> i32;
+```
+
+A fixed line the tests parse:
+
+```json
+{"v":1,"epoch":"k3f9q2","seq":7,"ts":1791100000,"pane":"p12","op":{"op":"check","task":"AC-12","position":2,"state":"passed","evidence":"cargo test: 41 passed"}}
 ```
 
 `Start` from an `OpContext` fills `NewAttempt` with `machine`, `pane_key` and
@@ -822,38 +1040,98 @@ the pane's workspace; the local CLI leaves it `None`).
 
 ### 4.1 Views
 
-The right panel gets two views, `Inbox | Tasks`. The header word `Inbox`
-becomes two clickable labels; the active one uses the accent colour, the other
-`overlay0`. Everything else about the panel (width, overlay, focus, border
-drag, project filter, tick) stays in inbox.rs.
+The right panel gets two views, `Inbox | Tasks`. Everything else about the
+panel (width, overlay, focus, border drag, tick) stays in inbox.rs.
 
-- `InboxState.view: PanelView` with `enum PanelView { Inbox, Tasks }`
-  (default Inbox) and `InboxState.tasks: TasksState` (from tasks_panel.rs).
+Widths. The panel is 48 columns or more (`inbox::MIN_WIDTH`). "Inner width"
+below is `area.width - 3` (border, left pad, right pad), so 45 or more.
+
+Header, line 0 of the panel, drawn by `inbox::draw` in both views:
+
+- Left: `Inbox` and `Tasks`, two labels two spaces apart; the active one in
+  the accent style (bold), the other `overlay0`. Each is a hit
+  (`InboxHits.views`).
+- Inbox view: the rest of line 0 is today's (counts, tabs, `≡ group`),
+  starting after the two labels. At inner width under 60 the counts are
+  dropped first (the tabs already switch to `W D A`).
+- Tasks view: `· {project}` after the labels (`overlay0`, cut with `…`), and
+  `+ new` at the right edge (hit `TasksHits.new`). No inbox tabs.
+- Line 1: the filter chip, as today, in both views; `✕` clears it.
+
+Code:
+
+- `InboxState.view: PanelView` with
+  `#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)] pub(super) enum PanelView { #[default] Inbox, Tasks }`
+  and `InboxState.tasks: tasks_panel::TasksState` (B, `Default`).
 - `InboxHits.views: Vec<(Rect, PanelView)>`.
-- `render` and `draw` call `tasks_panel::render(...)` when `view == Tasks`.
-- `handle_inbox_key`: `BackTab` (shift+Tab) toggles the view in both views.
-  In Tasks, every other key goes to `tasks_panel` first.
-- `handle_inbox_mouse`: header view labels first; then, in Tasks,
-  `tasks_panel` hits.
+- In `inbox::render`, after the header and chip are drawn, when
+  `view == Tasks`: call
+  ```rust
+  pub(super) fn render(
+      tasks: &mut TasksState,
+      endpoints: &[ClientShellEndpoint],
+      filter: Option<&InboxFilter>,
+      focused: bool,
+      palette: &Palette,
+      buffer: &mut Buffer,
+      body: Rect,            // the panel below the header and chip lines
+  );
+  ```
+  `tasks_panel::render` draws only inside `body` and stores its hits in
+  `tasks.hits`. It never touches the database; it reads the cache of
+  `TasksState` and the endpoints (for the live agent's radar colour).
+- `handle_inbox_key`: `BackTab` (shift+Tab) toggles the view in both views
+  when no editor is open (inbox compose, or a Tasks input); with an editor
+  open the key goes to the editor as today. In Tasks, every other key goes to
+  `self.handle_tasks_key(key, outcome) -> bool` first; false falls through to
+  the inbox's generic keys (Esc blur, close).
+- `handle_inbox_mouse`: border drag and header view labels first; then, in
+  Tasks, `self.handle_tasks_mouse(mouse, outcome) -> bool`.
 - The view is remembered in the session only.
+- `open_tasks_panel(project, outcome)` (B): sets `filter =
+  Project(project)`, `view = Tasks`, opens and focuses the panel.
 
 The project shown is the panel filter:
 
 - `InboxFilter::Project(name)`: the board of that project.
 - `InboxFilter::Workspace { .. }`: the tasks whose `workspace_key` matches
   that workspace; with exactly one, its task view opens directly.
-- No filter: a project list, one line per section in sidebar order with lane
-  counts (`Acme  2 ▸ 3 ● 1 ⚠ 1 ◎`). One click selects the project
-  (sets the filter to `Project`).
+- No filter: a project list, one line per section in sidebar order
+  (`projects::layout().display_order()`) with lane counts
+  (`Acme  2 ▸ 3 ● 1 ⚠ 1 ◎`; glyph per lane: Triage `·`, Ready `▸`, Working
+  `●`, Blocked `⚠`, Review `◎`; zero lanes omitted). One click selects the
+  project (sets the filter to `Project`).
 
-Data refresh: `tick_inbox` checks `TaskStore::data_version()` at most every
-500 ms while the Tasks view is visible and reloads cards (and the open
-detail) when it changed or after a write from the panel. Drawing never
-queries the database.
+TasksState (B owns the struct; C reads nothing from it):
+
+```rust
+#[derive(Debug, Default)]
+pub(super) struct TasksState {
+    cards: Vec<TaskCard>,                 // shown project, lane then position
+    counts: Vec<(String, [u32; 6])>,      // project list
+    detail: Option<TaskDetail>,           // open task view
+    decisions: Vec<OpenDecision>,         // all projects, for the inbox rows
+    /// "machine/pane_id" -> display id of the live attempt, for inbox rows.
+    pub(super) pane_tasks: HashMap<String, String>,
+    data_version: Option<i64>,
+    checked: Option<Instant>,
+    dirty: bool,                          // set after a panel write
+    error: Option<String>,                // TooNew or open failure, drawn instead of the board
+    pub(super) hits: TasksHits,
+    // selection, scroll, collapsed lanes, inputs, menus: B's choice
+}
+```
+
+Data refresh: `tick_inbox` calls `self.refresh_tasks(false)` (B) while the
+panel is open, in either view. It reads `PRAGMA data_version` through
+`read_store` at most every 500 ms and reloads `cards`, `counts`, `detail`,
+`decisions` and `pane_tasks` when the value changed, when `dirty` is set, or
+when the filter changed. `PRAGMA data_version` does not change for this
+connection's own commits, hence `dirty`. Drawing never queries the database.
 
 ### 4.2 Board
 
-Layout by panel inner width:
+Layout by inner width (section 4.1):
 
 - Under 90 columns: grouped list. Lane header lines in lane order, cards under
   them. Triage and Done start collapsed when they hold more than 3 cards.
@@ -861,6 +1139,11 @@ Layout by panel inner width:
   `(width - 3) / 4` wide, with one-line `Triage n ▸` above and `Done n ▸`
   below. Clicking either expands it as a full-width list above or below the
   columns.
+
+The Done lane holds `done` and `cancelled` tasks, newest `closed_at` first,
+at most 20 (`done_limit`); cancelled cards draw their name struck through in
+`overlay0`. Its header count is the number of closed, unarchived tasks.
+`lane_counts` counts cancelled under Done.
 
 Lane header: `Ready 3` (bold when it holds the selection), `▸` when collapsed.
 Click toggles collapse. Collapsed lanes are stored per project in
@@ -878,7 +1161,19 @@ Card, 2 lines:
   `● claude@mato` (radar colours: green working, yellow waiting, blue
   finished and unseen, `overlay0` idle), and at the right edge one action
   button: `▶ start` (triage, ready, no live attempt), `↗ pane` (live
-  attempt), `✓ accept` (review), nothing otherwise.
+  attempt), `✓ accept` (review), nothing otherwise. The radar colour comes
+  from the agent on `live.pane_key` in `endpoints` (status and
+  `AgentSignal::item`), as the sidebar draws it; no pane found = `overlay0`.
+
+Narrow cards. When a line does not fit, parts are dropped in this order
+until it does: line 2 the `@machine` suffix, then the kind word, then the
+outcome mark, then the agent name (the `●` stays); line 1 cuts the name with
+`…`. The id, the criteria count, `?` and the button never drop; at inner
+width 45 the button shortens to its glyph (`▶`, `↗`, `✓`). In the columns
+layout the same order applies per column.
+
+Hover. The card under the pointer draws its button label in the accent
+colour; nothing else changes (no fill).
 
 Selection follows the inbox: first line shaded with `active_row_bg`, a
 `╭ ╰` frame on the left of the card's lines. No full-card fill.
@@ -888,10 +1183,11 @@ One click acts:
 - Click a card: open the task view.
 - Click the right-edge button: run it (start, focus pane, accept).
 - Click a lane header: collapse or expand.
-- Click `+ new` (header line under the tabs): a one-line input
+- Click `+ new` (header line): a one-line input
   (`inbox_editor::NoteEditor`) parsed as `[#kind] [!priority] text`;
   Enter creates the task in Triage of the shown project. `!!` = urgent,
-  `!` = high.
+  `!` = high. A failed write keeps the input open with its text.
+- Right-click a card: the card menu (below).
 - Wheel scrolls the board.
 
 Keys (Tasks view focused): `j/k` next/previous card across lanes, `h/l`
@@ -900,30 +1196,94 @@ previous/next column (columns layout) or lane (list), `Enter` open, `n` new,
 collapse the selected card's lane, `/` filter the board by text (name and
 display id, Esc clears), `Esc` clears the project filter, then blurs.
 
-Move menu (`m` or a click on the status chip in the task view): the six lanes
-plus Cancelled, the current one dimmed. Picking `Ready` from Review asks for a
-note first (one-line input). Refusals show in the panel's status line for 4 s.
+Menus reuse the shell context menu overlay (`open_menu`, drawn and driven by
+context_menu.rs), with one target and these actions (all added in step 0):
+
+```rust
+// state.rs, ClientContextMenuTarget
+Task { display_id: String, menu: super::tasks_panel::TaskMenu },
+
+// tasks_panel.rs (B)
+#[derive(Debug)]
+pub(super) enum TaskMenu {
+    Card,                                         // right-click a card
+    Move { current: crate::tasks::Status },
+    Kind,
+    Priority,
+    Machine { machines: Vec<(ClientEndpointId, String)> },  // built by C
+}
+
+// state.rs, ClientContextMenuAction (Copy)
+TaskOpen, TaskStart, TaskFocusPane, TaskMoveMenu, TaskCopyId,
+TaskMove(crate::tasks::Status),
+TaskKind(Option<crate::tasks::Kind>),
+TaskPriority(crate::tasks::Priority),
+TaskOnMachine(usize),
+```
+
+- Card menu: Open, Start (when startable), Focus pane (when live), Move…,
+  Copy id. Copy pushes `ClientShellAction::ClipboardWrite(bytes)` and calls
+  `show_copy_feedback`, as selection copy does.
+- Move menu (`m`, a click on the status chip, or Move…): the six lanes plus
+  Cancelled; the current one is labelled `· {lane}` and does nothing.
+  Picking `Ready` from Review asks for a note first (one-line input).
+- Kind menu: `fix feature chore research spec`, then `none`. Priority menu:
+  `urgent high normal low`.
+- Items come from `tasks_panel::task_menu_items(&TaskMenu) -> Vec<ClientContextMenuItem>`
+  and activation goes to
+  `self.activate_task_menu(display_id, menu, action, (x, y), outcome)` (B),
+  which forwards `TaskOnMachine(i)` to C's `launch_task_on`.
+
+Refusals and write errors show in the panel's status line (the last body
+line) for 4 s; busy errors also raise the notice of section 2.1.
 
 ### 4.3 Task view
 
 Opens inside the panel in place of the board. `Esc` or the `←` on the header
-returns to the board with the same selection. `j/k` in the header region step
-to the next/previous card of the board order.
+returns to the board with the same selection. `]` and `[`, or a click on `›`
+and `‹` at the right of the header, step to the next/previous card in board
+order (the list it was opened from), as `j/k` do on the workspace task page.
+
+Scrolling. The header line (region 1) and the composer line (last line of
+the body, Notes tab only) stay in place; everything between them scrolls as
+one column with the wheel and `j/k`. Opening a task scrolls to the top;
+returning from a write keeps the scroll offset.
 
 Regions from top to bottom:
 
-1. Header: `← AC-12  [Review ▾]  auto  ● claude@mato 14m  ↗ pane`. The status
-   chip opens the move menu. `auto` is shown in accent when on, struck
-   through in `overlay0` when off; click toggles. The agent part shows the
-   live attempt (radar colour) and how long it has been in the status.
+1. Header: `← AC-12  [Review ▾]  auto  ● claude@mato 14m  ↗ pane   ‹ ›`.
+   The status chip opens the move menu. `auto` is shown in accent when on,
+   struck through in `overlay0` when off; click toggles. The agent part
+   shows the live attempt (radar colour) and how long it has been in the
+   status. When the line does not fit, parts drop in this order: the age,
+   `@machine`, `‹ ›`, the agent name (the `●` stays), `auto` becomes `A`.
+   `←`, the id, the status chip and `↗` never drop.
+1a. Waiting line, only when the task waits on someone, one line in yellow:
+   `waiting on you: permission · 3m` when the live attempt's pane has a
+   waiting inbox item (`ItemKind::waiting()`, from the same
+   `AgentSignal::item` the inbox uses), or `waiting on you: decision · 12m`
+   when a decision is open. Click: the permission case switches the panel to
+   the Inbox view with that item selected (its answer keys are there); the
+   decision case scrolls to the decision card. Drawn from the cache and the
+   endpoints; no query.
 2. Title, bold. Click to edit (one-line input). `Untitled` in `overlay0` when
-   empty.
+   empty. Saving passes `expected_version`; on `stale` the input stays open
+   with the text and the status line says `AC-12 changed; Enter saves over
+   it` (a second Enter saves without the check).
 3. Meta line, wrapping: `kind fix  pri high  ws acme/AC-12  $0.42`. Each value
    is clickable: kind and priority open a small menu; `ws` focuses the
    workspace.
 4. Description, folded to a third of the panel height, `▾ more` to unfold.
-   `e` (or click `edit`) opens it in the external editor through the inbox
-   editor path (`inbox_editor`), then saves the body.
+   `e` (or click `edit`) writes the body to
+   `state_dir()/drovr/tasks/edit/{display_id}.md` and opens `$EDITOR` on it
+   with `project_actions::open_local_editor(pane_id, path)` (a split under
+   a local pane: the live attempt's pane when it is local, else the focused
+   local pane; no local pane = status line `open a local pane to edit`). The
+   panel remembers `(path, mtime, version)`; on each mtime change it saves
+   the body with `expected_version = version` and takes the new version. On
+   `stale` it does not save: the file stays, and the status line says
+   `AC-12 changed while you edited; your text is in {path}`. The file is
+   deleted after a successful save once the editor pane is gone.
 5. Criteria: `Criteria 2/3`, then one line each: mark (`✓` green, `✗` red,
    `○` `overlay0`), text (passed text `overlay0`), `chk` suffix when
    `check_cmd` is set, `e` at the right edge when there is evidence. Click a
@@ -952,22 +1312,30 @@ Regions from top to bottom:
      attempt (open, pane gone) shows `release`.
    - Artifacts: one line each: kind, title, summary in `overlay0`, review
      state. Click opens: `doc` and `report` in the doc pane on the artifact's
-     machine (local: `project_actions::open_local_document`; remote:
-     `EndpointBridge::open_document`), `link` with the system opener, `diff`
+     machine (local: `ClientShellAction::OpenLocalDocument`; remote:
+     `ClientShellAction::OpenRemoteDocument` with the endpoint's bridge),
+     in the workspace of the live attempt's pane when it exists, else the
+     machine's focused workspace and pane; an offline machine gives the
+     status line `{machine} is offline`. `link` with the system opener
+     (`ClientShellAction::OpenSafeWebUrl`), `diff`
      and `file` in the doc pane when the path ends in `.md`, else copies the
-     path to the clipboard and says so.
-9. Footer actions when not live: `▶ Start on…` (section 5).
+     path to the clipboard (`ClipboardWrite` + `show_copy_feedback`).
+9. Footer actions when not live: `▶ Start on…` (section 5). A closed task
+   shows `archive` (sets `archived`; the card leaves the Done lane).
+
+Every input (title, note, reply, send-back note, composer) keeps its text
+when the write fails; it clears only on Ok.
 
 Keys: `Esc` back, `m` move, `e` edit description, `1`-`8` rule, `r` reply,
 `a` accept, `b` send back, `t` next tab, `s` start, `p` focus pane, `c`
-focus the composer, `j/k` scroll.
+focus the composer, `j/k` scroll, `]`/`[` next/previous task.
 
 ### 4.4 Sketches
 
 60 columns, grouped list, Acme selected, AC-12 selected:
 
 ```
-│ Inbox  Tasks · Acme                    + new      ×
+│ Inbox  Tasks · Acme                            + new
 │ Triage 2 ▸
 │ Ready 3
 │ AC-14 Retry the sync job                          !
@@ -989,7 +1357,7 @@ focus the composer, `j/k` scroll.
 100 columns, columns layout:
 
 ```
-│ Inbox  Tasks · Acme                                                         + new      ×
+│ Inbox  Tasks · Acme                                                                + new
 │ Triage 2 ▸
 │ Ready 3                 │ Working 1              │ Blocked 1              │ Review 1
 │ AC-14 Retry the sync j !│ AC-11 Attention hook   │ AC-08 Schema rename    │ AC-10 Doc pane links
@@ -1004,8 +1372,9 @@ focus the composer, `j/k` scroll.
 Task view, 60 columns:
 
 ```
-│ Inbox  Tasks · Acme                                       ×
-│ ← AC-12  [Blocked ▾]  auto  ● claude@mato 12m      ↗ pane
+│ Inbox  Tasks · Acme                                 + new
+│ ← AC-12  [Blocked ▾]  auto  ● claude@mato 12m ↗ pane ‹ ›
+│ waiting on you: decision · 3m
 │ Spec decision requests
 │ kind spec  pri high  ws mato/AC-12  $0.42
 │ Add decision requests to the store and the panel: one
@@ -1033,26 +1402,85 @@ Task view, 60 columns:
 At 100 columns the task view is the same single column; the meta line holds
 more pairs and the description folds at the same third of the height.
 
+48 columns (the minimum panel, inner width 45), board and task view:
+
+```
+│ Inbox  Tasks · Acme                    + new
+│ Ready 3
+│ AC-14 Retry the sync job                    !
+│   ○0/2                                      ▶
+│╭AC-12 Spec decision requests░░░░░░░░░░░░░░░░^
+│╰  ✓2/3  ?                                   ▶
+│ Working 1
+│ AC-11 Attention hook
+│   ✓1/4  ● claude                            ↗
+│ Done 14 ▸
+
+│ ← AC-12  [Blocked ▾]  A  ●  ↗ pane
+│ waiting on you: decision · 3m
+│ Spec decision requests
+│ kind spec  pri high
+│ ws mato/AC-12  $0.42
+```
+
+### 4.5 Inbox integration (B, in inbox.rs)
+
+The inbox stays the place for "waiting on you". Two additions, both drawn
+from `TasksState` (no query while drawing):
+
+1. Decision rows. In the Waiting and All tabs, open decisions
+   (`TasksState.decisions`, filtered by the panel filter's project) are
+   drawn above the hook items, one line each:
+   `? AC-12 Which table holds decisions?          3m` (`?` yellow, id
+   `overlay0`, title cut with `…`, age right-aligned). With `≡ group` on
+   they sit at the top of their project's group. They count in the header's
+   waiting count. Selection follows the inbox rule (frame + shaded first
+   line). One click: `view = Tasks`, open that task's view scrolled to the
+   decision card. `j/k` in the inbox move through decision rows too (they
+   come first in the order); `Enter` opens like the click. Hits:
+   `InboxHits.decisions: Vec<(Rect, String /*display id*/)>`.
+2. Task id on hook items. An inbox item whose pane key is in
+   `TasksState.pane_tasks` shows the display id in `overlay0` before the
+   workspace name. A click on the id opens the task view; the rest of the
+   row behaves as today.
+
+Notice. When a decision opens while the panel does not show that task, C's
+`tick_tasks` raises a notice `{id} asks: {title}` through
+`push_task_notice` (section 7.4). It tracks the open decision ids it has
+seen in `TaskRuntime`; the first scan after start-up records ids without a
+notice.
+
 ## 5. Start-task
 
 Port of workspace-herdr start-task, without MCP, tokens or worktrees.
 
 ### 5.1 Flow
 
-Triggered by `▶ start` on a card, `▶ Start on…` in the task view, or `s`.
+Triggered by `▶ start` on a card, `▶ Start on…` in the task view, `s`, or
+Start in the card menu. All of it is C's `launch_task` / `launch_task_on`.
 
-1. Machine: when more than one machine is online, show the machine menu that
-   `open_new_workspace_picker` already uses; else use the only one.
-2. Workspace: `create_workspace_on(endpoint_id, Some(project), true, cwd,
-   label, outcome)` with `cwd` = the project's `new_workspace_cwd` on that
-   machine and `label` = `{display_id} {name}` cut to 40 characters. The new
-   workspace joins the section through the existing `projects::update(assign
-   ...)` call.
-3. Context file, written before the agent starts, at
-   `<herdr state dir>/drovr/tasks/{display_id}.md` on that machine (local:
-   `crate::config::state_dir()`; remote: `${XDG_STATE_HOME:-$HOME/.local/state}/herdr`
-   through `EndpointBridge::run_sh` with a quoted heredoc). Content, in this
-   order, sections omitted when empty:
+1. Machine. `launch_task(display_id, at, outcome)` lists
+   `online_machines()` without Windows endpoints. One machine: go on with
+   it. Several: open the `Task { menu: TaskMenu::Machine { machines } }`
+   context menu at `at` (the click position); picking one calls
+   `launch_task_on(display_id, endpoint_id, outcome)`. None: status line
+   `no machine online`.
+2. Preflight (remote only). The machine's probe result (section 6.6) must
+   say `drovr-task 1` or newer. Unknown yet: run the probe job first and
+   start when it answers. Missing: refuse with the notice
+   `{machine}: drovr there has no task command; see docs/design/tasks.md 6.6`.
+   A task that already has a live attempt asks first: the panel status line
+   shows `AC-12 runs on mato.  [start another]  [cancel]` (clickable; `y`
+   and `n` also work); start another ends the old attempt as `stopped`.
+3. Context file, written before the workspace is created, at
+   `<root>/tasks/{display_id}.md` where `<root>` is
+   `crate::config::state_dir().join("drovr")` locally and
+   `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/drovr` on a remote machine
+   (section 6.3's `R`), written by a background job (`TaskJob::WriteFiles`,
+   section 6.3) with a quoted heredoc. The launch continues when the job
+   answers Ok; an error stops it with the notice `cannot write context file
+   on {machine}: {error}`. Content, in this order, sections omitted when
+   empty:
    ```
    # {display_id} {name}
    Status: {status} · Kind: {kind} · Priority: {priority} · Project: {project}
@@ -1074,48 +1502,95 @@ Triggered by `▶ start` on a card, `▶ Start on…` in the task view, or `s`.
    {title}: {choices}
 
    ## How to report
-   Use `drovr task` (skill drovr-tasks): note, check, artifact, decide, done.
-   Your task id is {display_id}; commands without an id use it.
+   Use `drovr task` (skill drovr-tasks): note, check, verify, artifact,
+   decide, done. Your task id is {display_id}; commands without an id use it.
    ```
-4. Command: `PendingLaunch` gains `task: Option<TaskLaunch>`:
+4. Workspace. C extracts from `create_workspace_on` (project_actions.rs) a
+   shared helper and makes `create_workspace_on` call it:
+   ```rust
+   /// Sends workspace.create (focus true) to the machine, assigns
+   /// `machine/label` to `project`, activates the endpoint when it is not
+   /// the active one. Returns the workspace ids known before the request.
+   pub(super) fn request_workspace(
+       &mut self,
+       endpoint_id: &ClientEndpointId,
+       project: Option<&str>,
+       cwd: Option<String>,
+       label: &str,
+       env: HashMap<String, String>,
+       outcome: &mut ClientShellInput,
+   ) -> Option<HashSet<String>>;
+   /// The project's `new_workspace_cwd` on that machine (the lookup that
+   /// prompt_new_workspace does today, moved here and reused by it).
+   pub(super) fn project_cwd(&self, endpoint_id: &ClientEndpointId, project: &str) -> Option<String>;
+   ```
+   `label` = `{display_id} {name}` cut to 40 characters. `env`:
+   - `DROVR_TASK` = display id
+   - `DROVR_AGENT` = `claude`
+   - local: `DROVR_TASK_MODE=db`, `DROVR_TASKS_DB` = the client's absolute
+     store path
+   - remote: `DROVR_TASK_MODE=outbox`
+
+   `workspace.create`'s `env` exists in stock herdr 0.9.3
+   (`WorkspaceCreateParams.env`) and reaches the root pane's process, so no
+   `export` text is typed into a shell. Task launches do not use
+   `projects::PendingLaunch` (one global slot, which a second launch would
+   overwrite); C keeps them in `TaskRuntime.launches: Vec<TaskLaunch>`:
    ```rust
    pub(super) struct TaskLaunch {
        pub(super) display_id: String,
-       pub(super) prompt: String,
-       pub(super) remote: bool,
+       pub(super) endpoint_id: ClientEndpointId,
+       pub(super) label: String,
+       pub(super) known: HashSet<String>,
+       pub(super) since: Instant,
+       /// Set once the workspace and its root pane are found.
+       pub(super) pane: Option<(String /*workspace key*/, String /*pane key*/, String /*pane id*/)>,
+       pub(super) typed_at: Option<Instant>,
    }
    ```
-   The command sent to the new pane is
-   `export DROVR_TASK={id}{remote}; cc` where `{remote}` is
-   ` DROVR_TASK_MODE=outbox` for a remote machine (two exports on one line).
-5. Link: as soon as `tick_drovr_launch` finds the new workspace and its root
-   pane, the client applies `start_attempt(display_id, NewAttempt { harness:
-   "claude", machine, workspace_key, pane_key, session_id: None }, Human)`.
-   This moves the task to working, sets `workspace_key` and `auto_status = 1`.
-6. First prompt: when the pane's agent is detected (agent status not `None`)
-   or 5 s after the command, whichever comes first, send
+5. Agent command. When `tick_tasks` finds the new workspace (label match,
+   id not in `known`, as `tick_drovr_launch` does) and its root pane, it
+   sends `PaneSendText { text: "cc" }` + `PaneSendKeys ["Enter"]` through
+   `endpoint_request`, sets `typed_at`, and applies
+   `start_attempt(display_id, NewAttempt { harness: "claude", machine,
+   workspace_key, pane_key, session_id: None }, Human)`. This moves the task
+   to working and sets `workspace_key` and `auto_status = 1`. A launch not
+   found within 60 s is dropped with the notice `{id}: workspace did not
+   appear on {machine}`.
+6. First prompt. When the pane's agent is detected (agent status not
+   `None`), or 5 s after `typed_at`, whichever comes first, send
+   `Method::AgentPrompt { target: pane_id, text, wait: None }` (the call the
+   inbox uses for replies) with
    `Work on drovr task {id}: {name}. Read {context path} first. Report with
-   drovr task (skill drovr-tasks).` with `PaneSendText` then `PaneSendKeys
-   Enter`.
+   drovr task (skill drovr-tasks).` Then the launch is removed.
 
-Starting a task that already has a live attempt asks `{id} is running on
-{machine}. Start another?`; yes ends the old attempt as stopped.
+Several launches may be pending at once; each is matched by its own label
+and `known` set.
 
-Upgrade path (not v1): replace step 2's cwd with a herdr `worktree.create`
+Upgrade path (not v1): replace step 4's cwd with a herdr `worktree.create`
 on branch `task/{id lowercase}`, falling back to `worktree.open`.
 
 ### 5.2 Context refresh
 
 The client rewrites the context file when the task's body, criteria or
-pinned notes change and an attempt is live on that machine. The snapshot of
-section 6.3 is written at the same time.
+pinned notes change and an attempt is live on that machine, through one
+`TaskJob::WriteFiles` per machine (local machine: the same job on
+`/bin/sh`). The snapshot `R/tasks/{id}.json` of section 6.3 is written in
+the same job. `tick_tasks` notices the change through `data_version` and
+compares `tasks.version` per live task with the version it last wrote.
 
 ### 5.3 Worktree or workspace removed
 
-When a workspace whose key matches an open attempt disappears from every
-snapshot for 30 s, the client ends the attempt as `stopped` with the note
+When a workspace whose key matches an open attempt is missing from its
+machine's snapshot for 30 s while that machine stays Online with the same
+`boot_id`, the client ends the attempt as `stopped` with the note
 `workspace closed` and, if the task is working or blocked and
 `auto_status = 1`, moves it to ready.
+
+An offline machine, a reconnect, or a new `boot_id` (server restart) resets
+the 30 s clock for every attempt on that machine; none of them ends an
+attempt. A machine that is offline for days leaves its attempts open; the
+Attempts tab shows them as stale with `release`, which the user clicks.
 
 ### 5.4 Relay
 
@@ -1125,8 +1600,16 @@ Human text reaches the agent's pane when an attempt is live:
 - a ruling: `Decision on {id}: {label}` or `Decision on {id}: {text}`
 - a send back: `{id} sent back: {note}`
 
-Sent with `PaneSendText` + `PaneSendKeys Enter` to the attempt's pane. Not
-sent when the pane is gone; the note stays in the thread.
+Sent with `Method::AgentPrompt { target: pane_id, text, wait: None }` to the
+attempt's pane through `endpoint_request`, as inbox replies are. Not sent
+when the pane is gone or its machine is offline; the note stays in the
+thread and the status line says `saved; {machine} is offline`.
+
+A ruling is relayed only when the decision's `wait_until` is NULL or past:
+a `decide --wait` CLI that is still polling receives the ruling itself, and
+a relay would deliver it twice. A remote waiting CLI gets the ruling from
+the reply file of section 6.3, which the client writes right after the
+ruling (a `TaskJob::WriteFiles`), not at the next ingest.
 
 ## 6. Agent updates
 
@@ -1146,6 +1629,7 @@ drovr task start [ID] [--harness NAME] [--session ID]
 drovr task note [ID] TEXT|-
 drovr task criteria [ID] (--add TEXT... | --set TEXT...)
 drovr task check [ID] N pass|fail [--evidence TEXT|-]
+drovr task verify [ID] [N]...
 drovr task artifact [ID] PATH|URL [--title T] [--kind doc|diff|link|file|report]
                     [--summary S]
 drovr task done [ID] [--outcome succeeded|failed|stopped|needs_human] [--note TEXT]
@@ -1154,12 +1638,14 @@ drovr task decide [ID] --title T [--summary S] --choice ID:LABEL[:CONSEQUENCE]..
                   [--recommend ID] [--default ID] [--no-text]
                   [--expires MINUTES] [--wait [SECS]]
 drovr task import PATH [--map KEY=SECTION]... [--dry-run]
+drovr task proto
 ```
 
 Rules:
 
-- `ID` is optional. A first positional matching `^[A-Z][A-Z0-9]*-[0-9]+$` is
-  the id when the command takes more positionals than were given without it.
+- `ID` is optional. A first positional matching `^[A-Za-z][A-Za-z0-9]*-[0-9]+$`
+  is the id (uppercased) when the command takes more positionals than were
+  given without it.
   Without an id: `$DROVR_TASK`, else the task of the open attempt on
   `$HERDR_PANE_ID` (local mode), else exit 2 with `no task id: pass ID or
   set DROVR_TASK`.
@@ -1172,8 +1658,21 @@ Rules:
   `diff` for `.diff`/`.patch`, else `file`; `--title` defaults to the file
   name.
 - Actor: `Agent("{harness}@{machine}")` when `$HERDR_PANE_ID` is set
-  (`harness` from `$DROVR_AGENT`, default `agent`; `machine` is `local` in
-  db mode, filled by the client in outbox mode), else `Human`.
+  (`harness` from `$DROVR_AGENT`, which start-task sets, default `agent`;
+  `machine` is `local` in db mode, filled by the client in outbox mode),
+  else `Human`.
+- `verify`: for each criterion N given (default: every criterion with a
+  `check_cmd`), runs `sh -c {check_cmd}` in the current directory with a
+  300 s limit, captures stdout and stderr (last 20 000 bytes), and records
+  `check N pass` (exit 0) or `check N fail` with `$ {cmd}\n{output}\nexit
+  {code}` as evidence, one `Check` op per criterion. In db mode it reads the
+  commands from the store; in outbox mode from the snapshot `R/tasks/{id}.json`
+  (no snapshot: exit 4 `no task data on this machine yet`). Prints one line
+  per criterion. The commands come from the task, which only the user and
+  agents on the user's machines write; `verify` runs them with the agent's
+  own rights, in the agent's own pane, as the agent could anyway.
+- `proto`: prints `drovr-task {OUTBOX_V}` and exits 0. The client's probe
+  (section 6.6) runs it.
 - Output: one line, `{id} {status}  {message}`. `--json` prints the
   `OpResult`, `TaskDetail` or `Vec<TaskCard>` as JSON.
 - Exit codes: 0 done, 1 error, 2 usage, 3 refused, 4 not found. In outbox
@@ -1183,8 +1682,12 @@ Rules:
   `ruled {choice id}: {label}` or `ruled text: {text}`; on timeout prints
   `waiting` and exits 0.
 
-Mode: `$DROVR_TASK_MODE` = `db` or `outbox`. Unset: `db` when
-`TaskStore::default_path()` exists, else `outbox`.
+Mode: `$DROVR_TASK_MODE` = `db` or `outbox` (start-task always sets it).
+Unset (an agent the user started by hand): `db` when `$DROVR_TASKS_DB` is
+set or `TaskStore::default_path()` exists, else `outbox`. In db mode the CLI
+opens the file with `TaskStore::open_existing`; a missing file exits 1 with
+`no tasks db at {path}`. Only `add` and `import` run outside a herdr pane
+(Human actor) create it with `TaskStore::open`.
 
 ### 6.2 Skill
 
@@ -1195,9 +1698,12 @@ same way. Content:
 - When `DROVR_TASK` is set or the first prompt names a drovr task, read the
   context file, then report with `drovr task`.
 - Record progress with `note` at milestones, not every step.
-- Report every criterion with `check N pass|fail --evidence`, with the
+- Run `drovr task verify` for criteria that have a check command. Report
+  every other criterion with `check N pass|fail --evidence`, with the
   command output or a one-line reason as evidence. Do not mark a criterion
   passed without evidence.
+- If `drovr task` answers `unknown command` or is missing, say so once in
+  your reply and continue the work; do not retry.
 - Attach documents you write for the user with `artifact` (and open them
   with drovr-docs as before).
 - Ask for a decision with `decide` only when blocked; keep the title under
@@ -1216,54 +1722,117 @@ evidence and bursts of ops would be lost, while files keep every op and the
 bridge already runs shell on each remote.
 
 Remote layout, root `R` = `$DROVR_TASK_OUTBOX_DIR`, else
-`${XDG_STATE_HOME:-$HOME/.local/state}/herdr/drovr`:
+`${XDG_STATE_HOME:-$HOME/.local/state}/herdr/drovr` (the release
+`state_dir()` on macOS and Linux; the client's scripts use the shell form,
+the remote CLI uses `state_dir().join("drovr")` from a release build, which
+is the same path):
 
 ```
+R/task-outbox/{pane_id}/epoch          6 random [a-z0-9] chars, created with seq
 R/task-outbox/{pane_id}/seq            last allocated seq (text integer)
 R/task-outbox/{pane_id}/.lock/         mkdir lock around seq allocation
 R/task-outbox/{pane_id}/{seq}.json     one OutboxOp, one line, written as
                                        .{seq}.tmp then renamed
-R/task-reply/{pane_id}-{seq}.json      OpResult written by the client
-R/task-reply/{pane_id}-d{decision}.json ruling of a decision (OpResult with
+R/task-reply/{pane_id}-{epoch}-{seq}.json  OpResult plus "exit", written by the client
+R/task-reply/{pane_id}-d{decision}.json    ruling of a decision (OpResult with
                                        message = ruling line)
 R/tasks/{display_id}.json              TaskDetail snapshot written by the client
 R/tasks/{display_id}.md                context file (section 5.1)
 ```
 
-The `seq` file is never deleted, so a reused pane id keeps counting up and
-`applied_ops` stays correct.
+The `seq` and `epoch` files are never deleted by drovr, so a reused pane id
+keeps counting up. If someone deletes the directory, the CLI creates a new
+epoch with seq starting at 1; because `apply_once`'s source is
+`{machine}/{pane}/{epoch}`, the new ops are not mistaken for applied ones.
 
 Remote CLI in outbox mode:
 
 1. Allocate seq (mkdir lock, retry every 20 ms up to 2 s, stale lock older
-   than 10 s removed), write `{seq}.json`.
+   than 10 s removed), create `epoch` when missing, write `{seq}.json` with
+   `v = OUTBOX_V`, fsync, rename.
 2. Ring: `herdr pane report-metadata $HERDR_PANE_ID --source drovr-task
-   --token drovr_tq={seq}|{unix}` (`$HERDR_BIN_PATH` or `herdr`).
-3. Wait up to 3 s for `R/task-reply/{pane}-{seq}.json` (poll 200 ms); print
-   its message and exit with its code mapping. Without a reply, print
+   --seq {unix nanos} --token drovr_tq={epoch}.{seq}|{unix}`
+   (`$HERDR_BIN_PATH` or `herdr`). A failed ring is ignored: the sweep
+   below still finds the file.
+3. Wait up to 3 s for `R/task-reply/{pane}-{epoch}-{seq}.json` (poll 200 ms);
+   print its message and exit with its `exit`. Without a reply, print
    `{id} queued` and exit 0. `decide --wait` then polls
-   `R/task-reply/{pane}-d*.json` for the decision named in the first reply.
+   `R/task-reply/{pane}-d*.json` for the decision named in the first reply;
+   when the first reply did not come, it polls the snapshot
+   `R/tasks/{id}.json` for a decision it created (title match) to learn the
+   id.
 4. `show` and `list` read `R/tasks/*.json`; `list` prints only those tasks.
    Without snapshots: `no task data on this machine yet`, exit 4.
 
 Token format: name `drovr_tq`, source `drovr-task`, value
-`{seq}|{unix}`, both decimal. The client parses it with
+`{epoch}.{seq}|{unix}`. The client parses it with
 `projects::agent_token(agent, "drovr_tq")`.
 
-Client ingest (every tick, at most one pull in flight per endpoint):
+Client ingest. All SSH work runs on a background thread, never in the tick:
+`EndpointBridge::run_sh` blocks for up to 15 s. C adds one action and one
+loop event (step 0 adds the variants):
 
-1. For each remote agent whose `drovr_tq` seq is above
-   `applied_seq("{machine}/{pane_id}")`, run one `run_sh` script that prints
-   every `R/task-outbox/{pane}/*.json` with seq above the applied seq, sorted
-   numerically, at most 200 files, one per line.
-2. Parse each line as `OutboxOp`; apply with
-   `apply_once("{machine}/{pane}", seq, op, ctx)` where `ctx = OpContext {
-   actor: Agent("{agent name}@{machine}"), machine, pane_key }`. The agent
-   name is the pane's detected agent (`claude`, `codex`), else `agent`.
-3. One second `run_sh`: write each reply file, the snapshots and context
-   files of tasks that changed, then `rm` exactly the applied op files.
-4. A line that fails to parse is moved to `{seq}.bad` by the same script and
-   a toast says `bad task op from {machine}/{pane}`.
+```rust
+// state.rs, ClientShellAction
+TaskJob { route: super::inbox::ApiRoute, job: super::task_ingest::TaskJob },
+// events.rs, ClientLoopEvent
+TaskJobDone(crate::client::shell::TaskJobDone),
+
+// task_ingest.rs (C)
+pub(crate) enum TaskJob {
+    /// Pull: print every outbox file of these panes (None = all panes)
+    /// above the given applied seq per (pane, epoch); at most 200 files.
+    Pull { machine: String, panes: Option<Vec<String>>, applied: Vec<(String, String, u64)> },
+    /// Write reply, snapshot and context files, then remove the applied op
+    /// files and every op file at or below the applied seq.
+    WriteFiles { machine: String, script: String },
+    /// `drovr task proto` on the machine (section 6.6).
+    Probe { machine: String },
+}
+pub(crate) struct TaskJobDone { pub machine: String, pub kind: &'static str, pub result: Result<String, String> }
+/// Runs the job (local: /bin/sh; remote: bridge.run_sh) and posts
+/// TaskJobDone to the loop. Without `events` (tests) the result is dropped.
+pub(crate) fn run_job(route: ApiRoute, job: TaskJob, events: Option<LoopEvents>);
+// impl ClientShellState (C)
+pub(crate) fn receive_task_job(&mut self, done: TaskJobDone) -> bool; // true = repaint
+```
+
+`src/client/shell_runtime.rs` runs `TaskJob` like `InboxTask` (spawn with
+`shell.drovr_events`), and `src/client/mod.rs` hands `TaskJobDone` to
+`receive_task_job` like `InboxReply`. At most one job per machine is in
+flight (`TaskRuntime.busy: HashSet<String>`).
+
+When to pull, per remote machine:
+
+- an agent's `drovr_tq` value changed since the last pull (in-memory map
+  `pane_key -> token value`);
+- on connect (the machine turns Online) and then every 60 s, a sweep:
+  `Pull { panes: None }`, which lists every `R/task-outbox/*/` directory.
+  The sweep is what picks up ops from panes that closed before the client
+  saw their token, and ops queued while the client was not running.
+
+Applying a pull, in `receive_task_job` on the UI thread:
+
+1. Each output line is `{pane}\t{epoch}\t{seq}\t{json}`, numeric order per
+   (pane, epoch). Parse the JSON in two steps: first `{"v": u32}` only. `v`
+   above `OUTBOX_V`: leave the file, notice once per machine
+   `{machine} runs a newer drovr task; update drovr on this Mac`. Else parse
+   `OutboxOp`; a failure moves the file to `{seq}.bad` (in the cleanup
+   script) with the notice `bad task op from {machine}/{pane}`.
+2. Apply with `apply_once("{machine}/{pane}/{epoch}", seq, op, ctx)` where
+   `ctx = OpContext { actor: Agent("{agent}@{machine}"), machine, pane_key }`;
+   `agent` is the pane's detected agent (`claude`, `codex`), else `agent`.
+   A pane no longer in the snapshot still applies (actor `agent@{machine}`).
+   A `Busy` error stops the batch; the files stay and the next pull retries
+   them. Each op commits on its own, so a crash after op 3 of 5 leaves 1-3
+   applied and recorded, and 4-5 pulled again.
+3. Then one `WriteFiles` job: reply files of the applied ops, snapshots and
+   context files of the tasks that changed, then `rm` of the applied op
+   files, of any op file at or below the applied seq of its (pane, epoch),
+   and the `.bad` renames. The op files go only after the database commit
+   (step 2), so a crash between the two re-pulls ops that `apply_once`
+   skips.
+4. Reply files older than 1 day are removed by the same cleanup script.
 
 Local agents (Mac panes) write the database directly in `db` mode; the
 client sees the change through `data_version`.
@@ -1289,32 +1858,115 @@ attempt and whose task has `auto_status = 1`. It reads the same
 | ItemKind Finished, gate fails                        | working        | none; event entry `finished with criteria {list} open` |
 | ItemKind Exited, or the pane is gone                 | working, blocked | none; event entry `agent exited` |
 
-- A move applies once per change of the pane's `drovr_state` stamp (the
-  `<unix>` field), held in an in-memory map `pane_key -> stamp`.
+- A move applies once per change of the pane's state stamp,
+  `AgentSignal::since()` (the `drovr_state` time, or the later beat),
+  together with the agent status; held in `TaskRuntime.stamps:
+  HashMap<String /*pane key*/, (AgentStatus, Option<u64>)>`.
 - A signal must be stable for 2 s before it moves the task.
 - Blocked caused by an open decision is left alone: a working signal does not
   move a task with an open decision.
 - "doing" is the CLI's alias for working (`Status::parse`).
 - Manual override: any human move sets `auto_status = 0`; the `auto` chip or
   a new start sets it back.
+- `tick_tasks` runs from `tick_drovr` (100 ms timer) whether the panel is
+  open or not. Its own cadence: sync on every call (it only reads
+  snapshots, and writes on a change); `data_version` check and decision
+  notices every 1 s; `expire_decisions(now)` every 30 s; the remote sweep
+  every 60 s per machine. Each write it makes is one short immediate
+  transaction.
+
+### 6.6 Remote machines
+
+Each remote machine needs three things, installed by the user (drovr never
+installs or upgrades software on a remote by itself):
+
+1. A drovr binary with the `task` command:
+   `ssh mato 'bash -s -- drovr-vX' < scripts/drovr-install`, where
+   `drovr-vX` is the first release that contains this feature. Until a
+   release exists, copy a build:
+   `scp target/release/herdr mato:.local/share/drovr/drovr` (same OS and
+   architecture only; mato is an Apple silicon Mac like this one).
+2. The `drovr-tasks` skill: `ssh mato 'bash -s' < scripts/drovr-install-hooks`
+   (A adds the skill to the installer next to drovr-docs). The installer
+   downloads from GitHub `main`; before that branch has the skill, copy it:
+   `scp -r skills/drovr-tasks mato:.claude/skills/`.
+3. The hooks already in place (state, usage); nothing new.
+
+Probe. On connect, the client runs `TaskJob::Probe` on each remote machine:
+`drovr=$(command -v drovr || echo "$HOME/.local/bin/drovr"); "$drovr" task proto`.
+The answer `drovr-task {n}` is kept in `TaskRuntime.probe: HashMap<String,
+Option<u32>>`. No answer, another output, or a non-zero exit = `None`.
+
+- `None`: start-task on that machine is refused (section 5.1, step 2); the
+  sweep still runs (it finds nothing).
+- `n < OUTBOX_V`: start is allowed when the client can still read format
+  `n` (it can read every older `v`); the notice
+  `{machine} runs an older drovr task; update it` shows once.
+- `n > OUTBOX_V`: start is allowed; ops with a newer `v` stay on the remote
+  until this Mac is updated (section 6.3).
+
+Agents started by hand on a remote (not through start-task) have no
+`DROVR_TASK`; `drovr task` there works when the agent passes an id.
 
 ## 7. Build split
 
-### 7.1 Step 0 (Builder A, first commit, before B and C start)
+Each builder works in its own git worktree, never in the shared checkout
+(another session has uncommitted work there):
+`git worktree add ../drovr-worktrees/tasks-{a,b,c} -b tasks/{a,b,c} drovr-main`
+after step 0 is committed on `drovr-main`. Merge order: A, then B rebased on
+A, then C rebased on B. Conflicts can only appear in the step-0 lines of
+section 7.5; each owner keeps the other builders' lines.
 
-A commits the contract skeleton so B and C build against real signatures:
+### 7.1 Step 0 (Builder A, one commit on drovr-main, before B and C start)
 
-- `Cargo.toml`/`Cargo.lock` with rusqlite.
-- `src/tasks/*.rs` with every type and signature of section 3; bodies may be
-  `unimplemented!()` except `Status`, `Actor`, serde derives and
-  `TaskStore::open_in_memory` + `migrate`.
-- `mod tasks;` in `src/main.rs`.
-- Empty modules registered in `src/client/shell.rs`: `mod tasks_panel;`
-  (B), `mod task_launch;`, `mod task_sync;`, `mod task_ingest;` (C), each
-  holding the stub items listed in 7.4 so every caller compiles.
+A commits the contract skeleton so B and C build against real signatures.
+Everything compiles, `cargo test` passes, and no behaviour changes for a
+user who never opens Tasks.
 
-If B or C must start before step 0 lands, they stub `src/tasks` locally with
-exactly these signatures and drop their stub when rebasing.
+- `Cargo.toml`/`Cargo.lock` with rusqlite (`bundled`).
+- `src/tasks/*.rs` with every type and signature of section 3. Working
+  bodies for: `Status`, `Actor`, serde derives, `now_text`, `migrate`,
+  `open`, `open_existing`, `open_in_memory`, `with_store`, `read_store`,
+  `data_version`, `ensure_project`, `create_task`, `task`, `task_detail`,
+  `list`, `lane_counts`, `open_decisions`. Every other body is
+  `Err(StoreError::Invalid("not built yet".into()))` (not
+  `unimplemented!()`, so a B or C test hitting one fails cleanly).
+- `mod tasks;` in `src/main.rs` and the `task` dispatch, next to `doc open`,
+  returning exit 2 `drovr task: not built yet` until A's CLI lands.
+- `src/client/shell.rs`: `mod tasks_panel; mod task_launch; mod task_sync;
+  mod task_ingest;` and `pub(crate) use task_ingest::TaskJobDone;`.
+- Stub files with the items of 7.4 and 7.5, bodies empty or returning
+  `false`/`None`:
+  - `tasks_panel.rs`: `TasksState`, `TasksHits`, `TaskMenu`, `render`,
+    `task_menu_items`, and the `impl ClientShellState` functions of 7.4
+    marked (B).
+  - `task_launch.rs`, `task_sync.rs`, `task_ingest.rs`: `TaskRuntime`,
+    `TaskLaunch`, `TaskJob`, `TaskJobDone`, `run_job`, and the functions of
+    7.4 marked (C).
+- `src/client/shell/state.rs`: the `ClientContextMenuTarget::Task` variant,
+  a field `task: Option<String>` on the `ProjectWorkspace` and `Agent`
+  variants (set to `None` at their two construction sites in
+  project_actions.rs), the nine `ClientContextMenuAction::Task*` variants,
+  the
+  `ClientShellAction::TaskJob` variant, and the field
+  `pub(super) task_rt: super::task_sync::TaskRuntime` on `ClientShellState`
+  with `Default::default()` in its constructor.
+- `src/client/shell/inbox.rs`: `view: PanelView` and
+  `tasks: super::tasks_panel::TasksState` on `InboxState` (no behaviour).
+- `src/client/shell/context_menu.rs`: route `Task { .. }` items to
+  `tasks_panel::task_menu_items` and activation to `activate_task_menu`,
+  before the fallback arm.
+- `src/client/events.rs`: `ClientLoopEvent::TaskJobDone`.
+- `src/client/mod.rs`: the `TaskJobDone` arm, shaped like `InboxReply`.
+- `src/client/shell_runtime.rs`: the `TaskJob` arm, shaped like
+  `InboxTask`.
+- `src/client/shell/project_actions.rs`: visibility only. `open_menu`,
+  `endpoint_request` and `online_machines` become `pub(super)`; the call
+  `self.tick_tasks(outcome);` is added in `tick_drovr` after
+  `self.tick_inbox(outcome);`.
+
+If B or C must start before step 0 lands, they stub exactly these items
+locally and drop the stubs when rebasing.
 
 ### 7.2 Builder A: store, CLI, skill, import
 
@@ -1326,63 +1978,110 @@ Owns:
 - `Cargo.toml`, `Cargo.lock` (rusqlite only)
 - the `task` dispatch lines in `src/main.rs`
 - the skill install lines in `scripts/drovr-install-hooks`
+- the step-0 edits listed in 7.1 (after step 0, the owners of 7.5 take them
+  over)
 
-### 7.3 Builder B: panel
+### 7.3 Builder B: panel and inbox integration
 
 Owns:
 
-- `src/client/shell/tasks_panel.rs` (TasksState, keys, mouse, render entry);
-  B may split drawing into `src/client/shell/tasks_panel/board.rs` and
+- `src/client/shell/tasks_panel.rs`; B may split drawing into
+  `src/client/shell/tasks_panel/board.rs` and
   `src/client/shell/tasks_panel/view.rs`
-- edits in `src/client/shell/inbox.rs` (PanelView, header labels, dispatch,
-  refresh in `tick_inbox`)
-- `TasksSettings` in `src/client/shell/projects.rs` (one field on
-  `ProjectLayout` plus the struct; nothing else in that file)
+- edits in `src/client/shell/inbox.rs`: header labels, `PanelView`
+  switching, dispatch to the Tasks functions, `refresh_tasks` in
+  `tick_inbox`, decision rows and task ids (section 4.5)
+- `TasksSettings` in `src/client/shell/projects.rs`: the struct and one
+  field on `ProjectLayout`
+  (`#[serde(default, skip_serializing_if = "TasksSettings::is_default")] pub(super) tasks: TasksSettings`
+  with `collapsed: Vec<String>` entries `"{project}:{lane}"`). Nothing else
+  in that file.
 
 ### 7.4 Builder C: start-task, sync, ingest
 
 Owns:
 
 - `src/client/shell/task_launch.rs`, `task_sync.rs`, `task_ingest.rs`
-- edits in `src/client/shell/project_actions.rs`: `PendingLaunch` use in
-  `tick_drovr_launch`, the `tick_tasks` call in the drovr tick, the
-  `rename_project` call at the `ProjectRename` apply site, a `Tasks` item in
-  the project menu that calls `open_tasks_panel`
-- `TaskLaunch` and the `task` field on `PendingLaunch` in
-  `src/client/shell/projects.rs` (that struct only)
+- edits in `src/client/shell/project_actions.rs`: `request_workspace` and
+  `project_cwd` (extracted, section 5.1), the `rename_project` call at the
+  `ProjectRename` apply site in `save_project_prompt` (called with the old
+  and new name only when the section rename was applied), a `Tasks` item in
+  the project menu (`ClientContextMenuTarget::Project { name, .. }` with
+  `Action::TaskOpen` calls `open_tasks_panel(name)`), and a `Task {id}` item
+  in the workspace and agent menus when the target's `task` field is set
+  (`Action::TaskOpen` calls `open_task_view(id)`). C fills `task` in
+  `workspace_target` and `agent_target` with one `read_store` lookup
+  (`list` with the workspace prefix, or `task_for_pane`).
+- the `TaskJob` arm in `shell_runtime.rs` and the `TaskJobDone` arm in
+  `client/mod.rs` after step 0
 
-Cross-builder functions (all `impl ClientShellState`, `pub(super)`), stubbed
-in step 0:
+Cross-builder functions (all `impl ClientShellState`, `pub(super)` unless
+noted), stubbed in step 0:
 
 ```rust
 // task_launch.rs (C)
-pub(super) fn launch_task(&mut self, display_id: &str, outcome: &mut ClientShellInput);
+pub(super) fn launch_task(&mut self, display_id: &str, at: (u16, u16), outcome: &mut ClientShellInput);
+pub(super) fn launch_task_on(&mut self, display_id: &str, endpoint_id: ClientEndpointId, outcome: &mut ClientShellInput);
 pub(super) fn endpoint_for_machine(&self, machine: &str) -> Option<ClientEndpointId>;
+/// Focuses the pane on its machine (activating the endpoint); false when
+/// the pane is gone or the machine is offline.
 pub(super) fn focus_task_pane(&mut self, pane_key: &str, outcome: &mut ClientShellInput) -> bool;
-pub(super) fn relay_to_task(&mut self, display_id: &str, text: &str, outcome: &mut ClientShellInput);
+/// Relays `text` to the live attempt's pane (section 5.4); false when not sent.
+pub(super) fn relay_to_task(&mut self, display_id: &str, text: &str, outcome: &mut ClientShellInput) -> bool;
+/// Queues a WriteFiles job with the ruling reply file for a remote waiting CLI.
+pub(super) fn publish_ruling(&mut self, decision: &Decision, outcome: &mut ClientShellInput);
+/// A notice in the shell's notice line (push_endpoint_notice, key "drovr.tasks").
+pub(super) fn push_task_notice(&mut self, message: String) -> bool;
 // task_sync.rs (C)
 pub(super) fn tick_tasks(&mut self, outcome: &mut ClientShellInput);
+// task_ingest.rs (C)
+pub(crate) fn receive_task_job(&mut self, done: TaskJobDone) -> bool;
+
 // tasks_panel.rs (B)
 pub(super) fn open_tasks_panel(&mut self, project: String, outcome: &mut ClientShellInput);
+/// Opens the task view of `display_id` (switching project and view).
+pub(super) fn open_task_view(&mut self, display_id: &str, outcome: &mut ClientShellInput);
+pub(super) fn handle_tasks_key(&mut self, key: &crate::input::TerminalKey, outcome: &mut ClientShellInput) -> bool;
+pub(super) fn handle_tasks_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) -> bool;
+pub(super) fn activate_task_menu(&mut self, display_id: String, menu: TaskMenu, action: ClientContextMenuAction, at: (u16, u16), outcome: &mut ClientShellInput);
+pub(super) fn refresh_tasks(&mut self, force: bool);
+pub(super) fn task_menu_items(menu: &TaskMenu) -> Vec<ClientContextMenuItem>; // free fn
 ```
+
+Who calls what: B's panel calls `launch_task`, `focus_task_pane`,
+`relay_to_task` (after a note, a send back, a ruling whose `wait_until`
+allows it), `publish_ruling` (after every ruling on a remote attempt) and
+`push_task_notice`. C's code calls `open_tasks_panel` (project menu) and
+`open_task_view` (workspace and agent menu items). Store writes go through
+`tasks::with_store` from either side; neither builder calls the other's
+private helpers.
 
 ### 7.5 Shared touch points
 
-| file                                   | owner | what                                   |
-|----------------------------------------|-------|----------------------------------------|
-| Cargo.toml, Cargo.lock                 | A     | rusqlite                               |
-| src/main.rs                            | A     | `mod tasks`, `task` dispatch           |
-| src/client/shell.rs                    | A     | all four `mod` lines (step 0)          |
-| src/client/shell/inbox.rs              | B     | view tabs and dispatch                 |
-| src/client/shell/projects.rs           | B: `TasksSettings` on `ProjectLayout`; C: `PendingLaunch.task`, `TaskLaunch` |
-| src/client/shell/project_actions.rs    | C     | launch, tick, rename, menu item        |
-| scripts/drovr-install-hooks            | A     | install the drovr-tasks skill          |
+| file                                   | owner after step 0 | what |
+|----------------------------------------|-------|------|
+| Cargo.toml, Cargo.lock                 | A     | rusqlite |
+| src/main.rs                            | A     | `mod tasks`, `task` dispatch |
+| src/client/shell.rs                    | A (step 0 only) | four `mod` lines, one `use` |
+| src/client/shell/state.rs              | A (step 0 only) | menu target and actions, `TaskJob` action, `task_rt` field |
+| src/client/events.rs                   | A (step 0 only) | `TaskJobDone` event |
+| src/client/mod.rs                      | C     | `TaskJobDone` arm |
+| src/client/shell_runtime.rs            | C     | `TaskJob` arm |
+| src/client/shell/context_menu.rs       | A (step 0 only) | `Task` routing |
+| src/client/shell/inbox.rs              | B     | view tabs, dispatch, refresh, decision rows, task ids |
+| src/client/shell/projects.rs           | B     | `TasksSettings` on `ProjectLayout` (C does not touch this file; `PendingLaunch` is unchanged) |
+| src/client/shell/project_actions.rs    | C     | `request_workspace`, `project_cwd`, rename hook, menu items; step 0: visibility, `task: None`, the `tick_tasks` call |
+| scripts/drovr-install-hooks            | A     | install the drovr-tasks skill |
+
+After step 0 nobody edits a file marked "step 0 only" without telling the
+other builders; a needed change goes into the owner's next commit.
 
 Other sessions have uncommitted work in `src/client/shell/drovr_sidebar.rs`,
 `src/config/sidebar.rs`, `src/doc_view/mod.rs`, `src/doc_view/select.rs`,
 `scripts/drovr-workflow-hook` and its test, and `.github/README.md`. No
-builder edits, stages, stashes or reformats those files. Run `cargo fmt` on
-your own files only (`rustfmt <files>`).
+builder edits, stages, stashes or reformats those files, in the shared
+checkout or in a worktree. Run `rustfmt` on your own files only
+(`rustfmt --edition 2021 <files>`), never `cargo fmt`.
 
 ## 8. Tests
 
@@ -1396,6 +2095,22 @@ mato.
 Builder A (`src/tasks/*` inline tests):
 
 - migrate on an empty file and again on a migrated file (no-op); version rows.
+- migrate race: two threads open the same temp file at once; both succeed,
+  one set of version rows.
+- a file with a version above `MIGRATIONS.len()` returns `TooNew` and is
+  left unchanged; an older version gets `{path}.v{n}.bak` before migrating.
+- concurrent writers: two `TaskStore::open(path, 5000)` connections on two
+  threads each add 200 notes to the same task; 400 entries, seqs 1..=400
+  with no gap or duplicate; the same with `create_task` gives numbers
+  1..=400.
+- `open_existing` on a missing path returns None and creates nothing;
+  `read_store` returns the default.
+- `update_task` with a stale `expected_version` returns `stale` and leaves
+  the body; with the current one it saves and bumps the version.
+- a move to the current status is Ok, writes no entry, keeps `version`.
+- a human move to done ends the open attempt (succeeded from review,
+  stopped otherwise) and withdraws an open decision.
+- reorder renumbers a lane when the gap is below 1e-6.
 - key derivation cases (one word, two words, digits first, collision).
 - create two tasks: numbers 1, 2; display ids; positions increase.
 - rename_project keeps display ids; rename onto an existing name refuses.
@@ -1406,13 +2121,21 @@ Builder A (`src/tasks/*` inline tests):
 - one open attempt per task; start ends the previous one as stopped.
 - decisions: 0 or 9 choices refused, two recommended refused, second open
   refused, first ruling wins, expiry with and without a default.
-- `apply_once` twice with the same seq applies once.
+- `apply_once` twice with the same seq applies once; the same seq under a
+  new epoch (another source string) applies again.
+- `OutboxOp` with `v = OUTBOX_V + 1` is rejected by the two-step parse
+  without touching the store.
 - every `TaskOp` round-trips through serde; a fixed JSON line from section 6.3
   parses.
-- CLI: argument parsing for each subcommand (id detection, `-` stdin,
-  defaults), exit codes, db mode end to end against a temp db, outbox mode
-  writes `{seq}.json` and the seq file, reuses the counter after files are
-  removed.
+- CLI: argument parsing for each subcommand (id detection, lowercase id,
+  `-` stdin, defaults), exit codes, db mode end to end against a temp db,
+  db mode with a missing file exits 1 and creates nothing, outbox mode
+  writes `{seq}.json`, the seq and epoch files, reuses the counter after op
+  files are removed, and makes a new epoch after the directory is removed.
+- `verify` against a temp db: a passing and a failing `check_cmd`
+  (`true`, `sh -c 'echo no; exit 3'`) record passed and failed with the
+  output and exit code in the evidence.
+- `proto` prints `drovr-task 1`.
 - import: a small workspace fixture built in the test with the v8 schema
   subset (projects, tasks, criteria, entries, attempts, artifacts,
   questions): counts, status mapping, idempotent second run.
@@ -1427,22 +2150,53 @@ Builder B (`tasks_panel` inline tests, render into a `Buffer`):
   Inbox view (an existing inbox test still passes).
 - review -> ready from the move menu asks for a note before writing.
 - the decision card lists choices with `(rec)` and rules on `1`.
-- a data_version change reloads cards on the next tick.
+- a data_version change reloads cards on the next tick; a panel write sets
+  `dirty` and reloads without a data_version change.
+- widths 48 and 45-inner: no line is wider than the body, the id, criteria
+  count and button glyph are drawn, and parts drop in the order of 4.2.
+- the header line and the composer stay in place while the task view
+  scrolls.
+- a failed write (stub returning Busy) keeps the input text.
+- a stale title save keeps the input open; a second Enter saves.
+- decision rows: drawn first in Waiting, counted in the header, a click
+  opens the task view on the decision; the task id shows on a hook item
+  whose pane is in `pane_tasks`.
 
 Builder C (`task_launch`, `task_sync`, `task_ingest` inline tests):
 
-- the launch command line for local and remote endpoints.
+- the `workspace.create` request for local and remote endpoints: label,
+  cwd, and the env map of section 5.1 (no typed `export`).
+- two launches pending at once each find their own workspace and type
+  `cc` once.
+- the first prompt goes out as `AgentPrompt` when the agent is detected,
+  else after 5 s.
+- an offline machine, a reconnect and a new boot id do not end attempts;
+  a workspace missing for 30 s on an online machine with the same boot id
+  does.
+- a ruling is relayed when `wait_until` is NULL or past and not while it is
+  in the future.
+- probe parsing (`drovr-task 1`, missing command, garbage) and the start
+  refusal for `None`.
+- decision notices: none for ids seen at start-up, one per new open id.
 - the context file text for a task with criteria, pinned notes and a
   decision.
 - sync table: each row moves or does not move; `auto_status = 0` blocks
   every move; the 2 s stability rule; one move per stamp.
-- ingest: the pull script and the cleanup script text (quoted paths, numeric
-  sort, 200 cap); parsing a multi-line pull output; a bad line produces a
-  `.bad` rename in the cleanup script; applied seq advances.
+- ingest: the pull and sweep script text (quoted paths, numeric sort, 200
+  cap, every pane directory for a sweep); parsing a multi-line pull output
+  with two epochs; a bad line produces a `.bad` rename; a newer `v` leaves
+  the file and raises one notice; a Busy stop leaves the remaining files;
+  the cleanup script removes only applied files and files at or below the
+  applied seq. Run the pull and cleanup scripts with `/bin/sh` against a
+  temp `DROVR_TASK_OUTBOX_DIR` (the local route), not over SSH.
 - relay text for note, ruling and send back.
 - rename hook calls `rename_project` with the old and new name.
 
-Before handing over, each builder runs `cargo test` for the crate and
-`cargo clippy --all-targets` with no new warnings. `cargo` is at
+Before handing over, each builder runs `just check` (or `cargo test` and
+`cargo clippy --all-targets` with no new warnings when the Windows stage
+cannot run on this Mac; say so in the hand-over). Builder A checks that
+`libsqlite3-sys` with `bundled` builds in the Windows stage of `just check`
+when it is available; if it does not, A reports it before B and C start,
+since every builder then needs the same `cfg` gate. `cargo` is at
 `~/.rustup/toolchains/1.96.1-aarch64-apple-darwin/bin` when it is not on
 `PATH`.
