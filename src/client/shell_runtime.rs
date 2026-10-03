@@ -83,6 +83,12 @@ pub(super) fn dispatch_client_shell_actions(
                     .and_then(|shell| shell.drovr_events.clone());
                 shell::run_inbox_task(route, task, reply, events);
             }
+            shell::ClientShellAction::TaskJob { route, job } => {
+                let events = shell
+                    .as_deref()
+                    .and_then(|shell| shell.drovr_events.clone());
+                shell::run_task_job(route, job, events);
+            }
             shell::ClientShellAction::OpenLocalEditor { pane_id, path } => {
                 shell::open_local_editor(pane_id, path);
             }

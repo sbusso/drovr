@@ -173,12 +173,16 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             groups,
             base,
             documents,
+            task,
             ..
         } => {
             let mut items = base
                 .as_deref()
                 .map(super::context_menu::items_for)
                 .unwrap_or_default();
+            if let Some(task) = task {
+                items.push(item(format!("Task {task}"), Action::TaskOpen));
+            }
             if documents.is_some() {
                 items.push(item("Documents…", Action::Documents));
             }
@@ -214,6 +218,7 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
                 return items;
             }
             let mut items = vec![
+                item("Tasks", Action::TaskOpen),
                 item("New agent here…", Action::ProjectNewAgent),
                 item("New workspace here…", Action::ProjectNewWorkspace),
                 collapse,
@@ -250,10 +255,14 @@ pub(super) fn project_menu_items(target: &ClientContextMenuTarget) -> Vec<Client
             groups,
             grouped,
             documents,
+            task,
             ..
         } => {
             let presence = projects::layout().presence(unread_key, *seq, *status);
             let mut items = vec![item("Go to", Action::AgentFocus)];
+            if let Some(task) = task {
+                items.push(item(format!("Task {task}"), Action::TaskOpen));
+            }
             items.push(if presence.needs_attention() {
                 item("Mark inactive", Action::AgentMarkInactive)
             } else {
@@ -401,6 +410,7 @@ impl ClientShellState {
             None
         };
         let layout = projects::layout();
+        let task = self.workspace_task(endpoint_id, workspace_id);
         Some(ClientContextMenuTarget::ProjectWorkspace {
             grouped: self.workspace_group(endpoint_id, workspace_id).is_some(),
             hidden: layout.is_hidden(&key),
@@ -408,7 +418,27 @@ impl ClientShellState {
             key,
             base,
             documents: documents_target(endpoint_id, workspace_id, None),
+            task,
         })
+    }
+
+    /// The task linked to a workspace: an open one first, else the newest
+    /// closed one (tasks.md 7.4).
+    fn workspace_task(&self, endpoint_id: &ClientEndpointId, workspace_id: &str) -> Option<String> {
+        let endpoint = self.endpoint_by_id(endpoint_id)?;
+        let filter = crate::tasks::TaskFilter {
+            workspace_key: Some(format!(
+                "{}/{workspace_id}:",
+                projects::machine_key(endpoint)
+            )),
+            ..Default::default()
+        };
+        let cards = crate::tasks::read_store(|store| store.list(&filter)).ok()?;
+        cards
+            .iter()
+            .find(|card| !card.task.status.is_closed())
+            .or_else(|| cards.first())
+            .map(|card| card.task.display_id.clone())
     }
 
     fn agent_target(
@@ -429,6 +459,10 @@ impl ClientShellState {
             agent.workspace_id.clone(),
         );
         let unread_key = projects::agent_key(endpoint, &pane_id);
+        let task = crate::tasks::read_store(|store| store.task_for_pane(&unread_key))
+            .ok()
+            .flatten()
+            .map(|task| task.display_id);
         let workspace_key = self
             .workspace_label_and_paths(&endpoint_id, &workspace_id)
             .map(|(key, _, _)| key);
@@ -446,10 +480,11 @@ impl ClientShellState {
             active: endpoint_id == self.active_endpoint_id,
             endpoint_id,
             pane_id,
+            task,
         })
     }
 
-    fn open_menu(&mut self, target: ClientContextMenuTarget, x: u16, y: u16) {
+    pub(super) fn open_menu(&mut self, target: ClientContextMenuTarget, x: u16, y: u16) {
         self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target,
             x,
@@ -758,6 +793,12 @@ impl ClientShellState {
                 documents: Some(documents),
                 ..
             } if action == Action::Documents => self.open_menu(*documents, x, y),
+            ClientContextMenuTarget::ProjectWorkspace {
+                task: Some(task), ..
+            }
+            | ClientContextMenuTarget::Agent {
+                task: Some(task), ..
+            } if action == Action::TaskOpen => self.open_task_view(&task, outcome),
             ClientContextMenuTarget::Documents {
                 workspace_id,
                 pane_id,
@@ -811,6 +852,7 @@ impl ClientShellState {
                 }
             }
             ClientContextMenuTarget::Project { name, .. } => match action {
+                Action::TaskOpen => self.open_tasks_panel(name, outcome),
                 Action::ProjectNewAgent | Action::ProjectNewWorkspace => self
                     .open_new_workspace_picker(
                         (name != projects::OTHER).then_some(name),
@@ -939,12 +981,17 @@ impl ClientShellState {
             }
             ClientRenameTarget::ProjectRename { name } => {
                 let text = text.trim().to_owned();
-                if !text.is_empty() {
+                let mut renamed = false;
+                if !text.is_empty() && text != name {
                     projects::update(|layout| {
                         if let Some(group) = layout.group_mut(&name) {
-                            group.name = text;
+                            group.name = text.clone();
+                            renamed = true;
                         }
                     })
+                }
+                if renamed {
+                    self.rename_task_project(&name, &text);
                 }
             }
             ClientRenameTarget::ProjectRules { name } => {
@@ -1043,7 +1090,7 @@ impl ClientShellState {
     }
 
     /// Machines you can create a workspace on, active one first.
-    fn online_machines(&self) -> Vec<(ClientEndpointId, String)> {
+    pub(super) fn online_machines(&self) -> Vec<(ClientEndpointId, String)> {
         let mut machines = self
             .endpoints
             .iter()
@@ -1105,21 +1152,9 @@ impl ClientShellState {
         run_agent: bool,
     ) {
         // Start in the project's folder on that machine when it has one there.
-        let cwd = project.as_deref().and_then(|project| {
-            let layout = projects::layout();
-            let (sections, _) = projects::sections(&layout, &self.endpoints);
-            sections
-                .into_iter()
-                .filter(|section| layout.groups[section.group].name == project)
-                .flat_map(|section| section.members)
-                .find_map(|member| {
-                    let endpoint = &self.endpoints[member.endpoint];
-                    (endpoint.endpoint_id == endpoint_id).then_some(())?;
-                    let workspace = endpoint.snapshot.as_deref()?.workspaces.get(member.index)?;
-                    (!workspace.new_workspace_cwd.is_empty())
-                        .then(|| workspace.new_workspace_cwd.clone())
-                })
-        });
+        let cwd = project
+            .as_deref()
+            .and_then(|project| self.project_cwd(&endpoint_id, project));
         let initial = project.clone().unwrap_or_default();
         self.prompt(
             if run_agent {
@@ -1137,8 +1172,42 @@ impl ClientShellState {
         );
     }
 
+    /// The project's `new_workspace_cwd` on that machine: the folder of one
+    /// of its workspaces there.
+    pub(super) fn project_cwd(
+        &self,
+        endpoint_id: &ClientEndpointId,
+        project: &str,
+    ) -> Option<String> {
+        let layout = projects::layout();
+        let (sections, _) = projects::sections(&layout, &self.endpoints);
+        sections
+            .into_iter()
+            .filter(|section| layout.groups[section.group].name == project)
+            .flat_map(|section| section.members)
+            .find_map(|member| {
+                let endpoint = &self.endpoints[member.endpoint];
+                (&endpoint.endpoint_id == endpoint_id).then_some(())?;
+                let workspace = endpoint.snapshot.as_deref()?.workspaces.get(member.index)?;
+                (!workspace.new_workspace_cwd.is_empty())
+                    .then(|| workspace.new_workspace_cwd.clone())
+            })
+    }
+
+    /// Renames the tasks project after its section (tasks.md 2.3). The store
+    /// file is not created for this: without tasks there is nothing to rename.
+    fn rename_task_project(&mut self, old: &str, new: &str) {
+        match crate::tasks::read_store(|store| store.rename_project(old, new)) {
+            Ok(()) => {}
+            Err(crate::tasks::StoreError::Refused(refusal)) => {
+                self.push_task_notice(refusal.message);
+            }
+            Err(error) => tracing::debug!(%error, "cannot rename the tasks project"),
+        }
+    }
+
     /// Send one API request to a specific machine (not just the active one).
-    fn endpoint_request(
+    pub(super) fn endpoint_request(
         &mut self,
         endpoint_id: &ClientEndpointId,
         method: crate::api::schema::Method,
@@ -1172,9 +1241,41 @@ impl ClientShellState {
             .map(str::to_owned)
             .or_else(|| project.clone())
             .unwrap_or_else(|| "workspace".to_owned());
-        let Some(endpoint) = self.endpoint_by_id(&endpoint_id) else {
+        let Some(known) = self.request_workspace(
+            &endpoint_id,
+            project.as_deref(),
+            cwd,
+            &label,
+            Default::default(),
+            outcome,
+        ) else {
             return;
         };
+        projects::set_launch(Some(projects::PendingLaunch {
+            endpoint_id,
+            label,
+            known,
+            command: run_agent.then(|| "cc".to_owned()),
+            since: std::time::Instant::now(),
+        }));
+    }
+
+    /// Sends workspace.create (focus true) to the machine, assigns
+    /// `machine/label` to `project`, activates the endpoint when it is not
+    /// the active one. Returns the workspace ids known before the request.
+    /// The active machine gets the request on the client connection; another
+    /// one through its API route, since the client connection only carries
+    /// requests for the active endpoint.
+    pub(super) fn request_workspace(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        project: Option<&str>,
+        cwd: Option<String>,
+        label: &str,
+        env: std::collections::HashMap<String, String>,
+        outcome: &mut ClientShellInput,
+    ) -> Option<std::collections::HashSet<String>> {
+        let endpoint = self.endpoint_by_id(endpoint_id)?;
         let machine = projects::machine_key(endpoint);
         let known = endpoint
             .snapshot
@@ -1192,31 +1293,27 @@ impl ClientShellState {
                 source_workspace_id: None,
                 cwd,
                 focus: true,
-                label: Some(label.clone()),
-                env: Default::default(),
+                label: Some(label.to_owned()),
+                env,
             },
         );
-        let Some(action) = self.endpoint_request(&endpoint_id, method) else {
-            return;
-        };
-        outcome.actions.push(action);
-        if let Some(project) = project.as_deref() {
+        if endpoint_id == &self.active_endpoint_id {
+            let action = self.endpoint_request(endpoint_id, method)?;
+            outcome.actions.push(action);
+        } else if !self.send_task_api(&machine, vec![method], outcome) {
+            return None;
+        }
+        if let Some(project) = project {
             let key = format!("{machine}/{label}");
             projects::update(|layout| layout.assign(&key, project));
         }
-        projects::set_launch(Some(projects::PendingLaunch {
-            endpoint_id: endpoint_id.clone(),
-            label,
-            known,
-            command: run_agent.then(|| "cc".to_owned()),
-            since: std::time::Instant::now(),
-        }));
-        if endpoint_id != self.active_endpoint_id {
+        if endpoint_id != &self.active_endpoint_id {
             outcome.actions.push(ClientShellAction::ActivateEndpoint {
-                endpoint_id,
+                endpoint_id: endpoint_id.clone(),
                 target: None,
             });
         }
+        Some(known)
     }
 
     /// Periodic drovr work, from the client loop's 100 ms timer.
@@ -1232,6 +1329,7 @@ impl ClientShellState {
         }
         outcome.repaint |= projects::expire_peek();
         self.tick_inbox(outcome);
+        self.tick_tasks(outcome);
         // Advance the structured view's spinner while an agent works.
         outcome.repaint |= super::drovr_sidebar::take_spinning();
         outcome.repaint |= super::drovr_sidebar::take_clock_tick();
@@ -1342,5 +1440,115 @@ mod tests {
         ]);
         assert!(projects::press().is_some());
         projects::clear_press();
+    }
+
+    fn task_in(project: &str) -> String {
+        crate::tasks::with_store(|store| {
+            store.create_task(
+                &crate::tasks::NewTask {
+                    project: project.into(),
+                    title: Some("Retry the sync job".into()),
+                    ..Default::default()
+                },
+                &crate::tasks::Actor::Human,
+            )
+        })
+        .expect("task")
+        .display_id
+    }
+
+    fn group(name: &str) {
+        projects::update(|layout| {
+            layout.groups.retain(|group| group.name != name);
+            layout.groups.push(projects::ProjectGroup {
+                name: name.into(),
+                ..Default::default()
+            });
+        });
+    }
+
+    #[test]
+    fn renaming_a_section_renames_its_tasks_project() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(
+            &crate::config::Config::default(),
+        ));
+        group("Rename Acme");
+        let id = task_in("Rename Acme");
+        let mut outcome = ClientShellInput::default();
+        state.save_project_prompt(
+            ClientRenameTarget::ProjectRename {
+                name: "Rename Acme".into(),
+            },
+            "Rename Acme Labs",
+            &mut outcome,
+        );
+        let project = crate::tasks::with_store(|store| store.task_detail(&id))
+            .expect("read")
+            .expect("task")
+            .project;
+        assert_eq!(project.name, "Rename Acme Labs");
+        // Onto a name another project row holds: the section is renamed, the
+        // tasks stay, and a notice says why.
+        task_in("Rename Beta");
+        state.save_project_prompt(
+            ClientRenameTarget::ProjectRename {
+                name: "Rename Acme Labs".into(),
+            },
+            "Rename Beta",
+            &mut outcome,
+        );
+        assert!(projects::layout()
+            .groups
+            .iter()
+            .any(|group| group.name == "Rename Beta"));
+        let notice = state.visible_endpoint_notice.as_ref().expect("notice");
+        assert_eq!(notice.body, "a project named Rename Beta already exists");
+        let project = crate::tasks::with_store(|store| store.task_detail(&id))
+            .expect("read")
+            .expect("task")
+            .project;
+        assert_eq!(project.name, "Rename Acme Labs");
+    }
+
+    #[test]
+    fn project_and_workspace_menus_open_tasks() {
+        let project = project_menu_items(&ClientContextMenuTarget::Project {
+            name: "Acme".into(),
+            pinned: false,
+            collapsed: false,
+        });
+        assert_eq!(project[0].label, "Tasks");
+        assert_eq!(project[0].action, Action::TaskOpen);
+        let other = project_menu_items(&ClientContextMenuTarget::Project {
+            name: projects::OTHER.into(),
+            pinned: false,
+            collapsed: false,
+        });
+        assert!(other.iter().all(|item| item.action != Action::TaskOpen));
+
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(
+            &crate::config::Config::default(),
+        ));
+        state.set_snapshot(Box::new(super::super::tests::snapshot()));
+        let target = state
+            .workspace_target(&ClientEndpointId::Local, "ws_1", 2, 2)
+            .expect("target");
+        assert!(project_menu_items(&target)
+            .iter()
+            .all(|item| item.action != Action::TaskOpen));
+        let id = task_in("Menu Acme");
+        crate::tasks::with_store(|store| {
+            store.link_workspace(&id, Some("local/ws_1:client-shell"))
+        })
+        .expect("link");
+        let target = state
+            .workspace_target(&ClientEndpointId::Local, "ws_1", 2, 2)
+            .expect("target");
+        let items = project_menu_items(&target);
+        let task = items
+            .iter()
+            .find(|item| item.action == Action::TaskOpen)
+            .expect("task item");
+        assert_eq!(task.label, format!("Task {id}"));
     }
 }

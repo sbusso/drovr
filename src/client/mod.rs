@@ -814,6 +814,17 @@ async fn run_client_loop(
                     }
                 }
             }
+            ClientLoopEvent::TaskJobDone(done) => {
+                if let Some(shell) = state.shell.as_mut() {
+                    if shell.receive_task_job(done) {
+                        if let Some(frame) =
+                            shell.compose(state.reported_size.0, state.reported_size.1)
+                        {
+                            state.present_frame(frame);
+                        }
+                    }
+                }
+            }
             ClientLoopEvent::RemoteDocOpenFailed(message) => {
                 if let Some(shell) = state.shell.as_mut() {
                     if shell.push_remote_doc_failure(message) {

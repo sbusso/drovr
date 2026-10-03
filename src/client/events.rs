@@ -40,4 +40,6 @@ pub(super) enum ClientLoopEvent {
         reply: shell::InboxReply,
         result: Result<serde_json::Value, String>,
     },
+    /// drovr fork: a tasks job (pull, file writes, probe) finished.
+    TaskJobDone(shell::TaskJobDone),
 }

@@ -308,6 +308,12 @@ pub(crate) enum ClientShellAction {
         task: super::inbox_answer::Task,
         reply: super::inbox::InboxReply,
     },
+    /// drovr fork: a tasks job (outbox pull, file writes, probe, API calls)
+    /// on a machine, run on a background thread (docs/design/tasks.md 6.3).
+    TaskJob {
+        route: super::inbox::ApiRoute,
+        job: super::task_ingest::TaskJob,
+    },
     /// drovr fork: `$EDITOR` on `path` in a pane split from `pane_id` on
     /// the local server.
     OpenLocalEditor {
@@ -675,6 +681,8 @@ pub(super) enum ClientContextMenuTarget {
         groups: Vec<String>,
         base: Option<Box<ClientContextMenuTarget>>,
         documents: Option<Box<ClientContextMenuTarget>>,
+        /// Display id of the task linked to this workspace (tasks.md 7.4).
+        task: Option<String>,
     },
     Project {
         name: String,
@@ -699,6 +707,8 @@ pub(super) enum ClientContextMenuTarget {
         groups: Vec<String>,
         grouped: bool,
         documents: Option<Box<ClientContextMenuTarget>>,
+        /// Display id of the task whose open attempt runs in this pane.
+        task: Option<String>,
     },
     /// drovr: recent documents of a workspace on this machine (newest first).
     Documents {
@@ -1119,6 +1129,8 @@ pub(crate) struct ClientShellState {
         Option<tokio::sync::mpsc::Sender<crate::client::events::ClientLoopEvent>>,
     /// drovr fork: the inbox panel.
     pub(super) inbox: super::inbox::InboxState,
+    /// drovr fork: start-task, status sync and outbox ingest state.
+    pub(super) task_rt: super::task_sync::TaskRuntime,
     pub(super) outer_focused: Option<bool>,
     pub(super) ascii_input_source_active: bool,
     pub(super) pending_input_source_changes: Vec<bool>,
@@ -1286,6 +1298,7 @@ impl ClientShellState {
             visible_endpoint_notice: None,
             drovr_events: None,
             inbox: Default::default(),
+            task_rt: Default::default(),
             outer_focused: None,
             ascii_input_source_active: false,
             pending_input_source_changes: Vec::new(),
