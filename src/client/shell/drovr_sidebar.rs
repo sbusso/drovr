@@ -760,19 +760,21 @@ const BANNER_MIN_BODY: u16 = 10;
 
 /// Versions to try next to the wordmark, widest first: the drovr version
 /// (build_info::DROVR_VERSION) without its `.dirty` mark, then without the
-/// `+N` commit count, then without the `-N` release suffix. A non-numeric
-/// build suffix (`+dev`) has no pixel glyphs and is dropped up front.
-fn banner_versions(version: &str) -> Vec<&str> {
+/// `-N` release suffix, so the `+N` commit count that changes with every
+/// build stays, then the release alone, then the base. A non-numeric build
+/// suffix (`+dev`) has no pixel glyphs and is dropped up front.
+fn banner_versions(version: &str) -> Vec<String> {
     let version = version.strip_suffix(".dirty").unwrap_or(version);
     let release = version.split('+').next().unwrap_or(version);
     let base = release.split('-').next().unwrap_or(release);
     let build = &version[release.len()..];
-    let mut versions = Vec::with_capacity(3);
+    let mut versions = Vec::with_capacity(4);
     if build.len() > 1 && build[1..].bytes().all(|b| b.is_ascii_digit()) {
-        versions.push(version);
+        versions.push(version.to_owned());
+        versions.push(format!("{base}{build}"));
     }
-    versions.push(release);
-    versions.push(base);
+    versions.push(release.to_owned());
+    versions.push(base.to_owned());
     versions.dedup();
     versions
 }
@@ -863,8 +865,8 @@ fn render_banner(buffer: &mut Buffer, area: Rect, inner: Rect, palette: &Palette
     let version_x = x + display_width(BANNER[0]) + 2;
     let room = inner.right().saturating_sub(version_x);
     if let Some(version) = banner_versions(crate::build_info::DROVR_VERSION)
-        .into_iter()
-        .map(pixel_text)
+        .iter()
+        .map(|version| pixel_text(version))
         .find(|version| display_width(&version[0]) <= room)
     {
         for (offset, line) in version.iter().enumerate() {
@@ -2988,8 +2990,8 @@ mod tests {
         let (buffer, hits, _) = render_with_banner(Rect::new(0, 0, 34, 40), 0);
         // 34 columns leave 15 cells right of the wordmark.
         let version = banner_versions(crate::build_info::DROVR_VERSION)
-            .into_iter()
-            .map(pixel_text)
+            .iter()
+            .map(|version| pixel_text(version))
             .find(|version| display_width(&version[0]) <= 15)
             .expect("the release version fits");
         for row in 0..2u16 {
@@ -3094,11 +3096,11 @@ mod tests {
     fn banner_versions_drop_suffixes_widest_first() {
         assert_eq!(
             banner_versions("0.9.3-3+1.dirty"),
-            ["0.9.3-3+1", "0.9.3-3", "0.9.3"]
+            ["0.9.3-3+1", "0.9.3+1", "0.9.3-3", "0.9.3"]
         );
         assert_eq!(
             banner_versions("0.9.3-3+12"),
-            ["0.9.3-3+12", "0.9.3-3", "0.9.3"]
+            ["0.9.3-3+12", "0.9.3+12", "0.9.3-3", "0.9.3"]
         );
         assert_eq!(banner_versions("0.9.3-3"), ["0.9.3-3", "0.9.3"]);
         assert_eq!(banner_versions("0.9.3+dev"), ["0.9.3"]);
