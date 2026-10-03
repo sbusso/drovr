@@ -677,13 +677,13 @@ fn a_failed_editor_save_after_a_good_one_keeps_the_file() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join(format!("{id}.md"));
     std::fs::write(&path, "").expect("write");
-    let version = task(&id).version;
     state.inbox.tasks.edit = Some(EditFile {
         id: id.clone(),
         path: path.clone(),
         mtime: None,
-        version,
+        base: task(&id).body,
         saved: false,
+        kept: false,
     });
     let write = |text: &str, secs: u64| {
         std::fs::write(&path, text).expect("write");
@@ -710,5 +710,66 @@ fn a_failed_editor_save_after_a_good_one_keeps_the_file() {
         std::fs::read_to_string(&path).expect("file kept"),
         "second body\n"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refused_editor_save_is_reopened_not_overwritten() {
+    let id = add("Edited", Status::Ready, None, &[]);
+    start(&id, "local", "p1");
+    let mut state = tasks_shell();
+    let mut outcome = ClientShellInput::default();
+    state.open_task_view(&id, &mut outcome);
+    let dir = std::env::temp_dir().join(format!("drovr-kept-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join(format!("{id}.md"));
+    std::fs::write(&path, "").expect("write");
+    state.inbox.tasks.edit = Some(EditFile {
+        id: id.clone(),
+        path: path.clone(),
+        mtime: None,
+        base: task(&id).body,
+        saved: false,
+        kept: false,
+    });
+    let write = |text: &str, secs: u64| {
+        std::fs::write(&path, text).expect("write");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .expect("mtime");
+    };
+    // A version bump that leaves the description alone (a usage copy) does
+    // not refuse the save.
+    let bump = TaskPatch {
+        priority: Some(crate::tasks::Priority::High),
+        ..TaskPatch::default()
+    };
+    tasks::with_store(|store| store.update_task(&id, &bump, &Actor::Human)).expect("bump");
+    write("mine\n", 1_000);
+    state.poll_task_edit();
+    assert_eq!(task(&id).body, "mine");
+    // Someone else changes the description: the save is refused and kept.
+    let theirs = TaskPatch {
+        body: Some("theirs".into()),
+        ..TaskPatch::default()
+    };
+    tasks::with_store(|store| store.update_task(&id, &theirs, &Actor::Human)).expect("theirs");
+    write("mine again\n", 2_000);
+    state.poll_task_edit();
+    assert_eq!(task(&id).body, "theirs");
+    // `e` reopens the kept file without writing over it; its save goes in.
+    state.refresh_tasks(true);
+    let mut outcome = ClientShellInput::default();
+    state.edit_description(&mut outcome);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("kept"),
+        "mine again\n"
+    );
+    write("mine again\n", 3_000);
+    state.poll_task_edit();
+    assert_eq!(task(&id).body, "mine again");
     let _ = std::fs::remove_dir_all(&dir);
 }

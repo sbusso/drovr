@@ -285,8 +285,14 @@ struct EditFile {
     id: String,
     path: std::path::PathBuf,
     mtime: Option<std::time::SystemTime>,
-    version: i64,
+    /// The description the edit started from. A save is refused only when
+    /// the stored description moved away from it, not on any version bump
+    /// (usage copies bump the version of a working task all the time).
+    base: String,
     saved: bool,
+    /// The last save was refused or failed: the file holds text the store
+    /// does not, so `e` reopens it instead of writing over it.
+    kept: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1386,11 +1392,7 @@ impl ClientShellState {
         let Some(detail) = self.inbox.tasks.detail.as_ref() else {
             return;
         };
-        let (id, body, version) = (
-            detail.task.display_id.clone(),
-            detail.task.body.clone(),
-            detail.task.version,
-        );
+        let (id, body) = (detail.task.display_id.clone(), detail.task.body.clone());
         let live_local = detail
             .attempts
             .iter()
@@ -1415,20 +1417,43 @@ impl ClientShellState {
             .join("drovr")
             .join("tasks")
             .join("edit");
-        let path = dir.join(format!("{id}.md"));
-        let written = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &body));
-        if let Err(error) = written {
-            self.inbox.tasks.status_line(format!("not saved: {error}"));
-            return;
-        }
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        self.inbox.tasks.edit = Some(EditFile {
-            id,
-            path: path.clone(),
-            mtime,
-            version,
-            saved: false,
-        });
+        // A file whose last save was refused holds the user's text: reopen
+        // it, and let its next save replace the description they were told
+        // changed.
+        let kept = self
+            .inbox
+            .tasks
+            .edit
+            .as_mut()
+            .filter(|edit| edit.id == id && edit.kept && edit.path.exists());
+        let path = if let Some(edit) = kept {
+            edit.base = body;
+            edit.mtime = std::fs::metadata(&edit.path)
+                .and_then(|m| m.modified())
+                .ok();
+            let path = edit.path.clone();
+            self.inbox.tasks.status_line(format!(
+                "your kept text; saving replaces {id}'s description"
+            ));
+            path
+        } else {
+            let path = dir.join(format!("{id}.md"));
+            let written = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &body));
+            if let Err(error) = written {
+                self.inbox.tasks.status_line(format!("not saved: {error}"));
+                return;
+            }
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            self.inbox.tasks.edit = Some(EditFile {
+                id,
+                path: path.clone(),
+                mtime,
+                base: body,
+                saved: false,
+                kept: false,
+            });
+            path
+        };
         outcome
             .actions
             .push(ClientShellAction::OpenLocalEditor { pane_id, path });
@@ -1451,42 +1476,45 @@ impl ClientShellState {
             edit.saved = false;
             return;
         };
-        let (id, version, path) = (edit.id.clone(), edit.version, edit.path.clone());
+        let (id, base, path) = (edit.id.clone(), edit.base.clone(), edit.path.clone());
         let body = text.trim_end_matches('\n').to_owned();
         let result = self.task_write(|store| {
+            let current = store
+                .task(&id)?
+                .ok_or_else(|| StoreError::Invalid(format!("no task {id}")))?;
+            if current.body != base {
+                return Err(crate::tasks::transitions::stale(&id));
+            }
             let patch = TaskPatch {
                 body: Some(body),
-                expected_version: Some(version),
+                expected_version: Some(current.version),
                 ..TaskPatch::default()
             };
             store.update_task(&id, &patch, &Actor::Human)
         });
         let state = &mut self.inbox.tasks;
-        match result {
-            Ok(task) => {
-                if let Some(edit) = state.edit.as_mut() {
-                    edit.version = task.version;
-                    edit.saved = true;
-                }
+        let saved = result.is_ok();
+        if let Some(edit) = state.edit.as_mut() {
+            if let Ok(task) = &result {
+                edit.base = task.body.clone();
             }
+            // Keep the file on a failure: an earlier good save must not let
+            // finish_task_edit delete text this save failed to store.
+            edit.saved = saved;
+            edit.kept = !saved;
+        }
+        match result {
+            Ok(_) => {}
             Err(StoreError::Refused(refusal)) if refusal.code == "stale" => {
                 state.status_line(format!(
-                    "{id} changed while you edited; your text is in {}",
+                    "{id} changed while you edited; your text is in {}; e reopens it",
                     path.display()
                 ));
-                if let Some(edit) = state.edit.as_mut() {
-                    edit.saved = false;
-                }
             }
             Err(error) => {
-                // Keep the file: an earlier good save must not let
-                // finish_task_edit delete text this save failed to store.
-                if let Some(edit) = self.inbox.tasks.edit.as_mut() {
-                    edit.saved = false;
-                }
                 self.report_task_error(&error);
                 let line = format!(
-                    "{id} not saved: {error}; your text is in {}",
+                    "{id} not saved: {error}; your text is in {}; e reopens it",
                     path.display()
                 );
                 self.inbox.tasks.status_line(line);
