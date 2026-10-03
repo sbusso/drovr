@@ -89,23 +89,28 @@ pub(crate) fn queue(root: &Path, pane: &str, op: &TaskOp) -> io::Result<Queued> 
     }
     let dir = pane_dir(root, pane);
     std::fs::create_dir_all(&dir)?;
-    let queued = {
-        let _lock = Lock::take(&dir)?;
-        let epoch = match read_trimmed(&dir.join("epoch")) {
-            Some(epoch) if !epoch.is_empty() => epoch,
-            _ => {
-                let epoch = new_epoch();
-                write_atomic(&dir.join("epoch"), epoch.as_bytes())?;
-                epoch
-            }
-        };
-        let last = read_trimmed(&dir.join("seq"))
-            .and_then(|seq| seq.parse::<u64>().ok())
-            .unwrap_or(0);
-        let seq = last + 1;
-        write_atomic(&dir.join("seq"), seq.to_string().as_bytes())?;
-        Queued { epoch, seq }
+    // The op file is renamed into place before the lock goes: files then
+    // appear in seq order, so a pull that sees `n.json` has seen every
+    // lower seq, and the applied mark it records never skips one.
+    let _lock = Lock::take(&dir)?;
+    let epoch = match read_trimmed(&dir.join("epoch")) {
+        Some(epoch) if !epoch.is_empty() => epoch,
+        _ => {
+            let epoch = new_epoch();
+            write_atomic(&dir.join("epoch"), epoch.as_bytes())?;
+            epoch
+        }
     };
+    let last = read_trimmed(&dir.join("seq"))
+        .and_then(|seq| seq.parse::<u64>().ok())
+        .unwrap_or(0);
+    let queued = Queued {
+        epoch,
+        seq: last + 1,
+    };
+    // The counter moves first: a failed op write leaves a gap, never a
+    // seq that a later op reuses.
+    write_atomic(&dir.join("seq"), queued.seq.to_string().as_bytes())?;
     let line = OutboxOp {
         v: OUTBOX_V,
         epoch: queued.epoch.clone(),
@@ -326,6 +331,39 @@ mod tests {
         let fresh = queue(root, "p1", &note("four")).unwrap();
         assert_eq!(fresh.seq, 1);
         assert_ne!(fresh.epoch, first.epoch);
+    }
+
+    #[test]
+    fn concurrent_queues_land_in_seq_order() {
+        let dir = TempDir::new("order");
+        let root = dir.path().to_path_buf();
+        queue(&root, "p3", &note("first")).unwrap();
+        let pane = pane_dir(&root, "p3");
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..5 {
+                        queue(&root, "p3", &note(&format!("{n}.{i}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        // A pull at any moment sees a gapless prefix: no `k.json` without
+        // every lower seq.
+        while !writers.iter().all(std::thread::JoinHandle::is_finished) {
+            let mut seqs: Vec<u64> = std::fs::read_dir(&pane)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json")?.parse().ok())
+                .collect();
+            seqs.sort_unstable();
+            assert!(seqs.iter().enumerate().all(|(i, s)| *s == i as u64 + 1));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(pane.join("41.json").exists());
     }
 
     #[test]
