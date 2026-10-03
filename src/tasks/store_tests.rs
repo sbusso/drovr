@@ -1137,3 +1137,33 @@ fn daily_backup_is_written_once_and_pruned_to_seven() {
     );
     TaskStore::open_in_memory().unwrap().backup_daily().unwrap();
 }
+
+#[test]
+fn a_send_back_with_an_open_attempt_keeps_auto_on() {
+    let store = store();
+    let task = add_with(&store, "t", Status::Ready, &[]);
+    let id = task.display_id.as_str();
+    store
+        .start_attempt(id, &attempt("local", "p1"), &agent())
+        .unwrap();
+    store.move_task(id, Status::Review, &agent(), None).unwrap();
+    let sent = store
+        .move_task(id, Status::Ready, &Actor::Human, Some("tests fail"))
+        .unwrap();
+    assert!(sent.auto_status, "the agent's signals drive it again");
+    let back = store
+        .move_task(id, Status::Working, &Actor::Auto, None)
+        .unwrap();
+    assert_eq!(back.status, Status::Working);
+    // Without an open attempt a send back is a plain human move.
+    let other = add_with(&store, "u", Status::Review, &[]);
+    let sent = store
+        .move_task(
+            &other.display_id,
+            Status::Ready,
+            &Actor::Human,
+            Some("redo"),
+        )
+        .unwrap();
+    assert!(!sent.auto_status);
+}

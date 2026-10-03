@@ -1584,7 +1584,15 @@ fn move_task(
                     close_decision(c, &decision, DecisionState::Withdrawn, actor)?;
                 }
             }
-            c.execute("UPDATE tasks SET auto_status = 0 WHERE id = ?1", [task.id])?;
+            // A send back keeps the attempt open for the agent to continue:
+            // its signals drive the task again (working, then review).
+            let send_back = task.status == Status::Review
+                && to == Status::Ready
+                && open_attempt(c, task.id)?.is_some();
+            c.execute(
+                "UPDATE tasks SET auto_status = ?2 WHERE id = ?1",
+                params![task.id, send_back],
+            )?;
         }
         Actor::Agent(_) | Actor::Auto => {
             if to == Status::Review {
