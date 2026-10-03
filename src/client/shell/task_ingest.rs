@@ -15,13 +15,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 use super::inbox::ApiRoute;
 use super::projects;
 use super::*;
 use crate::remote::shell_quote;
-use crate::tasks::ops::{OutboxOp, OUTBOX_V};
+use crate::tasks::ops::{parse_outbox_line, OutboxParse, OUTBOX_V};
 use crate::tasks::{self, OpContext, OpResult, StoreError, StoreResult, TaskDetail, TaskOp};
 
 /// Root of the tasks files on a remote machine (section 6.3's `R`), as POSIX
@@ -383,28 +381,6 @@ pub(super) fn parse_pull(output: &str) -> Vec<Pulled> {
         .collect()
 }
 
-#[derive(Deserialize)]
-struct VersionOnly {
-    v: u32,
-}
-
-/// What one op file parsed to.
-enum Parsed {
-    Op(Box<OutboxOp>),
-    /// `v` above [`OUTBOX_V`]: left on the machine.
-    Newer,
-    Bad,
-}
-
-fn parse_op(json: &str) -> Parsed {
-    match serde_json::from_str::<VersionOnly>(json) {
-        Ok(VersionOnly { v }) if v > OUTBOX_V => Parsed::Newer,
-        Ok(_) => serde_json::from_str::<OutboxOp>(json)
-            .map_or(Parsed::Bad, |op| Parsed::Op(Box::new(op))),
-        Err(_) => Parsed::Bad,
-    }
-}
-
 /// The outcome of applying one pull.
 #[derive(Debug, Default)]
 pub(super) struct Ingest {
@@ -450,9 +426,9 @@ pub(super) fn ingest(
         if held.contains(&group) {
             continue;
         }
-        let op = match parse_op(&line.json) {
-            Parsed::Op(op) => op,
-            Parsed::Newer => {
+        let op = match parse_outbox_line(&line.json) {
+            Ok(op) => op,
+            Err(OutboxParse::Newer(_)) => {
                 // Later ops of this pane wait behind it.
                 held.insert(group);
                 if !newer_noted {
@@ -463,7 +439,7 @@ pub(super) fn ingest(
                 }
                 continue;
             }
-            Parsed::Bad => {
+            Err(OutboxParse::Bad(_)) => {
                 let entry = done.entry(group).or_default();
                 entry.0 = entry.0.max(line.seq);
                 entry.1.push(line.seq);
@@ -712,6 +688,7 @@ impl ClientShellState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::ops::OutboxOp;
     use crate::tasks::{Actor, NewTask, Status};
 
     /// A unique empty directory under the system temp dir.

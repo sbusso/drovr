@@ -56,8 +56,6 @@ pub(super) enum TaskMenu {
     },
     Kind,
     Priority,
-    // Built by Builder C's start flow (task_launch.rs).
-    #[allow(dead_code)]
     Machine {
         machines: Vec<(ClientEndpointId, String)>,
     },
@@ -866,8 +864,6 @@ impl ClientShellState {
     }
 
     /// The project menu's Tasks item: the board of `project`.
-    // Called from Builder C's project menu item.
-    #[allow(dead_code)]
     pub(super) fn open_tasks_panel(&mut self, project: String, outcome: &mut ClientShellInput) {
         self.inbox.filter = Some(InboxFilter::Project(project));
         self.inbox.view = PanelView::Tasks;
@@ -929,10 +925,16 @@ impl ClientShellState {
         self.refresh_tasks(true);
     }
 
+    /// Back to the board. The loaded key keeps its scope so the reload is
+    /// not a move: a workspace filter with one task would reopen it.
     fn close_task_view(&mut self) {
         self.finish_task_edit();
-        self.inbox.tasks.close_view();
-        self.inbox.tasks.loaded = None;
+        let state = &mut self.inbox.tasks;
+        state.close_view();
+        if let Some((_, open)) = state.loaded.as_mut() {
+            *open = None;
+        }
+        state.dirty = true;
     }
 
     /// `]` / `[`: the next or previous task in the order the view was opened
@@ -1446,6 +1448,7 @@ impl ClientShellState {
         }
         edit.mtime = mtime;
         let Ok(text) = std::fs::read_to_string(&edit.path) else {
+            edit.saved = false;
             return;
         };
         let (id, version, path) = (edit.id.clone(), edit.version, edit.path.clone());
@@ -1475,7 +1478,19 @@ impl ClientShellState {
                     edit.saved = false;
                 }
             }
-            Err(error) => self.report_task_error(&error),
+            Err(error) => {
+                // Keep the file: an earlier good save must not let
+                // finish_task_edit delete text this save failed to store.
+                if let Some(edit) = self.inbox.tasks.edit.as_mut() {
+                    edit.saved = false;
+                }
+                self.report_task_error(&error);
+                let line = format!(
+                    "{id} not saved: {error}; your text is in {}",
+                    path.display()
+                );
+                self.inbox.tasks.status_line(line);
+            }
         }
         self.inbox.tasks.changed = true;
     }

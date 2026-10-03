@@ -5,8 +5,9 @@
 //! decisions. The client panel and `drovr task` both use [`TaskStore`];
 //! remote agents queue [`TaskOp`]s in an outbox the client pulls.
 
-// The client half of the API (the panel, start-task, the sync) lands with
-// the panel and launch builds; until then parts of it have no caller.
+// Part of the store API (reorder, set_criteria, pin_entry, artifacts,
+// decisions requested from code) is contract surface with only test callers
+// until the panel's drag-reorder and artifact review land.
 #![allow(dead_code)]
 
 pub(crate) mod cli;

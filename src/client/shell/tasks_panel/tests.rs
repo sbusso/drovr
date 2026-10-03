@@ -627,3 +627,88 @@ fn new_task_text_and_store_timestamps_parse() {
     assert_eq!(unix_of("2026-10-03T08:15:02Z"), Some(1_791_015_302));
     assert_eq!(unix_of("garbage"), None);
 }
+
+#[test]
+fn a_sidebar_glyph_and_prefix_a_switch_the_panel_to_the_inbox() {
+    let mut state = tasks_shell();
+    let mut outcome = ClientShellInput::default();
+    state.open_inbox_filtered(InboxFilter::Project(PROJECT.into()), &mut outcome);
+    assert_eq!(state.inbox.view, PanelView::Inbox);
+    state.inbox.view = PanelView::Tasks;
+    state.inbox_oldest_waiting(&mut outcome);
+    assert_eq!(state.inbox.view, PanelView::Inbox);
+}
+
+#[test]
+fn esc_and_the_back_arrow_leave_the_only_task_of_a_workspace() {
+    let id = add("Lone task", Status::Ready, None, &[]);
+    let mut state = shell();
+    let machine = projects::machine_key(&state.endpoints[0]);
+    let workspace_key = format!("{machine}/ws_1:lone");
+    tasks::with_store(|store| store.link_workspace(&id, Some(&workspace_key)))
+        .expect("link workspace");
+    state.inbox.open = true;
+    state.inbox.focused = true;
+    state.inbox.view = PanelView::Tasks;
+    state.inbox.filter = Some(InboxFilter::Workspace {
+        endpoint_id: state.endpoints[0].endpoint_id.clone(),
+        workspace_id: "ws_1".into(),
+    });
+    state.refresh_tasks(true);
+    assert_eq!(state.inbox.tasks.open.as_deref(), Some(id.as_str()));
+    key(&mut state, KeyCode::Esc);
+    state.refresh_tasks(true);
+    assert!(state.inbox.tasks.open.is_none(), "Esc stays on the board");
+    // The board reopens the view on Enter; the header arrow leaves it again.
+    key(&mut state, KeyCode::Enter);
+    assert_eq!(state.inbox.tasks.open.as_deref(), Some(id.as_str()));
+    render(&mut state, 80, 20);
+    let back = hit_point(&state, &Hit::Back);
+    click(&mut state, back);
+    state.refresh_tasks(true);
+    assert!(state.inbox.tasks.open.is_none(), "← stays on the board");
+}
+
+#[test]
+fn a_failed_editor_save_after_a_good_one_keeps_the_file() {
+    let id = add("Edited", Status::Ready, None, &[]);
+    let mut state = tasks_shell();
+    let dir = std::env::temp_dir().join(format!("drovr-edit-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join(format!("{id}.md"));
+    std::fs::write(&path, "").expect("write");
+    let version = task(&id).version;
+    state.inbox.tasks.edit = Some(EditFile {
+        id: id.clone(),
+        path: path.clone(),
+        mtime: None,
+        version,
+        saved: false,
+    });
+    let write = |text: &str, secs: u64| {
+        std::fs::write(&path, text).expect("write");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .expect("mtime");
+    };
+    write("first body\n", 1_000);
+    state.poll_task_edit();
+    assert_eq!(task(&id).body, "first body");
+    write("second body\n", 2_000);
+    FAIL_NEXT.with(|fail| fail.set(true));
+    state.poll_task_edit();
+    assert!(state
+        .inbox
+        .tasks
+        .status_text()
+        .is_some_and(|line| line.contains("not saved")));
+    state.finish_task_edit();
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("file kept"),
+        "second body\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

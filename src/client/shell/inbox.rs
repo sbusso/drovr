@@ -1252,6 +1252,7 @@ impl ClientShellState {
         filter: InboxFilter,
         outcome: &mut ClientShellInput,
     ) {
+        self.inbox.view = PanelView::Inbox;
         self.inbox.filter = Some(filter);
         self.inbox.tab = InboxTab::All;
         self.inbox.scroll = 0;
@@ -1262,6 +1263,7 @@ impl ClientShellState {
 
     /// `prefix a`: open or focus the inbox on the oldest waiting item.
     pub(super) fn inbox_oldest_waiting(&mut self, outcome: &mut ClientShellInput) {
+        self.inbox.view = PanelView::Inbox;
         self.inbox.filter = None;
         self.inbox.tab = InboxTab::Waiting;
         let oldest = self
