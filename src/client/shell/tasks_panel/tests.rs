@@ -859,3 +859,34 @@ fn the_inbox_key_opens_a_closed_panel_on_the_inbox() {
     state.toggle_inbox(&mut outcome);
     assert_eq!(state.inbox.view, PanelView::Inbox);
 }
+
+#[test]
+fn track_makes_a_linked_task_of_a_workspace_without_one() {
+    let mut state = shell();
+    let machine = projects::machine_key(&state.endpoints[0]);
+    state.inbox.open = true;
+    state.inbox.focused = true;
+    state.inbox.view = PanelView::Tasks;
+    state.inbox.filter = Some(InboxFilter::Workspace {
+        endpoint_id: state.endpoints[0].endpoint_id.clone(),
+        workspace_id: "ws_1".into(),
+    });
+    state.refresh_tasks(true);
+    render(&mut state, 80, 20);
+    let track = hit_point(&state, &Hit::Track);
+    click(&mut state, track);
+    let prefix = format!("{machine}/ws_1:");
+    let linked = tasks::with_store(|store| {
+        store.list(&TaskFilter {
+            workspace_key: Some(prefix.clone()),
+            ..TaskFilter::default()
+        })
+    })
+    .expect("list tasks");
+    assert_eq!(linked.len(), 1, "one task, linked to the workspace");
+    assert!(linked[0]
+        .task
+        .workspace_key
+        .as_deref()
+        .is_some_and(|key| key.starts_with(&prefix)));
+}

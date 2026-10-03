@@ -146,17 +146,19 @@ pub(super) fn priority_name(priority: Priority) -> &'static str {
 pub(super) enum Scope {
     /// No filter: the project list.
     All,
-    /// The OTHER section: no tasks.
-    Other,
     Project(String),
     /// A workspace: the `machine/{workspace_id}:` prefix of its key.
     Workspace(String),
 }
 
+/// The task project of workspaces in no section.
+const OTHER_PROJECT: &str = "Other";
+
 pub(super) fn scope_of(filter: Option<&InboxFilter>, endpoints: &[ClientShellEndpoint]) -> Scope {
     match filter {
         None => Scope::All,
-        Some(InboxFilter::Project(name)) if name == OTHER => Scope::Other,
+        // The Other section's tasks live in a project named "Other".
+        Some(InboxFilter::Project(name)) if name == OTHER => Scope::Project(OTHER_PROJECT.into()),
         Some(InboxFilter::Project(name)) => Scope::Project(name.clone()),
         Some(InboxFilter::Workspace {
             endpoint_id,
@@ -227,6 +229,8 @@ pub(super) enum Hit {
     Start,
     Archive,
     Composer,
+    /// Make a task of the filtered workspace, linked to it.
+    Track,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -716,7 +720,6 @@ pub(super) fn render(
     let scope = scope_of(filter, endpoints);
     let left = body.x + 1;
     let right = body.right().saturating_sub(1);
-    let dim = Style::default().fg(palette.overlay0).bg(palette.sidebar_bg);
     tasks.columns = right.saturating_sub(left) >= 90;
     // The status line: the last body line while a message shows.
     let status = tasks.status_text().map(str::to_owned);
@@ -745,16 +748,6 @@ pub(super) fn render(
         return;
     }
     match scope {
-        Scope::Other => {
-            put(
-                buffer,
-                left,
-                body.y,
-                right,
-                "Add this workspace to a section to track tasks.",
-                dim,
-            );
-        }
         Scope::All => board::draw_projects(tasks, palette, buffer, body),
         Scope::Project(_) | Scope::Workspace(_) => {
             board::draw(tasks, endpoints, &layout, focused, palette, buffer, body)
@@ -869,6 +862,63 @@ impl ClientShellState {
 
     /// One store call for the panel; errors go to the status line (and the
     /// notice for busy). A write marks the cache dirty and reloads it.
+    /// `+ track`: a workspace is the task, so make one named after the
+    /// filtered workspace, in its section (or Other), linked to it; its
+    /// status then follows the workspace's agent.
+    fn track_workspace(&mut self) {
+        let Some(InboxFilter::Workspace {
+            endpoint_id,
+            workspace_id,
+        }) = self.inbox.filter.clone()
+        else {
+            return;
+        };
+        let Some((key, label, project)) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .and_then(|endpoint| {
+                let snapshot = endpoint.snapshot.as_deref()?;
+                let workspace = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)?;
+                let key = projects::workspace_key(endpoint, workspace);
+                let paths = projects::workspace_paths(snapshot, workspace);
+                let layout = projects::layout();
+                // No section, or the Other group's sentinel name: "Other".
+                let project = layout
+                    .group_of(&key, &workspace.label, &paths)
+                    .map(|group| layout.groups[group].name.clone())
+                    .filter(|name| name != OTHER)
+                    .unwrap_or_else(|| OTHER_PROJECT.to_owned());
+                Some((key, workspace.label.clone(), project))
+            })
+        else {
+            return;
+        };
+        let created = self.task_write(|store| {
+            let task = store.create_task(
+                &NewTask {
+                    project,
+                    title: Some(label),
+                    ..NewTask::default()
+                },
+                &Actor::Human,
+            )?;
+            store.link_workspace(&task.display_id, Some(&key))?;
+            Ok(task)
+        });
+        match created {
+            Ok(task) => {
+                self.inbox.tasks.selected = Some(task.display_id);
+                self.inbox.tasks.follow = true;
+                self.refresh_tasks(true);
+            }
+            Err(error) => self.report_task_error(&error),
+        }
+    }
+
     fn task_write<R>(
         &mut self,
         write: impl FnOnce(&TaskStore) -> StoreResult<R>,
@@ -1755,7 +1805,6 @@ impl ClientShellState {
         }
         match scope_of(self.inbox.filter.as_ref(), &self.endpoints) {
             Scope::All => self.projects_key(code),
-            Scope::Other => self.board_escape(code),
             Scope::Project(_) | Scope::Workspace(_) => self.board_key(code, outcome),
         }
     }
@@ -2114,6 +2163,7 @@ impl ClientShellState {
                 self.card_button(&card, at, outcome);
             }
             Hit::FilterClear => self.inbox.tasks.text = None,
+            Hit::Track => self.track_workspace(),
             Hit::Back => self.close_task_view(),
             Hit::StatusChip => self.open_move_menu(&id, at),
             Hit::Auto => {
@@ -2314,7 +2364,6 @@ fn load(
                 loaded.counts.push((name.clone(), store.lane_counts(name)?));
             }
         }
-        Scope::Other => {}
     }
     loaded.decisions = store.open_decisions(None)?;
     for card in store.list(&TaskFilter {

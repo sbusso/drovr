@@ -382,14 +382,22 @@ pub(super) fn draw(
     let right = body.right().saturating_sub(1);
     let dim = Style::default().fg(palette.overlay0).bg(palette.sidebar_bg);
     if state.cards.is_empty() && matches!(state.loaded, Some((Scope::Workspace(_), _))) {
-        put(
+        let x = put(
             buffer,
             left,
             body.y,
             right,
-            "No tasks in this workspace.",
+            "No task for this workspace.  ",
             dim,
         );
+        let accent = Style::default().fg(palette.accent).bg(palette.sidebar_bg);
+        let end = put(buffer, x, body.y, right, "+ track", accent);
+        if end > x {
+            state
+                .hits
+                .items
+                .push((Rect::new(x, body.y, end - x, 1), Hit::Track));
+        }
         return;
     }
     let height = usize::from(body.height);
