@@ -9,7 +9,7 @@
 #   Workflow, so the sidebar shows a running workflow's progress;
 # - the state hook: copied to ~/.local/bin and registered for the inbox events
 #   in ~/.claude/settings.json and, when ~/.codex exists, ~/.codex/hooks.json;
-# - the drovr-docs skill: copied to ~/.claude/skills/drovr-docs/.
+# - the drovr-docs and drovr-tasks skills: copied to ~/.claude/skills/.
 # Each hook is appended to its event; existing hooks keep their order. A backup
 # of each changed settings file is kept.
 # --dry-run prints the settings diff and changes nothing:
@@ -17,7 +17,7 @@
 # Files come from sbusso/drovr (main), never from the current directory: under
 # `curl ... | bash` there is no script directory to resolve. DROVR_RAW
 # overrides the base URL (file:// works, for tests).
-# The plan, workflow and state hooks and the skill are optional: a failed download
+# The plan, workflow and state hooks and the skills are optional: a failed download
 # skips them.
 set -euo pipefail
 dry_run=0
@@ -61,13 +61,15 @@ if [ "$dry_run" = 0 ]; then
     echo "state hook not available; skipped" >&2
     state_hook=""
   fi
-  if curl -fsSL "$raw/skills/drovr-docs/SKILL.md" -o "$tmp/skill"; then
-    mkdir -p "$HOME/.claude/skills/drovr-docs"
-    install -m 0644 "$tmp/skill" "$HOME/.claude/skills/drovr-docs/SKILL.md"
-    echo "installed skill: $HOME/.claude/skills/drovr-docs/SKILL.md"
-  else
-    echo "drovr-docs skill not available; skipped" >&2
-  fi
+  for skill in drovr-docs drovr-tasks; do
+    if curl -fsSL "$raw/skills/$skill/SKILL.md" -o "$tmp/skill"; then
+      mkdir -p "$HOME/.claude/skills/$skill"
+      install -m 0644 "$tmp/skill" "$HOME/.claude/skills/$skill/SKILL.md"
+      echo "installed skill: $HOME/.claude/skills/$skill/SKILL.md"
+    else
+      echo "$skill skill not available; skipped" >&2
+    fi
+  done
 fi
 
 python3 - "$dry_run" "$settings" "$codex_hooks" "$usage_hook" "$plan_hook" "$state_hook" "$workflow_hook" <<'EOF'

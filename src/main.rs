@@ -53,6 +53,7 @@ mod selection;
 mod server;
 mod session;
 mod sound;
+mod tasks;
 mod terminal;
 mod terminal_effects;
 mod terminal_modes;
@@ -561,6 +562,10 @@ fn main() -> io::Result<()> {
         && args.get(2).map(String::as_str) == Some("open")
     {
         std::process::exit(doc_view::open::run_doc_open(&args[3..])?);
+    }
+    // drovr fork: durable task records (docs/design/tasks.md).
+    if args.get(1).map(String::as_str) == Some("task") {
+        std::process::exit(tasks::cli::run(&args[2..])?);
     }
 
     finish_cli(cli::maybe_run(&args))?;
