@@ -204,6 +204,55 @@ closes it.
   show.
 - Answering from the inbox comes next; for now, jump to the agent to answer.
 
+### Tasks
+Each project has a task board in the right panel, next to the inbox. Tasks
+live in a SQLite file on this machine
+(`~/.local/state/herdr/drovr/tasks.db`); agents on other machines report
+through drovr's SSH connection.
+
+```
+ Inbox  Tasks · drovr                                 + new
+ Ready 1
+╭DRO-1 Retry the sync job
+╰  fix  ✓1/2                                       ▶ start
+ Working 1
+ DRO-2 Attention hook
+   feature  ○0/1  ● claude@mato                     ↗ pane
+```
+
+- **Open the board**: right-click a project in the sidebar (or `prefix+.`)
+  → **Tasks**. With the panel open (`prefix+i`), click **Tasks** in its
+  header or press `shift+tab` to switch between Inbox and Tasks. A panel
+  100 columns or wider shows the lanes as columns.
+- **Add a task**: click **+ new** or press `n`, type the title, Enter. From a
+  shell: `drovr task add "Title" --project NAME [--criterion TEXT]...`.
+- **Open a task**: click its card. The task view shows the status menu
+  (`[Ready ▾]`), description (`e` edits it in `$EDITOR`), acceptance
+  criteria, notes, attempts and artifacts; `c` adds a note, Esc goes back.
+- **Start it**: click **▶ start** on the card (or `s`). drovr asks which
+  machine when more than one is online, writes a context file with the
+  task, criteria and notes, opens a workspace in the project's folder on that
+  machine and starts the agent there with `DROVR_TASK` set. `↗ pane` (or
+  `p`) jumps to the running agent.
+- **Review**: when the agent finishes with every criterion passed, the task
+  moves to Review; **✓ accept** (`a`) closes it, `b` sends it back with a
+  note.
+- **What agents can do** (skill `drovr-tasks`): `drovr task note`, `check N
+  pass|fail`, `verify` (runs the criteria's check commands), `artifact PATH`
+  (attaches a document or diff), `decide` (asks you a question that shows in
+  the inbox and the task view; answer with `1`–`8`), and `done`. Commands
+  without an id use `$DROVR_TASK`. The task's status follows the agent
+  (Working while it runs, Blocked while it waits on you) until you move it
+  by hand; the `auto` chip in the task view turns that back on.
+- `drovr task import PATH` imports tasks from a workspace (the earlier
+  server app) database; `--dry-run` shows what it would add.
+
+Install the skill on each machine that runs agents:
+
+```bash
+mkdir -p ~/.claude/skills && cp -R skills/drovr-tasks ~/.claude/skills/   # from a drovr checkout
+```
+
 ### New workspaces on any machine
 - `prefix+alt+c` (or clicking **new** in the footer) asks which machine, then a
   name. The workspace joins the project you're in and starts in that project's
