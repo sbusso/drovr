@@ -4,6 +4,7 @@
 mod image;
 pub mod open;
 mod render;
+mod select;
 pub(crate) use render::percent_decode;
 
 use std::io;
@@ -191,6 +192,23 @@ pub enum Action {
     Quit,
     OpenExternal(String),
     OpenFile(PathBuf),
+    /// Put this text on the clipboard.
+    Copy(String),
+}
+
+/// Clicks this close in time on the same cell count as a double or triple
+/// click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
+
+/// A left button held down in the body.
+#[derive(Debug, Clone, Copy)]
+struct Press {
+    pos: (usize, usize),
+    link: Option<usize>,
+    moved: bool,
+    /// 1 for a click, 2 for a double click, 3 for a triple click.
+    clicks: u8,
+    at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +254,11 @@ pub struct Viewer {
     images: image::Images,
     /// Text spans the whole pane instead of a centred reading column.
     full_width: bool,
+    /// Selected text, in rendered line and display column positions.
+    selection: Option<select::Selection>,
+    press: Option<Press>,
+    /// The last click, for double and triple clicks.
+    last_click: Option<Press>,
     doc: Doc,
     width: u16,
     height: usize,
@@ -270,6 +293,9 @@ impl Viewer {
             theme,
             images: image::Images::default(),
             full_width: false,
+            selection: None,
+            press: None,
+            last_click: None,
             doc: Doc::default(),
             width: 80,
             height: 20,
@@ -301,6 +327,9 @@ impl Viewer {
     }
 
     fn rerender(&mut self) {
+        // Positions point into the old layout.
+        self.selection = None;
+        self.press = None;
         self.doc = match &self.source {
             Ok(text) => {
                 let (images, path) = (&mut self.images, &self.path);
@@ -618,6 +647,7 @@ impl Viewer {
             KeyCode::Char('u') if ctrl => self.scroll_by(-page / 2),
             KeyCode::Char('f') if ctrl => self.scroll_by(page),
             KeyCode::Char('b') if ctrl => self.scroll_by(-page),
+            KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
@@ -650,19 +680,99 @@ impl Viewer {
         Action::None
     }
 
+    /// Wheel scrolls. A click on a link opens it; a drag selects text, a
+    /// double click a word and a triple click a line, and the selection is
+    /// copied when the button comes up.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
             MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_LINES as isize)),
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(index) = self.link_at(mouse.column, mouse.row) {
-                    self.selected = Some(index);
-                    return self.follow(index);
+                let Some(pos) = self.doc_pos(mouse.column, mouse.row) else {
+                    return Action::None;
+                };
+                let now = Instant::now();
+                let clicks = match self.last_click {
+                    Some(last) if last.pos == pos && now.duration_since(last.at) < MULTI_CLICK => {
+                        last.clicks % 3 + 1
+                    }
+                    _ => 1,
+                };
+                let press = Press {
+                    pos,
+                    link: self.link_at(mouse.column, mouse.row),
+                    moved: false,
+                    clicks,
+                    at: now,
+                };
+                self.press = Some(press);
+                self.last_click = Some(press);
+                self.selection = match clicks {
+                    2 => self.doc.lines.get(pos.0).map(|line| {
+                        let word = select::word_at(line, pos.1);
+                        select::Selection::new((pos.0, word.start), (pos.0, word.end))
+                    }),
+                    3 => self.doc.lines.get(pos.0).map(|line| {
+                        select::Selection::new((pos.0, 0), (pos.0, select::last_column(line)))
+                    }),
+                    _ => None,
+                };
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(mut press) = self.press else {
+                    return Action::None;
+                };
+                // Dragging past the top or bottom edge scrolls one line.
+                let row = usize::from(mouse.row);
+                let top = usize::from(BODY_TOP);
+                if row < top {
+                    self.scroll_by(-1);
+                } else if row >= top + self.height {
+                    self.scroll_by(1);
+                }
+                let Some(pos) = self.doc_pos(mouse.column, mouse.row) else {
+                    return Action::None;
+                };
+                if pos != press.pos || press.moved {
+                    press.moved = true;
+                    self.press = Some(press);
+                    self.selection = Some(select::Selection::new(press.pos, pos));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(press) = self.press.take() else {
+                    return Action::None;
+                };
+                if !press.moved && press.clicks == 1 {
+                    if let Some(index) = press.link {
+                        self.selected = Some(index);
+                        return self.follow(index);
+                    }
+                    return Action::None;
+                }
+                if let Some(selection) = self.selection {
+                    let text = select::selected_text(&self.doc.lines, &selection);
+                    if !text.trim().is_empty() {
+                        return Action::Copy(text);
+                    }
                 }
             }
             _ => {}
         }
         Action::None
+    }
+
+    /// The document position (line, display column) of a screen cell, held
+    /// inside the body so a drag past its edges keeps selecting.
+    fn doc_pos(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        let last_line = self.doc.lines.len().checked_sub(1)?;
+        let (left, width) = text_column(self.width, self.full_width);
+        let row = usize::from(row)
+            .saturating_sub(usize::from(BODY_TOP))
+            .min(self.height.saturating_sub(1));
+        let col =
+            usize::from(column.saturating_sub(left)).min(usize::from(width.saturating_sub(1)));
+        Some(((self.scroll + row).min(last_line), col))
     }
 
     /// Link under a screen cell. The body starts at row `BODY_TOP`, inset
@@ -754,7 +864,7 @@ impl Viewer {
         ])
     }
 
-    fn styled_line(&self, line: &RLine) -> Line<'static> {
+    fn styled_line(&self, index: usize, line: &RLine) -> Line<'static> {
         let query = self
             .query
             .as_deref()
@@ -781,6 +891,13 @@ impl Viewer {
                 None => spans.push(Span::styled(span.text.clone(), style)),
             }
         }
+        if let Some(range) = self
+            .selection
+            .and_then(|selection| selection.columns_on(index))
+        {
+            let selected = Style::default().add_modifier(Modifier::REVERSED);
+            spans = select::highlight(spans, range, selected);
+        }
         Line::from(spans)
     }
 
@@ -796,9 +913,10 @@ impl Viewer {
             .doc
             .lines
             .iter()
+            .enumerate()
             .skip(self.scroll)
             .take(usize::from(body_height))
-            .map(|line| self.styled_line(line))
+            .map(|(index, line)| self.styled_line(index, line))
             .collect();
         frame.render_widget(
             Paragraph::new(lines),
@@ -1026,6 +1144,13 @@ fn cell_size() -> Option<(u32, u32)> {
     ))
 }
 
+/// Copies through the terminal (OSC 52); herdr passes it to the clipboard.
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    write_graphics(format!("\x1b]52;c;{encoded}\x07").as_bytes())
+}
+
 fn write_graphics(bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
@@ -1112,6 +1237,10 @@ pub fn run_doc_view(path: Option<&Path>) -> io::Result<()> {
                 Action::Quit => break,
                 Action::OpenExternal(url) => viewer.message = Some(open_external(&url)),
                 Action::OpenFile(path) => viewer.message = Some(open_file(&path)),
+                Action::Copy(text) => {
+                    copy_to_clipboard(&text)?;
+                    viewer.message = Some(format!("copied {} characters", text.chars().count()));
+                }
             }
         }
         if Instant::now() >= next_poll {
@@ -1380,8 +1509,8 @@ mod tests {
         let dir = TempDir::new("mouse");
         let main = dir.write("main.md", "go [there](#end)\n\n# End");
         let mut v = viewer(main, None);
-        let click = |column| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
+        let mouse = |kind, column| MouseEvent {
+            kind,
             column,
             row: 2,
             modifiers: KeyModifiers::NONE,
@@ -1395,7 +1524,12 @@ mod tests {
         assert_eq!(v.link_at(3, 2), None);
         assert_eq!(v.link_at(7, 1), None);
         assert_eq!(v.link_at(7, 2), Some(0));
-        assert_eq!(v.handle_mouse(click(7)), Action::None);
+        // The link opens when the button comes up without a drag.
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        assert_eq!(v.handle_mouse(mouse(down, 7)), Action::None);
+        assert_eq!(v.selected, None);
+        assert_eq!(v.handle_mouse(mouse(up, 7)), Action::None);
         assert_eq!(v.selected, Some(0));
 
         // `w` drops the margin, so the link starts at column 3.
@@ -1404,5 +1538,63 @@ mod tests {
         assert_eq!(v.link_at(3, 2), Some(0));
         v.handle_key(key(KeyCode::Char('w')));
         assert_eq!(v.link_at(3, 2), None);
+    }
+
+    #[test]
+    fn drag_and_multi_clicks_select_and_copy_text() {
+        let dir = TempDir::new("select");
+        let main = dir.write(
+            "main.md",
+            "alpha beta [gamma](#x)
+
+second line here",
+        );
+        let mut v = viewer(main, None);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (down, up) = (
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        );
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        // Text starts at column 3, body at row 2; line 2 is "second line here".
+        v.handle_mouse(mouse(down, 9, 2));
+        v.handle_mouse(mouse(drag, 8, 4));
+        assert_eq!(
+            v.handle_mouse(mouse(up, 8, 4)),
+            Action::Copy("beta gamma[1]\n\nsecond".into())
+        );
+        assert!(v.selection.is_some(), "the selection stays shown");
+        // A drag that starts on a link selects instead of opening it.
+        v.handle_mouse(mouse(down, 14, 2));
+        v.handle_mouse(mouse(drag, 18, 2));
+        assert_eq!(
+            v.handle_mouse(mouse(up, 18, 2)),
+            Action::Copy("gamma".into())
+        );
+        assert_eq!(v.selected, None);
+        // Double click: a word; triple click: the line.
+        for _ in 0..2 {
+            v.handle_mouse(mouse(down, 11, 4));
+        }
+        assert_eq!(
+            v.handle_mouse(mouse(up, 11, 4)),
+            Action::Copy("line".into())
+        );
+        v.handle_mouse(mouse(down, 11, 4));
+        assert_eq!(
+            v.handle_mouse(mouse(up, 11, 4)),
+            Action::Copy("second line here".into())
+        );
+        // A plain click clears it, and Esc clears before it quits.
+        v.handle_mouse(mouse(down, 3, 4));
+        assert!(v.selection.is_none());
+        v.selection = Some(select::Selection::new((0, 0), (0, 1)));
+        assert_eq!(v.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(v.handle_key(key(KeyCode::Esc)), Action::Quit);
     }
 }
