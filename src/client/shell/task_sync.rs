@@ -98,6 +98,8 @@ pub(super) struct TaskRuntime {
     /// display id -> since when its workspace is missing.
     missing: HashMap<String, Instant>,
     pub(super) live: Vec<LiveTask>,
+    /// (display id, workspace key) of linked tasks with no open attempt.
+    linked: Vec<(String, String)>,
     loaded: Option<Instant>,
     checked: Option<Instant>,
     data_version: Option<i64>,
@@ -332,8 +334,12 @@ impl ClientShellState {
         self.task_rt.data_version = version;
         let live = tasks::read_store(|store| {
             let mut live = Vec::new();
+            let mut linked = Vec::new();
             for card in store.list(&TaskFilter::default())? {
                 let Some((_, machine, pane_key)) = card.live else {
+                    if let Some(key) = card.task.workspace_key {
+                        linked.push((card.task.display_id, key));
+                    }
                     continue;
                 };
                 let Some(detail) = store.task_detail(&card.task.display_id)? else {
@@ -354,10 +360,13 @@ impl ClientShellState {
                     pane_key,
                 });
             }
-            Ok(live)
+            Ok((live, linked))
         });
         match live {
-            Ok(live) => self.task_rt.live = live,
+            Ok((live, linked)) => {
+                self.task_rt.live = live;
+                self.task_rt.linked = linked;
+            }
             Err(error) => tracing::debug!(%error, "cannot read live tasks"),
         }
         true
@@ -506,12 +515,16 @@ impl ClientShellState {
                 .is_none_or(|previous| previous.online != online || previous.boot_id != boot_id);
             if changed {
                 // Offline, reconnect or restart: no attempt ends on old clocks.
+                let linked = self.task_rt.linked.iter().filter(|(_, key)| {
+                    split_workspace_key(key).is_some_and(|(on, _)| on == machine)
+                });
                 let ids: Vec<String> = self
                     .task_rt
                     .live
                     .iter()
                     .filter(|live| live.machine == machine)
                     .map(|live| live.display_id.clone())
+                    .chain(linked.map(|(id, _)| id.clone()))
                     .collect();
                 for id in ids {
                     self.task_rt.missing.remove(&id);
@@ -548,18 +561,34 @@ impl ClientShellState {
     }
 
     /// Section 5.3: a workspace missing for 30 s from an online machine
-    /// whose boot id did not change ends its task's attempt.
+    /// whose boot id did not change ends its task's attempt. The task's
+    /// workspace link goes too, live or not: herdr reuses workspace ids after
+    /// a restart, and a stale link would tie the task to an unrelated
+    /// workspace (its filter, `drovr task add`'s default project, this
+    /// check). Ceiling: a workspace closed while no client runs keeps its
+    /// links until its id is reused; matching on a server boot id stored in
+    /// the key would close that gap.
     fn end_gone_attempts(&mut self, now: Instant) {
-        let mut ended = Vec::new();
-        for live in &self.task_rt.live {
-            let Some((machine, workspace_id)) =
-                live.workspace_key.as_deref().and_then(split_workspace_key)
-            else {
+        let mut gone = Vec::new();
+        let linked = self
+            .task_rt
+            .live
+            .iter()
+            .filter_map(|live| {
+                let key = live.workspace_key.as_deref()?;
+                let (machine, _) = split_workspace_key(key)?;
+                (machine == live.machine).then_some((live.display_id.as_str(), key, Some(live)))
+            })
+            .chain(
+                self.task_rt
+                    .linked
+                    .iter()
+                    .map(|(id, key)| (id.as_str(), key.as_str(), None)),
+            );
+        for (display_id, key, live) in linked {
+            let Some((machine, workspace_id)) = split_workspace_key(key) else {
                 continue;
             };
-            if machine != live.machine {
-                continue;
-            }
             let Some(snapshot) = self
                 .endpoint_for_machine(machine)
                 .and_then(|endpoint_id| self.endpoint_by_id(&endpoint_id))
@@ -572,33 +601,36 @@ impl ClientShellState {
                 .iter()
                 .any(|workspace| workspace.workspace_id == workspace_id)
             {
-                self.task_rt.missing.remove(&live.display_id);
+                self.task_rt.missing.remove(display_id);
                 continue;
             }
             let since = *self
                 .task_rt
                 .missing
-                .entry(live.display_id.clone())
+                .entry(display_id.to_owned())
                 .or_insert(now);
             if now.saturating_duration_since(since) >= GONE_FOR {
-                ended.push(live.clone());
+                gone.push((display_id.to_owned(), live.cloned()));
             }
         }
-        for live in ended {
-            self.task_rt.missing.remove(&live.display_id);
+        for (display_id, live) in gone {
+            self.task_rt.missing.remove(&display_id);
+            self.task_rt.dirty = true;
             // Ceiling: the store ends an attempt only together with a move, so
             // a task in review (or with auto off) keeps its stale attempt; the
             // Attempts tab offers `release` for it.
-            if !(live.auto_status && matches!(live.status, Status::Working | Status::Blocked)) {
-                continue;
-            }
+            let release = live.is_some_and(|live| {
+                live.auto_status && matches!(live.status, Status::Working | Status::Blocked)
+            });
             let result = tasks::with_store(|store| {
-                store.release(&live.display_id, "workspace closed", &Actor::Auto)
+                if release {
+                    store.release(&display_id, "workspace closed", &Actor::Auto)?;
+                }
+                store.link_workspace(&display_id, None)
             });
             if let Err(error) = result {
-                tracing::debug!(%error, task = %live.display_id, "cannot end the attempt");
+                tracing::debug!(%error, task = %display_id, "cannot end the attempt");
             }
-            self.task_rt.dirty = true;
         }
     }
 
@@ -1139,6 +1171,42 @@ mod tests {
             .expect("read")
             .expect("task");
         assert!(detail.attempts.iter().all(|a| a.ended_at.is_some()));
+        assert_eq!(detail.task.workspace_key, None, "the link goes too");
+    }
+
+    #[test]
+    fn a_gone_workspace_unlinks_a_task_without_an_attempt_and_closing_unlinks() {
+        let id = live_task(Status::Ready, &[]);
+        let key = |id: &str| {
+            tasks::with_store(|store| store.task(id))
+                .expect("read")
+                .expect("task")
+                .workspace_key
+        };
+        // Released by hand (the attempt ends) but still linked.
+        tasks::with_store(|store| store.release(&id, "later", &Actor::Human)).expect("release");
+        assert!(key(&id).is_some());
+        let mut state = shell(Vec::new());
+        tick(&mut state);
+        let mut snapshot = super::super::tests::snapshot();
+        snapshot.workspaces.clear();
+        snapshot.panes.clear();
+        state.set_snapshot(Box::new(snapshot));
+        state.task_rt.dirty = true;
+        tick(&mut state);
+        assert!(key(&id).is_some(), "not before 30 s");
+        state
+            .task_rt
+            .missing
+            .insert(id.clone(), Instant::now() - GONE_FOR);
+        state.task_rt.dirty = true;
+        tick(&mut state);
+        assert_eq!(key(&id), None);
+        // Closing a task drops its link at once.
+        let other = live_task(Status::Ready, &[]);
+        tasks::with_store(|store| store.move_task(&other, Status::Cancelled, &Actor::Human, None))
+            .expect("cancel");
+        assert_eq!(key(&other), None);
     }
 
     #[test]

@@ -1477,14 +1477,19 @@ fn set_status(
         (true, true) => task.closed_at.clone().or(Some(now.clone())),
         (false, true) => Some(now.clone()),
     };
+    // A closed task leaves its workspace: herdr reuses workspace ids after a
+    // restart, and a reopened task links again when it starts.
     c.execute(
-        "UPDATE tasks SET status = ?2, status_since = ?3, closed_at = ?4, position = ?5 WHERE id = ?1",
+        "UPDATE tasks SET status = ?2, status_since = ?3, closed_at = ?4, position = ?5,
+           workspace_key = CASE WHEN ?6 THEN NULL ELSE workspace_key END
+         WHERE id = ?1",
         params![
             task.id,
             to,
             now,
             closed_at,
-            end_position(c, task.project_id, to)?
+            end_position(c, task.project_id, to)?,
+            to.is_closed()
         ],
     )?;
     let quiet = matches!(actor, Actor::Auto)
